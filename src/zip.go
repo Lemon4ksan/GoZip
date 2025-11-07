@@ -2,9 +2,12 @@ package gozip
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
+	"strings"
 	"time"
 )
 
@@ -17,11 +20,12 @@ const (
 	Deflated CompressionMethod = 8 // DEFLATE compression (most common)
 )
 
+// Compression levels for DEFLATE algorithm
 const (
-	DeflateNormal = 6
-	DeflateMaximum = 9
-	DeflateFast = 3
-	DeflateSuperFast = 1
+	DeflateNormal    = 6 // Default compression level (good balance between speed and ratio)
+	DeflateMaximum   = 9 // Maximum compression (best ratio, slowest speed)
+	DeflateFast      = 3 // Fast compression (lower ratio, faster speed)
+	DeflateSuperFast = 1 // Super fast compression (lowest ratio, fastest speed)
 )
 
 // EncryptionMethod represents the encryption algorithm used for file protection
@@ -49,7 +53,7 @@ func WithCompressionLevel(l int) AddOption {
 	}
 }
 
-// WithComment adds a comment to a specific file in the archive.
+// WithComment adds a comment to a specific file in the archive
 func WithComment(cmt string) AddOption {
 	return func(f *file) {
 		f.comment = cmt
@@ -57,9 +61,18 @@ func WithComment(cmt string) AddOption {
 }
 
 // WithCustomModTime sets a specified time as file's last modification time.
+// If not set, current system time is used for new files or file's actual mod time for existing files.
 func WithCustomModTime(t time.Time) AddOption {
 	return func(f *file) {
 		f.modTime = t
+	}
+}
+
+// WithPath sets path in which the file will be located in zip archive.
+// Parent directories are automatically created if they don't exist.
+func WithPath(path string) AddOption {
+	return func(f *file) {
+		f.path = path
 	}
 }
 
@@ -81,8 +94,9 @@ func NewZip(c CompressionMethod) *Zip {
 	}
 }
 
-// AddComment sets a global comment for the entire ZIP archive
-func (z *Zip) AddComment(comment string) {
+// SetComment sets a global comment for the entire ZIP archive.
+// The comment is stored in the end of central directory record.
+func (z *Zip) SetComment(comment string) {
 	z.comment = comment
 }
 
@@ -93,11 +107,20 @@ func (z *Zip) SetEncryption(e EncryptionMethod, pwd string) {
 }
 
 // AddFile adds a file from the filesystem to the ZIP archive.
-// The user is responsible for closing the added files after finishing working with the archive.
+// The provided [os.File] must be open and readable.
+// The caller is responsible for closing the file after the ZIP archive is saved.
+// Note: The file should not be modified between adding and saving the archive.
 func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
+	if f == nil {
+		return errors.New("file cannot be nil")
+	}
+
 	file, err := newFileFromOS(f)
 	if err != nil {
-		return err
+		return fmt.Errorf("create file from OS: %v", err)
+	}
+	if file.isDir {
+		return errors.New("AddFile: can't add directories")
 	}
 	file.compressionMethod = z.compressionMethod
 
@@ -106,9 +129,17 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	}
 
 	z.files = append(z.files, file)
+
+	if file.path != "" {
+		z.ensurePath(file)
+	}
+
 	return nil
 }
 
+// AddReader adds a file to the ZIP archive from an [io.Reader] interface.
+// This allows adding files from sources other than the filesystem, such as memory buffers or network streams.
+// The filename parameter specifies the name that will be used for the file in the archive.
 func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) error {
 	file, err := newFileFromReader(r, filename)
 	if err != nil {
@@ -120,10 +151,47 @@ func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) erro
 	}
 
 	z.files = append(z.files, file)
+
+	if file.path != "" {
+		z.ensurePath(file)
+	}
+
 	return nil
 }
 
+// CreateDirectory adds a directory entry to the ZIP archive
+func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
+	file, err := newDirectoryFile("", name)
+	if err != nil {
+		return fmt.Errorf("create directory file: %v", err)
+	}
+
+	for _, opt := range options {
+		opt(file)
+	}
+
+	z.files = append(z.files, file)
+
+	if file.path != "" {
+		z.ensurePath(file)
+	}
+
+	return nil
+}
+
+// Exists checks if file or directory with given name exists at the specified path.
+// Returns true if an entry with matching path and filename is found in the archive.
+func (z *Zip) Exists(filepath, filename string) bool {
+	for _, file := range z.files {
+		if file.path == filepath && file.name == filename {
+			return true
+		}
+	}
+	return false
+}
+
 // Save writes the ZIP archive to disk with the specified filename.
+// Returns error if any I/O operation fails during the save process.
 func (z *Zip) Save(name string) error {
 	f, err := os.Create(name)
 	if err != nil {
@@ -137,6 +205,7 @@ func (z *Zip) Save(name string) error {
 	for _, file := range z.files {
 		header := file.localHeader()
 		headerOffset := localHeaderOffset
+		file.localHeaderOffset = uint32(headerOffset)
 
 		n, err := f.Write(header.encode(file))
 		if err != nil {
@@ -145,17 +214,18 @@ func (z *Zip) Save(name string) error {
 		localHeaderOffset += int64(n)
 
 		// Write compressed file data
-		err = file.compressAndWrite(f)
-		if err != nil {
-			return fmt.Errorf("error writing compressed file data: %v", err)
-		}
-		localHeaderOffset += file.compressedSize
+		if !file.isDir {
+			err = file.compressAndWrite(f)
+			if err != nil {
+				return fmt.Errorf("error writing compressed file data: %v", err)
+			}
+			localHeaderOffset += file.compressedSize
 
-		// Update local header with actual CRC and compressed size
-		file.localHeaderOffset = uint32(headerOffset)
-		err = file.updateLocalHeader(f, headerOffset)
-		if err != nil {
-			return fmt.Errorf("error updating local file header: %v", err)
+			// Update local header with actual CRC and compressed size
+			err = file.updateLocalHeader(f, headerOffset)
+			if err != nil {
+				return fmt.Errorf("error updating local file header: %v", err)
+			}
 		}
 
 		cdData := file.centralDirEntry()
@@ -182,6 +252,43 @@ func (z *Zip) Save(name string) error {
 	_, err = f.Write(endOfCentralDir)
 	if err != nil {
 		return fmt.Errorf("error writing end of central directory to zip archive: %v", err)
+	}
+
+	return nil
+}
+
+// ensurePath verifies that the file's directory path exists in the archive,
+// creating any missing parent directories if necessary.
+func (z *Zip) ensurePath(f *file) error {
+	if f.path == "" || f.path == "/" {
+		return nil
+	}
+	
+	normalizedPath := path.Clean(f.path)
+	if normalizedPath == "." || normalizedPath == "/" {
+		return nil
+	}
+	pathComponents := strings.Split(normalizedPath, "/")
+
+	currentPath := ""
+	for _, component := range pathComponents {
+		if component == "" {
+			continue
+		}
+
+		if !z.Exists(currentPath, component) {
+			dir, err := newDirectoryFile(currentPath, component)
+			if err != nil {
+				return fmt.Errorf("create directory file: %v", err)
+			}
+			z.files = append(z.files, dir)
+		}
+
+		if currentPath == "" {
+			currentPath = component
+		} else {
+			currentPath = path.Join(currentPath, component)
+		}
 	}
 
 	return nil

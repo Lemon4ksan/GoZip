@@ -6,6 +6,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path"
 	"time"
 )
 
@@ -20,11 +21,13 @@ type file struct {
 	compressedSize    int64             // Size after compression
 	uncompressedSize  int64             // Original file size
 	compressionMethod CompressionMethod // Compression algorithm used
-	compressionLevel  int        		// Algorithm depended compression level
+	compressionLevel  int               // Algorithm depended compression level
 	localHeaderOffset uint32            // Offset of local file header in archive
 	comment           string            // Optional file comment
-	isEncrypted	      bool				// Whether file is encrypted
+	isEncrypted       bool              // Whether file is encrypted
 	source            io.Reader         // Source of file data to be compressed
+	path              string            // Path in zip archive
+	isDir             bool              // Whether file is a directory
 }
 
 // newFileFromOS creates a file struct from an [os.File] instance.
@@ -38,17 +41,28 @@ func newFileFromOS(f *os.File) (*file, error) {
 		name:             stat.Name(),
 		uncompressedSize: stat.Size(),
 		modTime:          stat.ModTime(),
+		isDir:            stat.IsDir(),
 		source:           f,
 	}, nil
 }
 
-// newFileFromOS creates a file struct from an [io.Reader] instance.
+// newFileFromReader creates a file struct from an [io.Reader] instance.
 // File's modification time will be set to current system time.
 func newFileFromReader(source io.Reader, name string) (*file, error) {
 	return &file{
 		name:    name,
 		modTime: time.Now(),
 		source:  source,
+	}, nil
+}
+
+// newDirectoryFile creates a file struct representing a directory in the ZIP archive
+func newDirectoryFile(dirPath, dirName string) (*file, error) {
+	return &file{
+		name:    dirName,
+		path:    dirPath,
+		isDir:   true,
+		modTime: time.Now(),
 	}, nil
 }
 
@@ -71,8 +85,8 @@ func (f *file) compressAndWrite(dest io.Writer) error {
 		tee := io.TeeReader(f.source, hasher)
 
 		if f.compressionLevel == 0 {
-            f.compressionLevel = DeflateNormal
-        }
+			f.compressionLevel = DeflateNormal
+		}
 		compressor, err := flate.NewWriter(sizeCounter, f.compressionLevel)
 		if err != nil {
 			compressor.Close()
@@ -117,9 +131,14 @@ func (f *file) updateLocalHeader(dest *os.File, offset int64) error {
 }
 
 // localHeader creates a local file header structure for ZIP format.
-// Local file headers appear before each file's compressed data.
+// Local file headers appear before each file's compressed data in the archive.
+// The header contains metadata about the file and compression information.
 func (f *file) localHeader() localFileHeader {
 	d, t := timeToMsDos(f.modTime)
+	filenameLength := uint16(len(path.Join(f.path, f.name)))
+	if f.isDir {
+		filenameLength++ // Directories have extra / at the end
+	}
 	return localFileHeader{
 		VersionNeededToExtract: f.getVersionNeededToExtract(),
 		GeneralPurposeBitFlag:  f.getFileBitFlag(),
@@ -129,15 +148,20 @@ func (f *file) localHeader() localFileHeader {
 		CRC32:                  0, // Will  be  updated
 		CompressedSize:         0, // after compression
 		UncompressedSize:       uint32(f.uncompressedSize),
-		FilenameLength:         uint16(len(f.name)),
+		FilenameLength:         filenameLength,
 		ExtraFieldLength:       0,
 	}
 }
 
 // centralDirEntry creates a central directory entry for ZIP format.
-// Central directory contains metadata about all files in the archive.
+// Central directory contains metadata about all files in the archive and is located at the end.
+// This entry is used for quick file lookup without scanning the entire archive.
 func (f *file) centralDirEntry() centralDirectory {
 	d, t := timeToMsDos(f.modTime)
+	filenameLength := uint16(len(path.Join(f.path, f.name)))
+	if f.isDir {
+		filenameLength++ // Directories have extra / at the end
+	}
 	return centralDirectory{
 		VersionMadeBy:          __LATEST_ZIP_VERSION,
 		VersionNeededToExtract: f.getVersionNeededToExtract(),
@@ -148,7 +172,7 @@ func (f *file) centralDirEntry() centralDirectory {
 		CRC32:                  f.crc32,
 		CompressedSize:         uint32(f.compressedSize),
 		UncompressedSize:       uint32(f.uncompressedSize),
-		FilenameLength:         uint16(len(f.name)),
+		FilenameLength:         filenameLength,
 		ExtraFieldLength:       0,
 		FileCommentLength:      uint16(len(f.comment)),
 		DiskNumberStart:        0,
@@ -158,57 +182,62 @@ func (f *file) centralDirEntry() centralDirectory {
 	}
 }
 
-// getVersionNeededToExtract returns minimum supported
-// ZIP specification version needed to extract the file
+// getVersionNeededToExtract returns minimum supported ZIP specification version needed to extract the file.
 func (f *file) getVersionNeededToExtract() uint16 {
 	var version uint16 = 10
 
-	if f.compressionMethod == Deflated {
+	if f.isDir || f.path != "" {
+		version = 20
+	} else if f.compressionMethod == Deflated {
 		version = 20
 	}
 	return version
 }
 
-// getFileBitFlag returns bit flag for the file
+// getFileBitFlag returns bit flag for the file according to ZIP specification.
 func (f *file) getFileBitFlag() uint16 {
-    flag := uint16(0)
+	flag := uint16(0)
 
-    // Bit 0: encryption
-    if f.isEncrypted {
-        flag |= 0x0001
-    }
-    
-    // Bits 1-2: compression level (for Deflate only)
-    if f.compressionMethod == Deflated {
-        var levelBits uint16
+	// Bit 0: encryption
+	if f.isEncrypted {
+		flag |= 0x0001
+	}
+
+	// Bits 1-2: compression level (for Deflate only)
+	if f.compressionMethod == Deflated {
+		var levelBits uint16
 
 		if f.compressionLevel == 0 {
-            f.compressionLevel = DeflateNormal
-        }
+			f.compressionLevel = DeflateNormal
+		}
 
-        switch f.compressionLevel {
-        case DeflateSuperFast: // Super Fast
-            levelBits = 0x0006 // bits 1 and 2: 1,1
-        case DeflateFast:      // Fast
-            levelBits = 0x0004 // bits 1 and 2: 1,0  
-        case DeflateMaximum:   // Maximum
-            levelBits = 0x0002 // bits 1 and 2: 0,1
-        case DeflateNormal:    // Normal (default)
-            fallthrough
-        default:
-            levelBits = 0x0000 // bits 1 and 2: 0,0
-        }
-        flag |= levelBits
-    }
-    
-    return flag
+		switch f.compressionLevel {
+		case DeflateSuperFast: // Super Fast
+			levelBits = 0x0006 // bits 1 and 2: 1,1
+		case DeflateFast: // Fast
+			levelBits = 0x0004 // bits 1 and 2: 1,0
+		case DeflateMaximum: // Maximum
+			levelBits = 0x0002 // bits 1 and 2: 0,1
+		case DeflateNormal: // Normal (default)
+			fallthrough
+		default:
+			levelBits = 0x0000 // bits 1 and 2: 0,0
+		}
+		flag |= levelBits
+	}
+
+	return flag
 }
 
+// byteCounterWriter is a wrapper around io.Writer that counts the total number of bytes written.
+// It's used to track compressed size during the compression process.
 type byteCounterWriter struct {
 	dest         io.Writer
 	bytesWritten int64
 }
 
+// Write implements the io.Writer interface and counts bytes written.
+// It delegates the actual writing to the underlying writer and accumulates the byte count.
 func (w *byteCounterWriter) Write(p []byte) (int, error) {
 	n, err := w.dest.Write(p)
 	w.bytesWritten += int64(n)
@@ -219,6 +248,7 @@ func (w *byteCounterWriter) Write(p []byte) (int, error) {
 // MS-DOS date format: bits 0-4: day (1-31), bits 5-8: month (1-12), bits 9-15: years from 1980 (0-127).
 // MS-DOS time format: bits 0-4: seconds/2 (0-29), bits 5-10: minutes (0-59), bits 11-15: hours (0-23).
 // Note: Seconds are stored divided by 2, limiting resolution to 2-second intervals.
+// Years before 1980 are clamped to 1980, years after 2107 are clamped to 2107.
 func timeToMsDos(t time.Time) (date uint16, time uint16) {
 	year := max(t.Year()-1980, 0)
 	if year > 127 {
@@ -243,6 +273,7 @@ func timeToMsDos(t time.Time) (date uint16, time uint16) {
 // msDosToTime converts MS-DOS date and time format to [time.Time].
 // Handles the reverse conversion of TimeToMsDos, reconstructing the original time.
 // Note: Time resolution is limited to 2 seconds due to the original format constraints.
+// The returned time is always in UTC timezone.
 func msDosToTime(dosDate uint16, dosTime uint16) time.Time {
 	day := dosDate & 0x1F                 // bits 0-4: day
 	month := (dosDate >> 5) & 0x0F        // bits 5-8: month

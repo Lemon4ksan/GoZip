@@ -3,6 +3,7 @@ package gozip
 import (
 	"bytes"
 	"encoding/binary"
+	"path"
 )
 
 // Each record type must be identified using a header signature that identifies the record type.
@@ -34,7 +35,10 @@ func (h localFileHeader) encode(f *file) []byte {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, __LOCAL_FILE_HEADER_SIGNATURE)
 	binary.Write(buf, binary.LittleEndian, h)
-	buf.WriteString(f.name)
+	buf.WriteString(path.Join(f.path, f.name))
+	if f.isDir {
+		buf.WriteString("/")
+	}
 	return buf.Bytes()
 }
 
@@ -61,7 +65,10 @@ func (d centralDirectory) encode(f *file) []byte {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, __CENTRAL_DIRECTORY_SIGNATURE)
 	binary.Write(buf, binary.LittleEndian, d)
-	buf.WriteString(f.name)
+	buf.WriteString(path.Join(f.path, f.name))
+	if f.isDir {
+		buf.WriteString("/")
+	}
 	buf.WriteString(f.comment)
 	return buf.Bytes()
 }
