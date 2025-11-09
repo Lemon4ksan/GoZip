@@ -8,78 +8,24 @@ import (
 	"os"
 	"path"
 	"strings"
-	"time"
 )
 
-// CompressionMethod represents the compression algorithm used for a file in the ZIP archive
-type CompressionMethod uint16
-
-// Supported compression methods according to ZIP specification
-const (
-	Stored   CompressionMethod = 0 // No compression - file stored as-is
-	Deflated CompressionMethod = 8 // DEFLATE compression (most common)
-)
-
-// Compression levels for DEFLATE algorithm
-const (
-	DeflateNormal    = 6 // Default compression level (good balance between speed and ratio)
-	DeflateMaximum   = 9 // Maximum compression (best ratio, slowest speed)
-	DeflateFast      = 3 // Fast compression (lower ratio, faster speed)
-	DeflateSuperFast = 1 // Super fast compression (lowest ratio, fastest speed)
-)
-
-// EncryptionMethod represents the encryption algorithm used for file protection
-type EncryptionMethod uint16
-
-// Supported encryption methods
-const (
-	NotEncrypted EncryptionMethod = 0 // No encryption - file stored in plaintext
-)
+// FileConfig holds configuration for file processing
+type FileConfig struct {
+	CompressionMethod CompressionMethod
+	CompressionLevel  int
+	Comment           string
+	IsEncrypted       bool
+	Path              string
+}
 
 // AddOption defines a function type for configuring file options during addition to archive
 type AddOption func(f *file)
 
-// WithCompressionMethod sets a specific compression method for a file
-func WithCompressionMethod(c CompressionMethod) AddOption {
+func WithConfig(c FileConfig) AddOption {
 	return func(f *file) {
-		f.compressionMethod = c
+		f.SetConfig(c)
 	}
-}
-
-// WithCompressionLevel sets a specified algorithm dependent compression level
-func WithCompressionLevel(l int) AddOption {
-	return func(f *file) {
-		f.compressionLevel = l
-	}
-}
-
-// WithComment adds a comment to a specific file in the archive
-func WithComment(cmt string) AddOption {
-	return func(f *file) {
-		f.comment = cmt
-	}
-}
-
-// WithCustomModTime sets a specified time as file's last modification time.
-// If not set, current system time is used for new files or file's actual mod time for existing files.
-func WithCustomModTime(t time.Time) AddOption {
-	return func(f *file) {
-		f.modTime = t
-	}
-}
-
-// WithPath sets path in which the file will be located in zip archive.
-// Parent directories are automatically created if they don't exist.
-func WithPath(path string) AddOption {
-	return func(f *file) {
-		f.path = path
-	}
-}
-
-// ExtraFieldEntry represents an external file data.
-type ExtraFieldEntry struct {
-	Tag  uint16
-	Data []byte
 }
 
 // Zip represents an editable ZIP archive in memory.
@@ -123,12 +69,12 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 
 	file, err := newFileFromOS(f)
 	if err != nil {
-		return fmt.Errorf("create file from OS: %v", err)
+		return fmt.Errorf("newFileFromOS: %v", err)
 	}
 	if file.isDir {
 		return errors.New("AddFile: can't add directories")
 	}
-	file.compressionMethod = z.compressionMethod
+	file.config.CompressionMethod = z.compressionMethod
 
 	for _, opt := range options {
 		opt(file)
@@ -136,7 +82,7 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 
 	z.files = append(z.files, file)
 
-	if file.path != "" {
+	if file.config.Path != "" {
 		z.ensurePath(file)
 	}
 
@@ -209,8 +155,9 @@ func (z *Zip) Save(name string) error {
 	centralDirBuf := new(bytes.Buffer)
 
 	for _, file := range z.files {
-		file.updateFileMetadataExtraField()
-		header := file.localHeader()
+		h, meta := newZipHeaders(file), NewFileMetadata(file)
+		meta.UpdateFileMetadataExtraField()
+		header := h.LocalHeader()
 		headerOffset := localHeaderOffset
 		file.localHeaderOffset = uint32(headerOffset)
 
@@ -222,20 +169,21 @@ func (z *Zip) Save(name string) error {
 
 		// Write compressed file data
 		if !file.isDir {
-			err = file.compressAndWrite(f)
+			op := NewFileOperations(file)
+			err = op.CompressAndWrite(f)
 			if err != nil {
 				return fmt.Errorf("error writing compressed file data: %v", err)
 			}
 			localHeaderOffset += file.compressedSize
 
 			// Update local header with actual CRC and compressed size
-			err = file.updateLocalHeader(f, headerOffset)
+			err = op.UpdateLocalHeader(f, headerOffset)
 			if err != nil {
 				return fmt.Errorf("error updating local file header: %v", err)
 			}
 		}
 
-		cdData := file.centralDirEntry()
+		cdData := h.CentralDirEntry()
 		n, err = centralDirBuf.Write(cdData.encode(file))
 		if err != nil {
 			return fmt.Errorf("error writing central directory entry to buffer: %v", err)
@@ -267,14 +215,15 @@ func (z *Zip) Save(name string) error {
 // ensurePath verifies that the file's directory path exists in the archive,
 // creating any missing parent directories if necessary.
 func (z *Zip) ensurePath(f *file) error {
-	if f.path == "" || f.path == "/" {
+	if f.config.Path == "" || f.config.Path == "/" {
 		return nil
 	}
 
-	normalizedPath := path.Clean(f.path)
+	normalizedPath := path.Clean(f.config.Path)
 	if normalizedPath == "." || normalizedPath == "/" {
 		return nil
 	}
+	f.path = normalizedPath
 	pathComponents := strings.Split(normalizedPath, "/")
 
 	currentPath := ""

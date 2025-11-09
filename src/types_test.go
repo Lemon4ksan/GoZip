@@ -251,7 +251,7 @@ func TestCentralDirectoryEncoding(t *testing.T) {
 				ExternalFileAttributes: 0,
 				LocalHeaderOffset:      2048,
 			},
-			file:        &file{name: "src", isDir: true, path: "app", comment: "Source code directory"},
+			file:        &file{name: "src", isDir: true, path: "app", config: FileConfig{Comment: "Source code directory"}},
 			description: "Directory with descriptive comment",
 		},
 	}
@@ -301,8 +301,8 @@ func TestCentralDirectoryEncoding(t *testing.T) {
 			if tt.dir.FileCommentLength > 0 {
 				commentBytes := make([]byte, tt.dir.FileCommentLength)
 				buf.Read(commentBytes)
-				if string(commentBytes) != tt.file.comment {
-					t.Errorf("Comment mismatch: expected '%s', got '%s'", tt.file.comment, string(commentBytes))
+				if string(commentBytes) != tt.file.config.Comment {
+					t.Errorf("Comment mismatch: expected '%s', got '%s'", tt.file.config.Comment, string(commentBytes))
 				}
 			}
 
@@ -482,9 +482,9 @@ func TestPathAndEdgeCases(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				f := &file{
-					name:   tc.fileName,
-					path:   tc.filePath,
-					isDir:  tc.isDir,
+					name:    tc.fileName,
+					path:    tc.filePath,
+					isDir:   tc.isDir,
 					modTime: time.Now(),
 				}
 
@@ -493,15 +493,15 @@ func TestPathAndEdgeCases(t *testing.T) {
 				}
 
 				encoded := header.encode(f)
-				
+
 				// Extract filename from encoded data
 				buf := bytes.NewReader(encoded)
 				buf.Seek(4+int64(binary.Size(header)), 0)
 				filenameBytes := make([]byte, header.FilenameLength)
 				buf.Read(filenameBytes)
-				
+
 				if string(filenameBytes) != tc.expected {
-					t.Errorf("Path combination mismatch: expected '%s', got '%s'", 
+					t.Errorf("Path combination mismatch: expected '%s', got '%s'",
 						tc.expected, string(filenameBytes))
 				}
 			})
@@ -517,8 +517,9 @@ func TestPathAndEdgeCases(t *testing.T) {
 
 		for _, f := range testFiles {
 			t.Run(f.name+" consistency", func(t *testing.T) {
-				localHeader := f.localHeader()
-				centralDir := f.centralDirEntry()
+				h := newZipHeaders(f)
+				localHeader := h.LocalHeader()
+				centralDir := h.CentralDirEntry()
 
 				localEncoded := localHeader.encode(f)
 				centralEncoded := centralDir.encode(f)
@@ -567,7 +568,7 @@ func TestPathAndEdgeCases(t *testing.T) {
 // Helper function to extract filename from encoded data
 func extractFilename(encoded []byte, header interface{}) string {
 	buf := bytes.NewReader(encoded)
-	
+
 	// Skip signature and header based on type
 	switch h := header.(type) {
 	case localFileHeader:
