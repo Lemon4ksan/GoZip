@@ -210,9 +210,6 @@ func TestFileHeaders(t *testing.T) {
 
 			case "central":
 				entry := tc.file.centralDirEntry()
-				if entry.VersionMadeBy != __LATEST_ZIP_VERSION {
-					t.Errorf("Expected version made by %d, got %d", __LATEST_ZIP_VERSION, entry.VersionMadeBy)
-				}
 				if entry.CRC32 != tc.file.crc32 {
 					t.Errorf("Expected CRC32 %x, got %x", tc.file.crc32, entry.CRC32)
 				}

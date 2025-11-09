@@ -76,6 +76,12 @@ func WithPath(path string) AddOption {
 	}
 }
 
+// ExtraFieldEntry represents an external file data.
+type ExtraFieldEntry struct {
+	Tag  uint16
+	Data []byte
+}
+
 // Zip represents an editable ZIP archive in memory.
 // Provides methods to add files, configure compression/encryption, and save the archive.
 type Zip struct {
@@ -203,6 +209,7 @@ func (z *Zip) Save(name string) error {
 	centralDirBuf := new(bytes.Buffer)
 
 	for _, file := range z.files {
+		file.updateFileMetadataExtraField()
 		header := file.localHeader()
 		headerOffset := localHeaderOffset
 		file.localHeaderOffset = uint32(headerOffset)
@@ -263,7 +270,7 @@ func (z *Zip) ensurePath(f *file) error {
 	if f.path == "" || f.path == "/" {
 		return nil
 	}
-	
+
 	normalizedPath := path.Clean(f.path)
 	if normalizedPath == "." || normalizedPath == "/" {
 		return nil
