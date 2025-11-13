@@ -341,8 +341,8 @@ func TestArchiveStructureComprehensive(t *testing.T) {
 			name               string
 			files              []*file
 			comment            string
-			centralDirSize     int64
-			centralDirOffset   int64
+			centralDirSize     uint64
+			centralDirOffset   uint64
 			expectedTotalFiles uint16
 			description        string
 		}{
@@ -409,10 +409,10 @@ func TestArchiveStructureComprehensive(t *testing.T) {
 					t.Errorf("TotalNumberOfEntries mismatch: expected %d, got %d",
 						tc.expectedTotalFiles, record.TotalNumberOfEntries)
 				}
-				if int64(record.CentralDirSize) != tc.centralDirSize {
+				if uint64(record.CentralDirSize) != tc.centralDirSize {
 					t.Errorf("CentralDirSize mismatch: expected %d, got %d", tc.centralDirSize, record.CentralDirSize)
 				}
-				if int64(record.CentralDirOffset) != tc.centralDirOffset {
+				if uint64(record.CentralDirOffset) != tc.centralDirOffset {
 					t.Errorf("CentralDirOffset mismatch: expected %d, got %d", tc.centralDirOffset, record.CentralDirOffset)
 				}
 
@@ -584,71 +584,4 @@ func extractFilename(encoded []byte, header interface{}) string {
 	default:
 		return ""
 	}
-}
-
-// Benchmark tests for performance measurement
-func BenchmarkStructureEncoding(b *testing.B) {
-	// Common test data
-	fileHeader := localFileHeader{
-		VersionNeededToExtract: 20,
-		CompressionMethod:      uint16(Deflated),
-		CRC32:                  0x12345678,
-		CompressedSize:         1024,
-		UncompressedSize:       2048,
-		FilenameLength:         8,
-	}
-
-	centralDir := centralDirectory{
-		VersionMadeBy:          63,
-		VersionNeededToExtract: 20,
-		CompressionMethod:      uint16(Deflated),
-		CRC32:                  0x12345678,
-		CompressedSize:         1024,
-		UncompressedSize:       2048,
-		FilenameLength:         8,
-		LocalHeaderOffset:      256,
-	}
-
-	regularFile := &file{name: "test.txt"}
-	directoryFile := &file{name: "docs", isDir: true, path: "projects"}
-
-	zip := &Zip{
-		files:   []*file{regularFile},
-		comment: "benchmark",
-	}
-
-	b.ResetTimer()
-
-	// File encoding benchmarks
-	b.Run("FileLocalHeaderEncode", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			fileHeader.encode(regularFile)
-		}
-	})
-
-	b.Run("FileCentralDirEncode", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			centralDir.encode(regularFile)
-		}
-	})
-
-	// Directory encoding benchmarks
-	b.Run("DirectoryLocalHeaderEncode", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			fileHeader.encode(directoryFile)
-		}
-	})
-
-	b.Run("DirectoryCentralDirEncode", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			centralDir.encode(directoryFile)
-		}
-	})
-
-	// End of central directory benchmark
-	b.Run("EndOfCentralDirEncode", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			encodeEndOfCentralDirRecord(zip, 1024, 2048)
-		}
-	})
 }

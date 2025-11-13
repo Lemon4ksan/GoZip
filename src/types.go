@@ -40,9 +40,6 @@ func (h localFileHeader) encode(f *file) []byte {
 	if f.isDir {
 		buf.WriteString("/")
 	}
-	if f.RequiresZip64() {
-		buf.Write(make([]byte, 20))
-	}
 	return buf.Bytes()
 }
 
@@ -92,7 +89,7 @@ type endOfCentralDirectory struct {
 
 // encodeEndOfCentralDirRecord creates the end of central directory record.
 // This marks the end of the ZIP file and contains archive-wide information.
-func encodeEndOfCentralDirRecord(z *Zip, centralDirSize int64, centralDirOffset int64) []byte {
+func encodeEndOfCentralDirRecord(z *Zip, centralDirSize uint64, centralDirOffset uint64) []byte {
 	record := endOfCentralDirectory{
 		ThisDiskNum:                     0,
 		DiskNumWithTheStartOfCentralDir: 0,

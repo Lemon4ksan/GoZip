@@ -2,11 +2,8 @@ package gozip
 
 import (
 	"bytes"
-	"compress/flate"
 	"encoding/binary"
 	"errors"
-	"hash"
-	"hash/crc32"
 	"io"
 	"math"
 	"os"
@@ -87,14 +84,21 @@ func (f *file) CompressedSize() int64   { return f.compressedSize }
 func (f *file) CRC32() uint32           { return f.crc32 }
 func (f *file) ModTime() time.Time      { return f.modTime }
 
-func (f *file) SetConfig(config FileConfig) { f.config = config }
+func (f *file) SetConfig(config FileConfig) {
+	if !f.isDir {
+		f.config = config
+	} else {
+		f.config.Path = config.Path
+		f.config.Comment = config.Comment
+	}
+}
 func (f *file) SetSource(source io.Reader)  { f.source = source }
 
 // RequiresZip64 checks whether zip64 extra field should be used for the file
 func (f *file) RequiresZip64() bool {
-	if (f.compressedSize    > math.MaxUint32 ||
-	    f.uncompressedSize  > math.MaxUint32 ||
-	    f.localHeaderOffset > math.MaxUint32) {
+	if f.compressedSize > math.MaxUint32 ||
+		f.uncompressedSize > math.MaxUint32 ||
+		f.localHeaderOffset > math.MaxUint32 {
 		return true
 	}
 	return false
@@ -217,10 +221,6 @@ func newZipHeaders(f *file) *zipHeaders {
 // LocalHeader creates a local file header
 func (zh *zipHeaders) LocalHeader() localFileHeader {
 	d, t := timeToMsDos(zh.file.modTime)
-	var extraFieldLength uint16
-	if zh.file.RequiresZip64() {
-		extraFieldLength = 20
-	}
 	return localFileHeader{
 		VersionNeededToExtract: zh.attrs.GetVersionNeededToExtract(),
 		GeneralPurposeBitFlag:  zh.attrs.GetFileBitFlag(),
@@ -231,7 +231,7 @@ func (zh *zipHeaders) LocalHeader() localFileHeader {
 		CompressedSize:         0,
 		UncompressedSize:       uint32(min(math.MaxUint32, zh.file.uncompressedSize)),
 		FilenameLength:         zh.file.getFilenameLength(),
-		ExtraFieldLength:       extraFieldLength,
+		ExtraFieldLength:       0,
 	}
 }
 
@@ -307,8 +307,8 @@ func (fm *FileMetadata) AddExtraFieldEntry(entry ExtraFieldEntry) error {
 	return nil
 }
 
-// SetupFileMetadataExtraField creates and sets extra fields with file metadata
-func (fm *FileMetadata) SetupFileMetadataExtraField() {
+// AddFilesystemExtraField creates and sets extra fields with file metadata
+func (fm *FileMetadata) AddFilesystemExtraField() {
 	if fm.file.metadata == nil {
 		return
 	}
@@ -370,107 +370,4 @@ func (fm *FileMetadata) addNTFSExtraField() {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, ntfs)
 	fm.file.extraField = append(fm.file.extraField, ExtraFieldEntry{__NTFS_METADATA_FIELD, buf.Bytes()})
-}
-
-// fileOperations handles file compression and writing operations
-type fileOperations struct {
-	file *file
-}
-
-// NewFileOperations creates a new FileOperations instance
-func NewFileOperations(f *file) *fileOperations {
-	return &fileOperations{file: f}
-}
-
-// CompressAndWrite compresses the file content and writes it to destination
-func (fo *fileOperations) CompressAndWrite(dest io.Writer) error {
-	var uncompressedSize int64
-	var err error
-
-	hasher := crc32.NewIEEE()
-	sizeCounter := &byteCounterWriter{dest: dest}
-
-	switch fo.file.config.CompressionMethod {
-	case Stored:
-		uncompressedSize, err = fo.writeStored(sizeCounter, hasher)
-	case Deflated:
-		uncompressedSize, err = fo.writeDeflated(sizeCounter, hasher)
-	default:
-		return errors.New("unsupported compression method")
-	}
-
-	if err != nil {
-		return err
-	}
-
-	fo.file.uncompressedSize = uncompressedSize
-	fo.file.compressedSize = sizeCounter.bytesWritten
-	fo.file.crc32 = hasher.Sum32()
-	return nil
-}
-
-// UpdateLocalHeader updates the local file header with actual values
-func (fo *fileOperations) UpdateLocalHeader(dest io.WriteSeeker, offset int64) error {
-	currentPos, err := dest.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	defer dest.Seek(currentPos, io.SeekStart)
-
-	_, err = dest.Seek(offset+14, io.SeekStart)
-	if err != nil {
-		return err
-	}
-
-	binary.Write(dest, binary.LittleEndian, fo.file.crc32)
-	binary.Write(dest, binary.LittleEndian, uint32(min(math.MaxUint32, fo.file.compressedSize)))
-	binary.Write(dest, binary.LittleEndian, uint32(min(math.MaxUint32, fo.file.uncompressedSize)))
-
-	if fo.file.RequiresZip64() {
-		buf := new(bytes.Buffer)
-		binary.Write(buf, binary.LittleEndian, __ZIP64_EXTRA_FIELD)
-		binary.Write(buf, binary.LittleEndian, uint16(16))
-		binary.Write(buf, binary.LittleEndian, fo.file.uncompressedSize)
-		binary.Write(buf, binary.LittleEndian, fo.file.compressedSize)
-
-		_, err := dest.Seek(2, io.SeekCurrent)
-		if err != nil {
-			return err
-		}
-		binary.Write(dest, binary.LittleEndian, uint16(20))
-		_, err = dest.Seek(int64(fo.file.getFilenameLength()), io.SeekCurrent)
-		if err != nil {
-			return err
-		}
-		dest.Write(buf.Bytes())
-	}
-
-	return nil
-}
-
-func (fo *fileOperations) writeStored(counter *byteCounterWriter, hasher hash.Hash32) (int64, error) {
-	multiWriter := io.MultiWriter(counter, hasher)
-	return io.Copy(multiWriter, fo.file.source)
-}
-
-func (fo *fileOperations) writeDeflated(counter *byteCounterWriter, hasher hash.Hash32) (int64, error) {
-	tee := io.TeeReader(fo.file.source, hasher)
-
-	level := fo.file.config.CompressionLevel
-	if level == 0 {
-		level = DeflateNormal
-	}
-
-	compressor, err := flate.NewWriter(counter, level)
-	if err != nil {
-		return 0, err
-	}
-	defer compressor.Close()
-
-	uncompressedSize, err := io.Copy(compressor, tee)
-	if err != nil {
-		return 0, err
-	}
-
-	return uncompressedSize, compressor.Close()
 }

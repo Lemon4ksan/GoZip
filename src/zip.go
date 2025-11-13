@@ -1,11 +1,9 @@
 package gozip
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path"
 	"strings"
@@ -108,13 +106,16 @@ func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) erro
 func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
 	file, err := newDirectoryFile("", name)
 	if err != nil {
-		return fmt.Errorf("create directory file: %v", err)
+		return err
 	}
 	for _, opt := range options {
 		opt(file)
 	}
 	if file.path != "" {
-		z.ensurePath(file)
+		err := z.ensurePath(file)
+		if err != nil {
+			return fmt.Errorf("ensure path: %v", err)
+		}
 	}
 	z.files = append(z.files, file)
 	return nil
@@ -134,82 +135,47 @@ func (z *Zip) Exists(filepath, filename string) bool {
 // Save writes the ZIP archive to disk with the specified filename.
 // Returns error if any I/O operation fails during the save process.
 func (z *Zip) Save(name string) error {
-	f, err := os.Create(name)
+	dest, err := os.Create(name)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer dest.Close()
 
-	var localHeaderOffset, sizeOfCentralDir int64
-	centralDirBuf := new(bytes.Buffer)
+	var tmpFile *os.File
+	defer func() {
+		if tmpFile != nil {
+			tmpFile.Close()
+			os.Remove(tmpFile.Name())
+		}
+	}()
 
+	writer := newZipWriter(z, dest)
 	for _, file := range z.files {
-		h, meta := newZipHeaders(file), NewFileMetadata(file)
-		meta.SetupFileMetadataExtraField()
-		header := h.LocalHeader()
-		headerOffset := localHeaderOffset
-		file.localHeaderOffset = headerOffset
+		meta := NewFileMetadata(file)
+		meta.AddFilesystemExtraField()
 
-		n, err := f.Write(header.encode(file))
-		if err != nil {
-			return fmt.Errorf("error writing local file header: %v", err)
-		}
-		localHeaderOffset += int64(n)
-
-		// Write compressed file data
+		writer.WriteFileHeader(file)
 		if !file.isDir {
-			op := NewFileOperations(file)
-			err = op.CompressAndWrite(f)
+			tmpFile, err = writer.EncodeFileData(file)
 			if err != nil {
-				return fmt.Errorf("error writing compressed file data: %v", err)
-			}
-			localHeaderOffset += file.compressedSize
-
-			// Update local header with actual CRC and compressed size
-			err = op.UpdateLocalHeader(f, headerOffset)
-			if err != nil {
-				return fmt.Errorf("error updating local file header: %v", err)
+				return err
 			}
 		}
-
 		if file.RequiresZip64() {
-			metadata := NewFileMetadata(file)
-			metadata.addZip64ExtraField()
+			meta.addZip64ExtraField()
 		}
-		cdData := h.CentralDirEntry()
-		n, err = centralDirBuf.Write(cdData.encode(file))
+		err = writer.UpdateLocalHeader(file)
 		if err != nil {
-			return fmt.Errorf("error writing central directory entry to buffer: %v", err)
+			return fmt.Errorf("update local header: %v", err)
 		}
-		sizeOfCentralDir += int64(n)
-	}
-
-	// Write central directory to archive
-	centralDirData := centralDirBuf.Bytes()
-	_, err = f.Write(centralDirData)
-	if err != nil {
-		return fmt.Errorf("error writing central directory to zip archive: %v", err)
-	}
-
-	if sizeOfCentralDir > math.MaxUint32 || localHeaderOffset > math.MaxUint32 {
-		zip64EndOfCentralDir := encodeZip64EndOfCentralDirectoryRecord(z, uint64(sizeOfCentralDir), uint64(localHeaderOffset))
-		_, err := f.Write(zip64EndOfCentralDir)
-		if err != nil {
-			return fmt.Errorf("error writing zip64 end of central directory to zip archive: %v", err)
-		}
-		zip64EndOfCentralDirLocator := encodeZip64EndOfCentralDirectoryLocator(uint64(localHeaderOffset + sizeOfCentralDir))
-		_, err = f.Write(zip64EndOfCentralDirLocator)
-		if err != nil {
-			return fmt.Errorf("error writing zip64 end of central directory locator to zip archive: %v", err)
+		writer.WriteFileData(tmpFile)
+		writer.AddCentralDirEntry(file)
+		if tmpFile != nil {
+			tmpFile.Close()
+			os.Remove(tmpFile.Name())
 		}
 	}
-	// Write end of central directory record
-	endOfCentralDir := encodeEndOfCentralDirRecord(z, sizeOfCentralDir, localHeaderOffset)
-	_, err = f.Write(endOfCentralDir)
-	if err != nil {
-		return fmt.Errorf("error writing end of central directory to zip archive: %v", err)
-	}
-
+	writer.WriteCentralDirAndEndDir()
 	return nil
 }
 
