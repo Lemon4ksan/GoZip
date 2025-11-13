@@ -341,8 +341,8 @@ func TestArchiveStructureComprehensive(t *testing.T) {
 			name               string
 			files              []*file
 			comment            string
-			centralDirSize     uint32
-			centralDirOffset   uint32
+			centralDirSize     int64
+			centralDirOffset   int64
 			expectedTotalFiles uint16
 			description        string
 		}{
@@ -409,10 +409,10 @@ func TestArchiveStructureComprehensive(t *testing.T) {
 					t.Errorf("TotalNumberOfEntries mismatch: expected %d, got %d",
 						tc.expectedTotalFiles, record.TotalNumberOfEntries)
 				}
-				if record.CentralDirSize != tc.centralDirSize {
+				if int64(record.CentralDirSize) != tc.centralDirSize {
 					t.Errorf("CentralDirSize mismatch: expected %d, got %d", tc.centralDirSize, record.CentralDirSize)
 				}
-				if record.CentralDirOffset != tc.centralDirOffset {
+				if int64(record.CentralDirOffset) != tc.centralDirOffset {
 					t.Errorf("CentralDirOffset mismatch: expected %d, got %d", tc.centralDirOffset, record.CentralDirOffset)
 				}
 

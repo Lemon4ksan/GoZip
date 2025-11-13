@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path"
 	"strings"
@@ -66,7 +67,6 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	if f == nil {
 		return errors.New("file cannot be nil")
 	}
-
 	file, err := newFileFromOS(f)
 	if err != nil {
 		return fmt.Errorf("newFileFromOS: %v", err)
@@ -74,18 +74,15 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	if file.isDir {
 		return errors.New("AddFile: can't add directories")
 	}
-	file.config.CompressionMethod = z.compressionMethod
 
+	file.config.CompressionMethod = z.compressionMethod
 	for _, opt := range options {
 		opt(file)
 	}
-
-	z.files = append(z.files, file)
-
 	if file.config.Path != "" {
 		z.ensurePath(file)
 	}
-
+	z.files = append(z.files, file)
 	return nil
 }
 
@@ -97,17 +94,13 @@ func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) erro
 	if err != nil {
 		return err
 	}
-
 	for _, opt := range options {
 		opt(file)
 	}
-
-	z.files = append(z.files, file)
-
 	if file.path != "" {
 		z.ensurePath(file)
 	}
-
+	z.files = append(z.files, file)
 	return nil
 }
 
@@ -117,17 +110,13 @@ func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
 	if err != nil {
 		return fmt.Errorf("create directory file: %v", err)
 	}
-
 	for _, opt := range options {
 		opt(file)
 	}
-
-	z.files = append(z.files, file)
-
 	if file.path != "" {
 		z.ensurePath(file)
 	}
-
+	z.files = append(z.files, file)
 	return nil
 }
 
@@ -156,10 +145,10 @@ func (z *Zip) Save(name string) error {
 
 	for _, file := range z.files {
 		h, meta := newZipHeaders(file), NewFileMetadata(file)
-		meta.UpdateFileMetadataExtraField()
+		meta.SetupFileMetadataExtraField()
 		header := h.LocalHeader()
 		headerOffset := localHeaderOffset
-		file.localHeaderOffset = uint32(headerOffset)
+		file.localHeaderOffset = headerOffset
 
 		n, err := f.Write(header.encode(file))
 		if err != nil {
@@ -183,6 +172,10 @@ func (z *Zip) Save(name string) error {
 			}
 		}
 
+		if file.RequiresZip64() {
+			metadata := NewFileMetadata(file)
+			metadata.addZip64ExtraField()
+		}
 		cdData := h.CentralDirEntry()
 		n, err = centralDirBuf.Write(cdData.encode(file))
 		if err != nil {
@@ -198,12 +191,20 @@ func (z *Zip) Save(name string) error {
 		return fmt.Errorf("error writing central directory to zip archive: %v", err)
 	}
 
+	if sizeOfCentralDir > math.MaxUint32 || localHeaderOffset > math.MaxUint32 {
+		zip64EndOfCentralDir := encodeZip64EndOfCentralDirectoryRecord(z, uint64(sizeOfCentralDir), uint64(localHeaderOffset))
+		_, err := f.Write(zip64EndOfCentralDir)
+		if err != nil {
+			return fmt.Errorf("error writing zip64 end of central directory to zip archive: %v", err)
+		}
+		zip64EndOfCentralDirLocator := encodeZip64EndOfCentralDirectoryLocator(uint64(localHeaderOffset + sizeOfCentralDir))
+		_, err = f.Write(zip64EndOfCentralDirLocator)
+		if err != nil {
+			return fmt.Errorf("error writing zip64 end of central directory locator to zip archive: %v", err)
+		}
+	}
 	// Write end of central directory record
-	endOfCentralDir := encodeEndOfCentralDirRecord(
-		z,
-		uint32(sizeOfCentralDir),
-		uint32(localHeaderOffset),
-	)
+	endOfCentralDir := encodeEndOfCentralDirRecord(z, sizeOfCentralDir, localHeaderOffset)
 	_, err = f.Write(endOfCentralDir)
 	if err != nil {
 		return fmt.Errorf("error writing end of central directory to zip archive: %v", err)

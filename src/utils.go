@@ -1,11 +1,12 @@
 package gozip
 
 import (
-    "io"
-    "os"
-    "runtime"
-    "syscall"
-    "time"
+	"io"
+	"os"
+	"runtime"
+	"syscall"
+	"time"
+	"unsafe"
 )
 
 // byteCounterWriter counts bytes written to a writer
@@ -87,17 +88,127 @@ func getFileMetadata(stat os.FileInfo) map[string]interface{} {
     return metadata
 }
 
-func getHostSystem() HostSystem {
+func getFilePathFromFD(fd uintptr) string {
+    kernel32 := syscall.NewLazyDLL("kernel32.dll")
+    getFinalPathNameByHandle := kernel32.NewProc("GetFinalPathNameByHandleW")
+
+    var path [1024]uint16
+    ret, _, _ := getFinalPathNameByHandle.Call(
+        fd,
+        uintptr(unsafe.Pointer(&path[0])),
+        uintptr(len(path)),
+        0, // FILE_NAME_NORMALIZED
+    )
+
+    if ret == 0 || ret > uintptr(len(path)) {
+        return ""
+    }
+
+    return syscall.UTF16ToString(path[:ret])
+}
+
+func hasPreciseTimestamps(metadata map[string]interface{}) bool {
+    if metadata == nil {
+        return false
+    }
+
+    if _, hasWriteTime := metadata["LastWriteTime"]; hasWriteTime {
+        return true
+    }
+    if _, hasAccessTime := metadata["LastAccessTime"]; hasAccessTime {
+        return true
+    }
+    if _, hasCreationTime := metadata["CreationTime"]; hasCreationTime {
+        return true
+    }
+    
+    return false
+}
+
+func getHostSystem(fd uintptr) HostSystem {
+    fsType := getFileSystemFromFD(fd)
+    
+    switch fsType {
+    case FileSystemNTFS:
+        return HostSystemNTFS
+    case FileSystemFAT:
+        return HostSystemFAT
+    case FileSystemEXT4, FileSystemZFS:
+        return HostSystemUNIX
+    case FileSystemAPFS, FileSystemHFSPlus:
+        return HostSystemDarwin
+    default:
+        return getHostSystemByOS()
+    }
+}
+
+func getHostSystemByOS() HostSystem {
     switch runtime.GOOS {
     case "windows":
-        return HostSystemFAT  // For compatibility reasons FAT is used instead of NTFS  
+        return HostSystemNTFS
     case "darwin":
         return HostSystemDarwin
-    case "linux", "freebsd", "openbsd", "netbsd", "dragonfly", "android", "aix", "solaris", "illumos", "plan9":
+    case "linux", "freebsd", "openbsd", "netbsd":
         return HostSystemUNIX
     case "zos":
         return HostSystemMVS
     default:
         return HostSystemFAT
+    }
+}
+
+func getFileSystemFromFD(fd uintptr) FileSystemType {
+    switch runtime.GOOS {
+    case "windows":
+        return getWindowsFileSystem(fd)
+    default:
+        return FileSystemUnknown
+    }
+}
+
+func getWindowsFileSystem(fd uintptr) FileSystemType {
+    var (
+        volumeName      [256]uint16
+        fileSystemName  [256]uint16
+        serialNumber    uint32
+        maxComponentLen uint32
+        fileSystemFlags uint32
+    )
+
+    path := getFilePathFromFD(fd)
+    if path == "" {
+        return FileSystemUnknown
+    }
+
+    kernel32 := syscall.NewLazyDLL("kernel32.dll")
+    getVolumeInformation := kernel32.NewProc("GetVolumeInformationW")
+
+    pathPtr, err := syscall.UTF16PtrFromString(path)
+    if err != nil {
+        return FileSystemUnknown
+    }
+    ret, _, _ := getVolumeInformation.Call(
+        uintptr(unsafe.Pointer(pathPtr)),
+        uintptr(unsafe.Pointer(&volumeName[0])),
+        uintptr(len(volumeName)),
+        uintptr(unsafe.Pointer(&serialNumber)),
+        uintptr(unsafe.Pointer(&maxComponentLen)),
+        uintptr(unsafe.Pointer(&fileSystemFlags)),
+        uintptr(unsafe.Pointer(&fileSystemName[0])),
+        uintptr(len(fileSystemName)),
+    )
+
+    if ret == 0 {
+        return FileSystemUnknown
+    }
+
+    fsName := syscall.UTF16ToString(fileSystemName[:])
+    switch fsName {
+    case "NTFS":
+        return FileSystemNTFS
+    case "FAT", "FAT32", "exFAT":
+        return FileSystemFAT
+    default:
+        return FileSystemUnknown
     }
 }

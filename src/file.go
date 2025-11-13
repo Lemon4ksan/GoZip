@@ -31,7 +31,7 @@ type file struct {
 	config FileConfig
 
 	// ZIP archive structure
-	localHeaderOffset uint32
+	localHeaderOffset int64
 	hostSystem        HostSystem
 
 	// Metadata and timestamps
@@ -53,7 +53,7 @@ func newFileFromOS(f *os.File) (*file, error) {
 		modTime:          stat.ModTime(),
 		isDir:            stat.IsDir(),
 		metadata:         getFileMetadata(stat),
-		hostSystem:       getHostSystem(),
+		hostSystem:       getHostSystem(f.Fd()),
 		source:           f,
 	}, nil
 }
@@ -63,7 +63,7 @@ func newFileFromReader(source io.Reader, name string) (*file, error) {
 	return &file{
 		name:       name,
 		modTime:    time.Now(),
-		hostSystem: getHostSystem(),
+		hostSystem: getHostSystemByOS(),
 		source:     source,
 	}, nil
 }
@@ -74,7 +74,7 @@ func newDirectoryFile(dirPath, dirName string) (*file, error) {
 		name:       dirName,
 		path:       dirPath,
 		isDir:      true,
-		hostSystem: getHostSystem(),
+		hostSystem: getHostSystemByOS(),
 		modTime:    time.Now(),
 	}, nil
 }
@@ -90,76 +90,112 @@ func (f *file) ModTime() time.Time      { return f.modTime }
 func (f *file) SetConfig(config FileConfig) { f.config = config }
 func (f *file) SetSource(source io.Reader)  { f.source = source }
 
+// RequiresZip64 checks whether zip64 extra field should be used for the file
+func (f *file) RequiresZip64() bool {
+	if (f.compressedSize    > math.MaxUint32 ||
+	    f.uncompressedSize  > math.MaxUint32 ||
+	    f.localHeaderOffset > math.MaxUint32) {
+		return true
+	}
+	return false
+}
+
+// getExtraFieldLength returns the total length of all extra fields
+func (f *file) getExtraFieldLength() uint16 {
+	var size uint16
+	for _, entry := range f.extraField {
+		size += uint16(len(entry.Data))
+	}
+	return size
+}
+
+// getFilenameLength returns the length of the filename in bytes
+func (f *file) getFilenameLength() uint16 {
+	filenameLength := uint16(len(path.Join(f.path, f.name)))
+	if f.isDir {
+		filenameLength++
+	}
+	return filenameLength
+}
+
 const __LATEST_ZIP_VERSION uint16 = 63
 
 // fileAttributes handles file attribute calculations
 type fileAttributes struct {
-    file *file
+	file *file
 }
 
 // NewFileAttributes creates a new FileAttributes instance
 func NewFileAttributes(f *file) *fileAttributes {
-    return &fileAttributes{file: f}
+	return &fileAttributes{file: f}
 }
 
 // GetVersionNeededToExtract returns minimum ZIP version needed
 func (fa *fileAttributes) GetVersionNeededToExtract() uint16 {
-    if fa.file.isDir || fa.file.path != "" {
-        return 20
-    }
-    if fa.file.config.CompressionMethod == Deflated {
-        return 20
-    }
-    return 10
+	if fa.file.RequiresZip64() {
+		return 45
+	}
+	if fa.file.isDir || fa.file.path != "" {
+		return 20
+	}
+	if fa.file.config.CompressionMethod == Deflated {
+		return 20
+	}
+	return 10
 }
 
 // GetVersionMadeBy returns version made by field
 func (fa *fileAttributes) GetVersionMadeBy() uint16 {
-    return uint16(fa.file.hostSystem)<<8 | __LATEST_ZIP_VERSION
+	fs := fa.file.hostSystem
+	if fs == HostSystemNTFS {
+		fs = HostSystemFAT
+	}
+	return uint16(fs)<<8 | __LATEST_ZIP_VERSION
 }
 
 // GetFileBitFlag returns general purpose bit flag
 func (fa *fileAttributes) GetFileBitFlag() uint16 {
-    var flag uint16
+	var flag uint16
 
-    if fa.file.config.IsEncrypted {
-        flag |= 0x0001
-    }
+	if fa.file.config.IsEncrypted {
+		flag |= 0x0001
+	}
 
-    if fa.file.config.CompressionMethod == Deflated {
-        flag |= fa.getCompressionLevelBits()
-    }
+	if fa.file.config.CompressionMethod == Deflated {
+		flag |= fa.getCompressionLevelBits()
+	}
 
-    return flag
+	return flag
 }
 
 // GetExternalFileAttributes returns external file attributes
 func (fa *fileAttributes) GetExternalFileAttributes() uint32 {
-    if fa.file.hostSystem == HostSystemFAT {
-        if fa.file.isDir {
-            return 0x10
-        }
-        return 0x20
-    }
-    return 0
+	if fa.file.hostSystem == HostSystemFAT || fa.file.hostSystem == HostSystemNTFS {
+		if fa.file.isDir {
+			return 0x10
+		}
+		return 0x20
+	}
+	return 0
 }
 
+// getCompressionLevelBits returns compression level bits for DEFLATE compression
 func (fa *fileAttributes) getCompressionLevelBits() uint16 {
-    level := fa.file.config.CompressionLevel
-    if level == 0 {
-        level = DeflateNormal
-    }
+	level := fa.file.config.CompressionLevel
+	if level == 0 {
+		level = DeflateNormal
+	}
 
-    switch level {
-    case DeflateSuperFast:
-        return 0x0006
-    case DeflateFast:
-        return 0x0004
-    case DeflateMaximum:
-        return 0x0002
-    default: // DeflateNormal
-        return 0x0000
-    }
+	switch level {
+	case DeflateSuperFast:
+		return 0x0006
+	case DeflateFast:
+		return 0x0004
+	case DeflateMaximum:
+		return 0x0002
+	default: // DeflateNormal
+		return 0x0000
+	}
 }
 
 const (
@@ -181,7 +217,10 @@ func newZipHeaders(f *file) *zipHeaders {
 // LocalHeader creates a local file header
 func (zh *zipHeaders) LocalHeader() localFileHeader {
 	d, t := timeToMsDos(zh.file.modTime)
-
+	var extraFieldLength uint16
+	if zh.file.RequiresZip64() {
+		extraFieldLength = 20
+	}
 	return localFileHeader{
 		VersionNeededToExtract: zh.attrs.GetVersionNeededToExtract(),
 		GeneralPurposeBitFlag:  zh.attrs.GetFileBitFlag(),
@@ -190,9 +229,9 @@ func (zh *zipHeaders) LocalHeader() localFileHeader {
 		LastModFileDate:        d,
 		CRC32:                  0,
 		CompressedSize:         0,
-		UncompressedSize:       uint32(zh.file.uncompressedSize),
-		FilenameLength:         zh.getFilenameLength(),
-		ExtraFieldLength:       zh.getExtraFieldLength(),
+		UncompressedSize:       uint32(min(math.MaxUint32, zh.file.uncompressedSize)),
+		FilenameLength:         zh.file.getFilenameLength(),
+		ExtraFieldLength:       extraFieldLength,
 	}
 }
 
@@ -208,31 +247,16 @@ func (zh *zipHeaders) CentralDirEntry() centralDirectory {
 		LastModFileTime:        t,
 		LastModFileDate:        d,
 		CRC32:                  zh.file.crc32,
-		CompressedSize:         uint32(zh.file.compressedSize),
-		UncompressedSize:       uint32(zh.file.uncompressedSize),
-		FilenameLength:         zh.getFilenameLength(),
+		CompressedSize:         uint32(min(math.MaxUint32, zh.file.compressedSize)),
+		UncompressedSize:       uint32(min(math.MaxUint32, zh.file.uncompressedSize)),
+		FilenameLength:         zh.file.getFilenameLength(),
 		ExtraFieldLength:       zh.file.getExtraFieldLength(),
 		FileCommentLength:      uint16(len(zh.file.config.Comment)),
 		DiskNumberStart:        0,
 		InternalFileAttributes: 0,
 		ExternalFileAttributes: zh.attrs.GetExternalFileAttributes(),
-		LocalHeaderOffset:      zh.file.localHeaderOffset,
+		LocalHeaderOffset:      uint32(min(math.MaxUint32, zh.file.localHeaderOffset)),
 	}
-}
-
-func (zh *zipHeaders) getFilenameLength() uint16 {
-	filenameLength := uint16(len(path.Join(zh.file.path, zh.file.name)))
-	if zh.file.isDir {
-		filenameLength++
-	}
-	return filenameLength
-}
-
-func (zh *zipHeaders) getExtraFieldLength() uint16 {
-	if zh.file.HasExtraField(__ZIP64_EXTRA_FIELD) {
-		return 32
-	}
-	return 0
 }
 
 // FileMetadata handles file metadata and extra fields
@@ -251,20 +275,29 @@ func NewFileMetadata(f *file) *FileMetadata {
 	return &FileMetadata{file: f}
 }
 
-// UpdateFileMetadataExtraField updates extra fields with file metadata
-func (fm *FileMetadata) UpdateFileMetadataExtraField() {
-	if fm.file.metadata == nil {
-		return
+// GetExtraField returns extra field entry with given tag
+func (fm *FileMetadata) GetExtraField(tag uint16) ExtraFieldEntry {
+	for _, entry := range fm.file.extraField {
+		if entry.Tag == tag {
+			return entry
+		}
 	}
+	return ExtraFieldEntry{}
+}
 
-	if fm.file.hostSystem == HostSystemNTFS && !fm.file.HasExtraField(__NTFS_METADATA_FIELD) {
-		fm.addNTFSExtraField()
+// HasExtraField checks if extra field with given tag exists
+func (fm *FileMetadata) HasExtraField(tag uint16) bool {
+	for _, entry := range fm.file.extraField {
+		if entry.Tag == tag {
+			return true
+		}
 	}
+	return false
 }
 
 // AddExtraFieldEntry adds an extra field entry
 func (fm *FileMetadata) AddExtraFieldEntry(entry ExtraFieldEntry) error {
-	if fm.file.HasExtraField(entry.Tag) {
+	if fm.HasExtraField(entry.Tag) {
 		return errors.New("entry with the same tag already exists")
 	}
 	if int(fm.file.getExtraFieldLength())+len(entry.Data) > math.MaxUint16 {
@@ -274,14 +307,39 @@ func (fm *FileMetadata) AddExtraFieldEntry(entry ExtraFieldEntry) error {
 	return nil
 }
 
-// HasExtraField checks if extra field with given tag exists
-func (f *file) HasExtraField(tag uint16) bool {
-	for _, entry := range f.extraField {
-		if entry.Tag == tag {
-			return true
-		}
+// SetupFileMetadataExtraField creates and sets extra fields with file metadata
+func (fm *FileMetadata) SetupFileMetadataExtraField() {
+	if fm.file.metadata == nil {
+		return
 	}
-	return false
+
+	if fm.file.hostSystem == HostSystemNTFS && !fm.HasExtraField(__NTFS_METADATA_FIELD) {
+		fm.addNTFSExtraField()
+	}
+}
+
+func (fm *FileMetadata) addZip64ExtraField() {
+	buf := new(bytes.Buffer)
+
+	binary.Write(buf, binary.LittleEndian, uint16(__ZIP64_EXTRA_FIELD))
+	binary.Write(buf, binary.LittleEndian, uint16(0))
+
+	var size uint16
+	if fm.file.uncompressedSize > math.MaxUint32 {
+		binary.Write(buf, binary.LittleEndian, uint64(fm.file.uncompressedSize))
+		size += 8
+	}
+	if fm.file.compressedSize > math.MaxUint32 {
+		binary.Write(buf, binary.LittleEndian, uint64(fm.file.compressedSize))
+		size += 8
+	}
+	if fm.file.localHeaderOffset > math.MaxUint32 {
+		binary.Write(buf, binary.LittleEndian, uint64(fm.file.localHeaderOffset))
+		size += 8
+	}
+	data := buf.Bytes()
+	binary.LittleEndian.PutUint16(data[2:4], size)
+	fm.AddExtraFieldEntry(ExtraFieldEntry{Tag: __ZIP64_EXTRA_FIELD, Data: data})
 }
 
 func (fm *FileMetadata) addNTFSExtraField() {
@@ -314,26 +372,18 @@ func (fm *FileMetadata) addNTFSExtraField() {
 	fm.file.extraField = append(fm.file.extraField, ExtraFieldEntry{__NTFS_METADATA_FIELD, buf.Bytes()})
 }
 
-func (f *file) getExtraFieldLength() uint16 {
-	var size uint16
-	for _, entry := range f.extraField {
-		size += uint16(len(entry.Data))
-	}
-	return size
-}
-
-// FileOperations handles file compression and writing operations
-type FileOperations struct {
+// fileOperations handles file compression and writing operations
+type fileOperations struct {
 	file *file
 }
 
 // NewFileOperations creates a new FileOperations instance
-func NewFileOperations(f *file) *FileOperations {
-	return &FileOperations{file: f}
+func NewFileOperations(f *file) *fileOperations {
+	return &fileOperations{file: f}
 }
 
 // CompressAndWrite compresses the file content and writes it to destination
-func (fo *FileOperations) CompressAndWrite(dest io.Writer) error {
+func (fo *fileOperations) CompressAndWrite(dest io.Writer) error {
 	var uncompressedSize int64
 	var err error
 
@@ -360,7 +410,7 @@ func (fo *FileOperations) CompressAndWrite(dest io.Writer) error {
 }
 
 // UpdateLocalHeader updates the local file header with actual values
-func (fo *FileOperations) UpdateLocalHeader(dest *os.File, offset int64) error {
+func (fo *fileOperations) UpdateLocalHeader(dest io.WriteSeeker, offset int64) error {
 	currentPos, err := dest.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
@@ -373,18 +423,37 @@ func (fo *FileOperations) UpdateLocalHeader(dest *os.File, offset int64) error {
 	}
 
 	binary.Write(dest, binary.LittleEndian, fo.file.crc32)
-	binary.Write(dest, binary.LittleEndian, uint32(fo.file.compressedSize))
-	binary.Write(dest, binary.LittleEndian, uint32(fo.file.uncompressedSize))
+	binary.Write(dest, binary.LittleEndian, uint32(min(math.MaxUint32, fo.file.compressedSize)))
+	binary.Write(dest, binary.LittleEndian, uint32(min(math.MaxUint32, fo.file.uncompressedSize)))
+
+	if fo.file.RequiresZip64() {
+		buf := new(bytes.Buffer)
+		binary.Write(buf, binary.LittleEndian, __ZIP64_EXTRA_FIELD)
+		binary.Write(buf, binary.LittleEndian, uint16(16))
+		binary.Write(buf, binary.LittleEndian, fo.file.uncompressedSize)
+		binary.Write(buf, binary.LittleEndian, fo.file.compressedSize)
+
+		_, err := dest.Seek(2, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		binary.Write(dest, binary.LittleEndian, uint16(20))
+		_, err = dest.Seek(int64(fo.file.getFilenameLength()), io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		dest.Write(buf.Bytes())
+	}
 
 	return nil
 }
 
-func (fo *FileOperations) writeStored(counter *byteCounterWriter, hasher hash.Hash32) (int64, error) {
+func (fo *fileOperations) writeStored(counter *byteCounterWriter, hasher hash.Hash32) (int64, error) {
 	multiWriter := io.MultiWriter(counter, hasher)
 	return io.Copy(multiWriter, fo.file.source)
 }
 
-func (fo *FileOperations) writeDeflated(counter *byteCounterWriter, hasher hash.Hash32) (int64, error) {
+func (fo *fileOperations) writeDeflated(counter *byteCounterWriter, hasher hash.Hash32) (int64, error) {
 	tee := io.TeeReader(fo.file.source, hasher)
 
 	level := fo.file.config.CompressionLevel

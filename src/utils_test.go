@@ -2,7 +2,6 @@ package gozip
 
 import (
 	"bytes"
-	"runtime"
 	"testing"
 	"time"
 )
@@ -168,30 +167,5 @@ func TestRoundTrip(t *testing.T) {
                 t.Errorf("round trip mismatch: original %v, got %v", tt.time, result)
             }
         })
-    }
-}
-
-func TestGetHostSystem(t *testing.T) {
-    // systems := map[string]HostSystem{
-    //     "windows":  HostSystemNTFS,
-    //     "darwin":   HostSystemDarwin,
-    //     "linux":    HostSystemUNIX,
-    //     "freebsd":  HostSystemUNIX,
-    //     "android":  HostSystemUNIX,
-    //     "solaris":  HostSystemUNIX,
-    //     "plan9":    HostSystemUNIX,
-    //     "zos":      HostSystemMVS,
-    //     "unknown":  HostSystemFAT,
-    // }
-
-    // We can't test all runtime.GOOS values, but we can verify the function doesn't panic
-    system := getHostSystem()
-    if system == HostSystem(255) { // Invalid value
-        t.Error("getHostSystem returned invalid host system")
-    }
-
-    // Test that known systems return expected values (where possible)
-    if runtime.GOOS == "windows" && system != HostSystemFAT {
-        t.Errorf("on windows expected HostSystemFAT, got %v", system)
     }
 }

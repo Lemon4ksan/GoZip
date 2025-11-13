@@ -25,6 +25,19 @@ const (
 	NotEncrypted EncryptionMethod = 0 // No encryption - file stored in plaintext
 )
 
+// FileSystemType represents the type of file system on which the ZIP file was created
+type FileSystemType int
+
+const (
+    FileSystemUnknown FileSystemType = iota
+    FileSystemFAT
+    FileSystemNTFS
+    FileSystemEXT4
+    FileSystemAPFS
+    FileSystemHFSPlus
+    FileSystemZFS
+)
+
 // HostSystem represents the host system on which the ZIP file was created
 type HostSystem uint8
 

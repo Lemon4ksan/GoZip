@@ -3,6 +3,7 @@ package gozip
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"path"
 )
 
@@ -39,11 +40,8 @@ func (h localFileHeader) encode(f *file) []byte {
 	if f.isDir {
 		buf.WriteString("/")
 	}
-	for _, entry := range f.extraField {
-		if entry.Tag == __ZIP64_EXTRA_FIELD {
-			buf.Write(entry.Data)
-			break
-		}
+	if f.RequiresZip64() {
+		buf.Write(make([]byte, 20))
 	}
 	return buf.Bytes()
 }
@@ -94,19 +92,67 @@ type endOfCentralDirectory struct {
 
 // encodeEndOfCentralDirRecord creates the end of central directory record.
 // This marks the end of the ZIP file and contains archive-wide information.
-func encodeEndOfCentralDirRecord(z *Zip, centralDirSize uint32, centralDirOffset uint32) []byte {
+func encodeEndOfCentralDirRecord(z *Zip, centralDirSize int64, centralDirOffset int64) []byte {
 	record := endOfCentralDirectory{
 		ThisDiskNum:                     0,
 		DiskNumWithTheStartOfCentralDir: 0,
 		TotalNumberOfEntriesOnThisDisk:  uint16(len(z.files)),
 		TotalNumberOfEntries:            uint16(len(z.files)),
-		CentralDirSize:                  centralDirSize,
-		CentralDirOffset:                centralDirOffset,
+		CentralDirSize:                  uint32(min(math.MaxUint32, centralDirSize)),
+		CentralDirOffset:                uint32(min(math.MaxUint32, centralDirOffset)),
 		CommentLength:                   uint16(len(z.comment)),
 	}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, __END_OF_CENTRAL_DIRECTORY_SIGNATURE)
 	binary.Write(buf, binary.LittleEndian, record)
 	buf.WriteString(z.comment)
+	return buf.Bytes()
+}
+
+type zip64EndOfCentralDirectory struct {
+	Size                            uint64
+	VersionMadeBy                   uint16
+	VersionNeededToExtract          uint16
+	ThisDiskNum                     uint32
+	DiskNumWithTheStartOfCentralDir uint32
+	TotalNumberOfEntriesOnThisDisk  uint64
+	TotalNumberOfEntries            uint64
+	CentralDirSize                  uint64
+	CentralDirOffset                uint64
+}
+
+func encodeZip64EndOfCentralDirectoryRecord(z *Zip, centralDirSize uint64, centralDirOffset uint64) []byte {
+	record := zip64EndOfCentralDirectory{
+		Size:                            44,
+		VersionMadeBy:                   1,
+		VersionNeededToExtract:          1,
+		ThisDiskNum:                     0,
+		DiskNumWithTheStartOfCentralDir: 0,
+		TotalNumberOfEntriesOnThisDisk:  uint64(len(z.files)),
+		TotalNumberOfEntries:            uint64(len(z.files)),
+		CentralDirSize:                  centralDirSize,
+		CentralDirOffset:                centralDirOffset,
+	}
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, __ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE)
+	binary.Write(buf, binary.LittleEndian, record)
+	return buf.Bytes()
+}
+
+type zip64EndOfCentralDirectoryLocator struct {
+	EndOfCentralDirStartDiskNum uint32
+	EndOfCentralDirOffset       uint64
+	TotalNumberOfDisks          uint32
+}
+
+func encodeZip64EndOfCentralDirectoryLocator(endOfCentralDirOffset uint64) []byte {
+	locator := zip64EndOfCentralDirectoryLocator{
+		EndOfCentralDirStartDiskNum: 0,
+		EndOfCentralDirOffset:       endOfCentralDirOffset,
+		TotalNumberOfDisks:          0,
+	}
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, __ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE)
+	binary.Write(buf, binary.LittleEndian, locator)
 	return buf.Bytes()
 }
