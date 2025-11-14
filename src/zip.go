@@ -250,6 +250,29 @@ func (z *Zip) Save(name string) error {
 	return writer.WriteCentralDirAndEndRecords()
 }
 
+// SaveParallel writes the ZIP archive using multiple workers for parallel compression.
+// Parallel compression is only effective for compression methods other than Stored.
+// Returns a slice of errors encountered during compression.
+func (z *Zip) SaveParallel(name string, maxWorkers int) []error {
+	if name == "" {
+		return []error{errors.New("filename cannot be empty")}
+	}
+
+	dest, err := os.Create(name)
+	if err != nil {
+		return []error{fmt.Errorf("create destination file: %w", err)}
+	}
+	defer dest.Close()
+
+	writer := newParallelZipWriter(z, dest, maxWorkers)
+	errs := writer.WriteFiles(z.files)
+
+	if err = writer.zw.WriteCentralDirAndEndRecords(); err != nil {
+		errs = append(errs, err)
+	}
+	return errs
+}
+
 // ensurePath verifies that the file's directory path exists in the archive,
 // creating any missing parent directories if necessary.
 func (z *Zip) ensurePath(f *file) error {

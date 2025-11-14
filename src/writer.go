@@ -11,6 +11,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"sync"
 )
 
 // zipWriter handles the low-level writing of ZIP archive structure
@@ -132,7 +133,7 @@ func (zw *zipWriter) encodeFileData(file *file) (*os.File, error) {
 	case Deflated:
 		uncompressedSize, err = writeDeflated(file, sizeCounter, hasher)
 	default:
-		return nil, errors.New("unsupported compression method")
+		err = errors.New("unsupported compression method")
 	}
 	if err != nil {
 		cleanupTempFile(tmpFile)
@@ -288,4 +289,127 @@ func cleanupTempFile(tmpFile *os.File) {
 		tmpFile.Close()
 		os.Remove(tmpFile.Name())
 	}
+}
+
+// parallelZipWriter handles parallel compression and writing of files to a ZIP archive
+type parallelZipWriter struct {
+	zw  *zipWriter
+	sem chan struct{}
+}
+
+// newParallelZipWriter creates a new parallelZipWriter instance
+func newParallelZipWriter(zip *Zip, dest io.WriteSeeker, workers int) *parallelZipWriter {
+	return &parallelZipWriter{
+		zw:  newZipWriter(zip, dest),
+		sem: make(chan struct{}, workers),
+	}
+}
+
+// WriteFiles processes multiple files in parallel and writes them to the ZIP archive.
+// This method performs compression concurrently using a worker pool but writes
+// files sequentially to maintain proper ZIP format structure.
+func (pzw *parallelZipWriter) WriteFiles(files []*file) []error {
+	var wg sync.WaitGroup
+	results := make(chan struct {
+		file    *file
+		tmpFile *os.File
+		err     error
+	}, len(files))
+
+	for _, f := range files {
+		wg.Add(1)
+		go func(f *file) {
+			defer wg.Done()
+			pzw.sem <- struct{}{}
+			defer func() { <-pzw.sem }()
+
+			tmpFile, err := pzw.compressFile(f)
+			results <- struct {
+				file    *file
+				tmpFile *os.File
+				err     error
+			}{f, tmpFile, err}
+		}(f)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var errs []error
+	for result := range results {
+		if result.err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", result.file.name, result.err))
+			continue
+		}
+		if err := pzw.writeCompressedFile(result.file, result.tmpFile); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", result.file.name, err))
+		}
+		cleanupTempFile(result.tmpFile)
+	}
+	return errs
+}
+
+// compressFile compresses a single file according to its configuration
+func (pzw *parallelZipWriter) compressFile(file *file) (*os.File, error) {
+	if file.isDir {
+		return nil, nil
+	}
+
+	tmpFile, err := os.CreateTemp("", "zip-compress-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp file: %w", err)
+	}
+
+	sizeCounter := &byteCounterWriter{dest: tmpFile}
+	hasher := crc32.NewIEEE()
+
+	var uncompressedSize int64
+	switch file.config.CompressionMethod {
+	case Stored:
+		uncompressedSize, err = writeStored(file, sizeCounter, hasher)
+	case Deflated:
+		uncompressedSize, err = writeDeflated(file, sizeCounter, hasher)
+	default:
+		err = errors.New("unsupported compression method")
+	}
+	if err != nil {
+		cleanupTempFile(tmpFile)
+		return nil, fmt.Errorf("compression: %w", err)
+	}
+
+	file.uncompressedSize = uncompressedSize
+	file.compressedSize = sizeCounter.bytesWritten
+	file.crc32 = hasher.Sum32()
+
+	return tmpFile, nil
+}
+
+// writeCompressedFile writes a compressed file to the ZIP archive and creates central directory entry
+func (pzw *parallelZipWriter) writeCompressedFile(file *file, tmpFile *os.File) error {
+	meta := NewFileMetadata(file)
+	meta.AddFilesystemExtraField()
+
+	if err := pzw.zw.writeFileHeader(file); err != nil {
+		return fmt.Errorf("write header: %w", err)
+	}
+
+	if !file.isDir {
+		pzw.zw.localHeaderOffset += file.compressedSize
+
+		if err := pzw.zw.updateLocalHeader(file); err != nil {
+			return fmt.Errorf("update header: %w", err)
+		}
+
+		if err := pzw.zw.writeFileData(tmpFile); err != nil {
+			return fmt.Errorf("write data: %w", err)
+		}
+	}
+
+	if file.RequiresZip64() {
+		meta.addZip64ExtraField()
+	}
+
+	return pzw.zw.addCentralDirEntry(file)
 }
