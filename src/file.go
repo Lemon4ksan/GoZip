@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path"
@@ -76,6 +77,21 @@ func newDirectoryFile(dirPath, dirName string) (*file, error) {
 	}, nil
 }
 
+func newDirectoryFileFromDirEntry(dir fs.DirEntry) (*file, error) {
+	stat, err := dir.Info()
+	if err != nil {
+		return nil, err
+	}
+	return &file{
+		name:             stat.Name(),
+		uncompressedSize: stat.Size(),
+		modTime:          stat.ModTime(),
+		isDir:            true,
+		metadata:         getFileMetadata(stat),
+		hostSystem:       getHostSystemByOS(),
+	}, nil
+}
+
 func (f *file) Name() string            { return f.name }
 func (f *file) Path() string            { return f.path }
 func (f *file) IsDir() bool             { return f.isDir }
@@ -92,7 +108,7 @@ func (f *file) SetConfig(config FileConfig) {
 		f.config.Comment = config.Comment
 	}
 }
-func (f *file) SetSource(source io.Reader)  { f.source = source }
+func (f *file) SetSource(source io.Reader) { f.source = source }
 
 // RequiresZip64 checks whether zip64 extra field should be used for the file
 func (f *file) RequiresZip64() bool {

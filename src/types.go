@@ -87,8 +87,6 @@ type endOfCentralDirectory struct {
 	CommentLength                   uint16
 }
 
-// encodeEndOfCentralDirRecord creates the end of central directory record.
-// This marks the end of the ZIP file and contains archive-wide information.
 func encodeEndOfCentralDirRecord(z *Zip, centralDirSize uint64, centralDirOffset uint64) []byte {
 	record := endOfCentralDirectory{
 		ThisDiskNum:                     0,

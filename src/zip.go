@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 )
 
@@ -24,6 +26,12 @@ type AddOption func(f *file)
 func WithConfig(c FileConfig) AddOption {
 	return func(f *file) {
 		f.SetConfig(c)
+	}
+}
+
+func PrefixPath(p string) AddOption {
+	return func(f *file) {
+		f.config.Path = filepath.Join(p, f.config.Path)
 	}
 }
 
@@ -84,6 +92,56 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	return nil
 }
 
+// AddDirectory recursively goes through the directory at given path
+// and adds all files excluding root to the archive, applying options to each of them.
+// Returns list of opened files that must be closed after archive is saved or error occurs.
+func (z *Zip) AddDirectory(root string, options ...AddOption) ([]*os.File, error) {
+	files := make([]*os.File, 0)
+	root = filepath.Clean(root)
+
+	err := filepath.WalkDir(root, func(walkPath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if walkPath == root {
+			return nil
+		}
+		relPath, err := filepath.Rel(root, walkPath)
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			file, err := newDirectoryFileFromDirEntry(d)
+			if err != nil {
+				return err
+			}
+			for _, opt := range append(options, PrefixPath(filepath.Dir(relPath))) {
+				opt(file)
+			}
+			if file.config.Path != "" {
+				err := z.ensurePath(file)
+				if err != nil {
+					return fmt.Errorf("ensure path: %v", err)
+				}
+			}
+			z.files = append(z.files, file)
+		} else {
+			file, err := os.Open(walkPath)
+			if err != nil {
+				return err
+			}
+			dirPath := filepath.Dir(relPath)
+			if dirPath == "." {
+				dirPath = ""
+			}
+			z.AddFile(file, append(options, PrefixPath(dirPath))...)
+			files = append(files, file)
+		}
+		return nil
+	})
+	return files, err
+}
+
 // AddReader adds a file to the ZIP archive from an [io.Reader] interface.
 // This allows adding files from sources other than the filesystem, such as memory buffers or network streams.
 // The filename parameter specifies the name that will be used for the file in the archive.
@@ -95,7 +153,7 @@ func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) erro
 	for _, opt := range options {
 		opt(file)
 	}
-	if file.path != "" {
+	if file.config.Path != "" {
 		z.ensurePath(file)
 	}
 	z.files = append(z.files, file)
@@ -111,7 +169,7 @@ func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
 	for _, opt := range options {
 		opt(file)
 	}
-	if file.path != "" {
+	if file.config.Path != "" {
 		err := z.ensurePath(file)
 		if err != nil {
 			return fmt.Errorf("ensure path: %v", err)
@@ -186,7 +244,7 @@ func (z *Zip) ensurePath(f *file) error {
 		return nil
 	}
 
-	normalizedPath := path.Clean(f.config.Path)
+	normalizedPath := filepath.ToSlash(filepath.Clean(f.config.Path))
 	if normalizedPath == "." || normalizedPath == "/" {
 		return nil
 	}
