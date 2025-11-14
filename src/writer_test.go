@@ -41,7 +41,7 @@ func TestZipWriter_WriteFileHeader(t *testing.T) {
 			var buf bytes.Buffer
 			zw := newZipWriter(NewZip(Stored), &seekableBuffer{Buffer: &buf})
 
-			err := zw.WriteFileHeader(tt.file)
+			err := zw.writeFileHeader(tt.file)
 
 			if (err != nil) != tt.wantErr {
 				t.Errorf("WriteFileHeader() error = %v, wantErr %v", err, tt.wantErr)
@@ -101,7 +101,7 @@ func TestZipWriter_CompressFileData(t *testing.T) {
 				config: FileConfig{CompressionMethod: tt.compression},
 			}
 
-			tmpFile, err := zw.EncodeFileData(file)
+			tmpFile, err := zw.encodeFileData(file)
 
 			// Clean up temp file if created
 			if tmpFile != nil {
@@ -163,7 +163,7 @@ func TestZipWriter_AddCentralDirEntry(t *testing.T) {
 	var buf bytes.Buffer
 	zw := newZipWriter(NewZip(Stored), &seekableBuffer{Buffer: &buf})
 
-	err := zw.AddCentralDirEntry(file)
+	err := zw.addCentralDirEntry(file)
 	if err != nil {
 		t.Errorf("AddCentralDirEntry() error = %v", err)
 	}
@@ -202,13 +202,13 @@ func TestZipWriter_UpdateLocalHeader(t *testing.T) {
 	zw := newZipWriter(NewZip(Stored), &seekableBuffer{Buffer: &buf})
 
 	// Write initial header
-	err := zw.WriteFileHeader(file)
+	err := zw.writeFileHeader(file)
 	if err != nil {
 		t.Fatalf("WriteFileHeader() error = %v", err)
 	}
 
 	// Update with compression results
-	err = zw.UpdateLocalHeader(file)
+	err = zw.updateLocalHeader(file)
 	if err != nil {
 		t.Errorf("UpdateLocalHeader() error = %v", err)
 	}
@@ -261,7 +261,7 @@ func TestZipWriter_WriteFileData(t *testing.T) {
 	tmpFile.Seek(0, io.SeekStart)
 
 	// Write temp file data to destination
-	err = zw.WriteFileData(tmpFile)
+	err = zw.writeFileData(tmpFile)
 	if err != nil {
 		t.Errorf("WriteFileData() error = %v", err)
 	}
@@ -287,12 +287,12 @@ func TestZipWriter_Integration(t *testing.T) {
 	}
 
 	// Complete flow
-	err := zw.WriteFileHeader(file)
+	err := zw.writeFileHeader(file)
 	if err != nil {
 		t.Fatalf("WriteFileHeader failed: %v", err)
 	}
 
-	tmpFile, err := zw.EncodeFileData(file)
+	tmpFile, err := zw.encodeFileData(file)
 	if err != nil {
 		t.Fatalf("CompressFileData failed: %v", err)
 	}
@@ -301,22 +301,22 @@ func TestZipWriter_Integration(t *testing.T) {
 		defer tmpFile.Close()
 	}
 
-	err = zw.WriteFileData(tmpFile)
+	err = zw.writeFileData(tmpFile)
 	if err != nil {
 		t.Fatalf("WriteFileData failed: %v", err)
 	}
 
-	err = zw.UpdateLocalHeader(file)
+	err = zw.updateLocalHeader(file)
 	if err != nil {
 		t.Fatalf("UpdateLocalHeader failed: %v", err)
 	}
 
-	err = zw.AddCentralDirEntry(file)
+	err = zw.addCentralDirEntry(file)
 	if err != nil {
 		t.Fatalf("AddCentralDirEntry failed: %v", err)
 	}
 
-	err = zw.WriteCentralDirAndEndDir()
+	err = zw.WriteCentralDirAndEndRecords()
 	if err != nil {
 		t.Fatalf("WriteCentralDirAndEndDir failed: %v", err)
 	}

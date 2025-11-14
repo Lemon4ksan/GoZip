@@ -4,12 +4,21 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"math"
 	"os"
 	"path"
+	"strings"
 	"time"
+)
+
+// Constants for ZIP format
+const (
+	__LATEST_ZIP_VERSION     uint16 = 63
+	__ZIP64_EXTRA_FIELD_ID   uint16 = 0x0001
+	__NTFS_METADATA_FIELD_ID uint16 = 0x000A
 )
 
 // file represents a file to be compressed and added to a ZIP archive
@@ -38,13 +47,12 @@ type file struct {
 	extraField []ExtraFieldEntry
 }
 
-// newFileFromOS creates a File from an os.File instance
+// newFileFromOS creates a File from an [os.File] instance
 func newFileFromOS(f *os.File) (*file, error) {
 	stat, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get file stats: %w", err)
 	}
-
 	return &file{
 		name:             stat.Name(),
 		uncompressedSize: stat.Size(),
@@ -56,7 +64,7 @@ func newFileFromOS(f *os.File) (*file, error) {
 	}, nil
 }
 
-// newFileFromReader creates a File from an io.Reader
+// newFileFromReader creates a File from an [io.Reader]
 func newFileFromReader(source io.Reader, name string) (*file, error) {
 	return &file{
 		name:       name,
@@ -68,6 +76,9 @@ func newFileFromReader(source io.Reader, name string) (*file, error) {
 
 // newDirectoryFile creates a File representing a directory
 func newDirectoryFile(dirPath, dirName string) (*file, error) {
+	if dirName == "" {
+		return nil, errors.New("directory name cannot be empty")
+	}
 	return &file{
 		name:       dirName,
 		path:       dirPath,
@@ -77,10 +88,11 @@ func newDirectoryFile(dirPath, dirName string) (*file, error) {
 	}, nil
 }
 
+// newDirectoryFileFromDirEntry creates a directory file from [fs.DirEntry]
 func newDirectoryFileFromDirEntry(dir fs.DirEntry) (*file, error) {
 	stat, err := dir.Info()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get dir entry info: %w", err)
 	}
 	return &file{
 		name:             stat.Name(),
@@ -108,19 +120,17 @@ func (f *file) SetConfig(config FileConfig) {
 		f.config.Comment = config.Comment
 	}
 }
+
 func (f *file) SetSource(source io.Reader) { f.source = source }
 
 // RequiresZip64 checks whether zip64 extra field should be used for the file
 func (f *file) RequiresZip64() bool {
-	if f.compressedSize > math.MaxUint32 ||
+	return f.compressedSize > math.MaxUint32 ||
 		f.uncompressedSize > math.MaxUint32 ||
-		f.localHeaderOffset > math.MaxUint32 {
-		return true
-	}
-	return false
+		f.localHeaderOffset > math.MaxUint32
 }
 
-// getExtraFieldLength returns the total length of all extra fields
+// getExtraFieldLength returns the total length of all extra field entries
 func (f *file) getExtraFieldLength() uint16 {
 	var size uint16
 	for _, entry := range f.extraField {
@@ -131,14 +141,12 @@ func (f *file) getExtraFieldLength() uint16 {
 
 // getFilenameLength returns the length of the filename in bytes
 func (f *file) getFilenameLength() uint16 {
-	filenameLength := uint16(len(path.Join(f.path, f.name)))
-	if f.isDir {
-		filenameLength++
+	filename := path.Join(f.path, f.name)
+	if f.isDir && !strings.HasSuffix(filename, "/") {
+		filename += "/"
 	}
-	return filenameLength
+	return uint16(len(filename))
 }
-
-const __LATEST_ZIP_VERSION uint16 = 63
 
 // fileAttributes handles file attribute calculations
 type fileAttributes struct {
@@ -192,9 +200,9 @@ func (fa *fileAttributes) GetFileBitFlag() uint16 {
 func (fa *fileAttributes) GetExternalFileAttributes() uint32 {
 	if fa.file.hostSystem == HostSystemFAT || fa.file.hostSystem == HostSystemNTFS {
 		if fa.file.isDir {
-			return 0x10
+			return 0x10 // Directory attribute
 		}
-		return 0x20
+		return 0x20 // Archive attribute
 	}
 	return 0
 }
@@ -218,11 +226,6 @@ func (fa *fileAttributes) getCompressionLevelBits() uint16 {
 	}
 }
 
-const (
-	__ZIP64_EXTRA_FIELD   uint16 = 0x0001
-	__NTFS_METADATA_FIELD uint16 = 0x000A
-)
-
 // zipHeaders handles ZIP format header creation
 type zipHeaders struct {
 	file  *file
@@ -236,32 +239,33 @@ func newZipHeaders(f *file) *zipHeaders {
 
 // LocalHeader creates a local file header
 func (zh *zipHeaders) LocalHeader() localFileHeader {
-	d, t := timeToMsDos(zh.file.modTime)
+	dosDate, dosTime := timeToMsDos(zh.file.modTime)
+
 	return localFileHeader{
 		VersionNeededToExtract: zh.attrs.GetVersionNeededToExtract(),
 		GeneralPurposeBitFlag:  zh.attrs.GetFileBitFlag(),
 		CompressionMethod:      uint16(zh.file.config.CompressionMethod),
-		LastModFileTime:        t,
-		LastModFileDate:        d,
-		CRC32:                  0,
-		CompressedSize:         0,
+		LastModFileTime:        dosTime,
+		LastModFileDate:        dosDate,
+		CRC32:                  0, // Will be updated later
+		CompressedSize:         0, // Will be updated later
 		UncompressedSize:       uint32(min(math.MaxUint32, zh.file.uncompressedSize)),
 		FilenameLength:         zh.file.getFilenameLength(),
-		ExtraFieldLength:       0,
+		ExtraFieldLength:       0, // Will be updated if ZIP64 is needed
 	}
 }
 
 // CentralDirEntry creates a central directory entry
 func (zh *zipHeaders) CentralDirEntry() centralDirectory {
-	d, t := timeToMsDos(zh.file.modTime)
+	dosDate, dosTime := timeToMsDos(zh.file.modTime)
 
 	return centralDirectory{
 		VersionMadeBy:          zh.attrs.GetVersionMadeBy(),
 		VersionNeededToExtract: zh.attrs.GetVersionNeededToExtract(),
 		GeneralPurposeBitFlag:  zh.attrs.GetFileBitFlag(),
 		CompressionMethod:      uint16(zh.file.config.CompressionMethod),
-		LastModFileTime:        t,
-		LastModFileDate:        d,
+		LastModFileTime:        dosTime,
+		LastModFileDate:        dosDate,
 		CRC32:                  zh.file.crc32,
 		CompressedSize:         uint32(min(math.MaxUint32, zh.file.compressedSize)),
 		UncompressedSize:       uint32(min(math.MaxUint32, zh.file.uncompressedSize)),
@@ -282,8 +286,8 @@ type FileMetadata struct {
 
 // ExtraFieldEntry represents an external file data
 type ExtraFieldEntry struct {
-	Tag  uint16
-	Data []byte
+	Tag  uint16  // Extra field identifier
+	Data []byte  // Encoded field data including tag
 }
 
 // NewFileMetadata creates a new FileMetadata instance
@@ -328,16 +332,15 @@ func (fm *FileMetadata) AddFilesystemExtraField() {
 	if fm.file.metadata == nil {
 		return
 	}
-
-	if fm.file.hostSystem == HostSystemNTFS && !fm.HasExtraField(__NTFS_METADATA_FIELD) {
+	if fm.file.hostSystem == HostSystemNTFS && !fm.HasExtraField(__NTFS_METADATA_FIELD_ID) {
 		fm.addNTFSExtraField()
 	}
 }
 
+// addZip64ExtraField adds ZIP64 extra field for large files
 func (fm *FileMetadata) addZip64ExtraField() {
-	buf := new(bytes.Buffer)
-
-	binary.Write(buf, binary.LittleEndian, uint16(__ZIP64_EXTRA_FIELD))
+	buf := bytes.NewBuffer(nil)
+	binary.Write(buf, binary.LittleEndian, __ZIP64_EXTRA_FIELD_ID)
 	binary.Write(buf, binary.LittleEndian, uint16(0))
 
 	var size uint16
@@ -353,11 +356,13 @@ func (fm *FileMetadata) addZip64ExtraField() {
 		binary.Write(buf, binary.LittleEndian, uint64(fm.file.localHeaderOffset))
 		size += 8
 	}
+
 	data := buf.Bytes()
 	binary.LittleEndian.PutUint16(data[2:4], size)
-	fm.AddExtraFieldEntry(ExtraFieldEntry{Tag: __ZIP64_EXTRA_FIELD, Data: data})
+	fm.AddExtraFieldEntry(ExtraFieldEntry{Tag: __ZIP64_EXTRA_FIELD_ID, Data: data})
 }
 
+// addNTFSExtraField adds NTFS timestamp extra field
 func (fm *FileMetadata) addNTFSExtraField() {
 	var mtime, atime, ctime uint64
 	if mTime, ok := fm.file.metadata["LastWriteTime"].(uint64); ok {
@@ -380,10 +385,13 @@ func (fm *FileMetadata) addNTFSExtraField() {
 		Atime      uint64
 		Ctime      uint64
 	}{
-		__NTFS_METADATA_FIELD, 32, 0, 1, 24, mtime, atime, ctime,
+		__NTFS_METADATA_FIELD_ID, 32, 0, 1, 24, mtime, atime, ctime,
 	}
 
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, ntfs)
-	fm.file.extraField = append(fm.file.extraField, ExtraFieldEntry{__NTFS_METADATA_FIELD, buf.Bytes()})
+	fm.file.extraField = append(fm.file.extraField, ExtraFieldEntry{
+		Tag:  __NTFS_METADATA_FIELD_ID,
+		Data: buf.Bytes(),
+	})
 }

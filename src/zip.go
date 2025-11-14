@@ -23,15 +23,28 @@ type FileConfig struct {
 // AddOption defines a function type for configuring file options during addition to archive
 type AddOption func(f *file)
 
+// WithConfig applies a complete FileConfig to a file
 func WithConfig(c FileConfig) AddOption {
 	return func(f *file) {
 		f.SetConfig(c)
 	}
 }
 
+// PrefixPath prefixes the file path with the given path component
 func PrefixPath(p string) AddOption {
 	return func(f *file) {
-		f.config.Path = filepath.Join(p, f.config.Path)
+		if p != "" {
+			f.config.Path = path.Join(p, f.config.Path)
+		}
+	}
+}
+
+// ExtendPath extends the file path with given path component
+func ExtendPath(p string) AddOption {
+	return func(f *file) {
+		if p != "" {
+			f.config.Path = path.Join(f.config.Path, p)
+		}
 	}
 }
 
@@ -50,6 +63,7 @@ type Zip struct {
 func NewZip(c CompressionMethod) *Zip {
 	return &Zip{
 		compressionMethod: c,
+		files:             make([]*file, 0),
 	}
 }
 
@@ -73,21 +87,24 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	if f == nil {
 		return errors.New("file cannot be nil")
 	}
+
 	file, err := newFileFromOS(f)
 	if err != nil {
-		return fmt.Errorf("newFileFromOS: %v", err)
+		return fmt.Errorf("newFileFromOS: %w", err)
 	}
 	if file.isDir {
-		return errors.New("AddFile: can't add directories")
+		return errors.New("AddFile: can't add directories, use AddDirectory instead")
 	}
 
 	file.config.CompressionMethod = z.compressionMethod
 	for _, opt := range options {
 		opt(file)
 	}
-	if file.config.Path != "" {
-		z.ensurePath(file)
+
+	if err := z.ensurePath(file); err != nil {
+		return fmt.Errorf("ensure path: %w", err)
 	}
+
 	z.files = append(z.files, file)
 	return nil
 }
@@ -106,75 +123,96 @@ func (z *Zip) AddDirectory(root string, options ...AddOption) ([]*os.File, error
 		if walkPath == root {
 			return nil
 		}
+
 		relPath, err := filepath.Rel(root, walkPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("get relative path: %w", err)
 		}
+
 		if d.IsDir() {
 			file, err := newDirectoryFileFromDirEntry(d)
 			if err != nil {
-				return err
+				return fmt.Errorf("create directory file: %w", err)
 			}
-			for _, opt := range append(options, PrefixPath(filepath.Dir(relPath))) {
+
+			for _, opt := range append(options, ExtendPath(filepath.Dir(relPath))) {
 				opt(file)
 			}
-			if file.config.Path != "" {
-				err := z.ensurePath(file)
-				if err != nil {
-					return fmt.Errorf("ensure path: %v", err)
-				}
+
+			if err := z.ensurePath(file); err != nil {
+				return fmt.Errorf("ensure path: %w", err)
 			}
 			z.files = append(z.files, file)
 		} else {
 			file, err := os.Open(walkPath)
 			if err != nil {
-				return err
+				return fmt.Errorf("open file: %w", err)
 			}
-			dirPath := filepath.Dir(relPath)
-			if dirPath == "." {
-				dirPath = ""
+
+			if err := z.AddFile(file, append(options, ExtendPath(filepath.Dir(relPath)))...); err != nil {
+				file.Close()
+				return fmt.Errorf("add file: %w", err)
 			}
-			z.AddFile(file, append(options, PrefixPath(dirPath))...)
 			files = append(files, file)
 		}
 		return nil
 	})
-	return files, err
+	if err != nil {
+		for _, f := range files {
+			f.Close()
+		}
+		return nil, err
+	}
+	return files, nil
 }
 
 // AddReader adds a file to the ZIP archive from an [io.Reader] interface.
 // This allows adding files from sources other than the filesystem, such as memory buffers or network streams.
 // The filename parameter specifies the name that will be used for the file in the archive.
 func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) error {
+	if r == nil {
+		return errors.New("reader cannot be nil")
+	}
+	if filename == "" {
+		return errors.New("filename cannot be empty")
+	}
+
 	file, err := newFileFromReader(r, filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("create file from reader: %w", err)
 	}
+
 	for _, opt := range options {
 		opt(file)
 	}
-	if file.config.Path != "" {
-		z.ensurePath(file)
+
+	if err := z.ensurePath(file); err != nil {
+		return fmt.Errorf("ensure path: %w", err)
 	}
+
 	z.files = append(z.files, file)
 	return nil
 }
 
 // CreateDirectory adds a directory entry to the ZIP archive
 func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
+	if name == "" {
+		return errors.New("directory name cannot be empty")
+	}
+
 	file, err := newDirectoryFile("", name)
 	if err != nil {
-		return err
+		return fmt.Errorf("create directory file: %w", err)
 	}
+
 	for _, opt := range options {
 		opt(file)
 	}
-	if file.config.Path != "" {
-		err := z.ensurePath(file)
-		if err != nil {
-			return fmt.Errorf("ensure path: %v", err)
-		}
+
+	if err := z.ensurePath(file); err != nil {
+		return fmt.Errorf("ensure path: %w", err)
 	}
+
 	z.files = append(z.files, file)
 	return nil
 }
@@ -193,48 +231,23 @@ func (z *Zip) Exists(filepath, filename string) bool {
 // Save writes the ZIP archive to disk with the specified filename.
 // Returns error if any I/O operation fails during the save process.
 func (z *Zip) Save(name string) error {
+	if name == "" {
+		return errors.New("filename cannot be empty")
+	}
+
 	dest, err := os.Create(name)
 	if err != nil {
-		return err
+		return fmt.Errorf("create destination file: %w", err)
 	}
 	defer dest.Close()
 
-	var tmpFile *os.File
-	defer func() {
-		if tmpFile != nil {
-			tmpFile.Close()
-			os.Remove(tmpFile.Name())
-		}
-	}()
-
 	writer := newZipWriter(z, dest)
 	for _, file := range z.files {
-		meta := NewFileMetadata(file)
-		meta.AddFilesystemExtraField()
-
-		writer.WriteFileHeader(file)
-		if !file.isDir {
-			tmpFile, err = writer.EncodeFileData(file)
-			if err != nil {
-				return err
-			}
-		}
-		if file.RequiresZip64() {
-			meta.addZip64ExtraField()
-		}
-		err = writer.UpdateLocalHeader(file)
-		if err != nil {
-			return fmt.Errorf("update local header: %v", err)
-		}
-		writer.WriteFileData(tmpFile)
-		writer.AddCentralDirEntry(file)
-		if tmpFile != nil {
-			tmpFile.Close()
-			os.Remove(tmpFile.Name())
+		if err := writer.WriteFile(file); err != nil {
+			return fmt.Errorf("write file %s: %w", file.name, err)
 		}
 	}
-	writer.WriteCentralDirAndEndDir()
-	return nil
+	return writer.WriteCentralDirAndEndRecords()
 }
 
 // ensurePath verifies that the file's directory path exists in the archive,
@@ -248,6 +261,7 @@ func (z *Zip) ensurePath(f *file) error {
 	if normalizedPath == "." || normalizedPath == "/" {
 		return nil
 	}
+
 	f.path = normalizedPath
 	pathComponents := strings.Split(normalizedPath, "/")
 
@@ -260,7 +274,7 @@ func (z *Zip) ensurePath(f *file) error {
 		if !z.Exists(currentPath, component) {
 			dir, err := newDirectoryFile(currentPath, component)
 			if err != nil {
-				return fmt.Errorf("create directory file: %v", err)
+				return fmt.Errorf("create directory file: %w", err)
 			}
 			z.files = append(z.files, dir)
 		}
