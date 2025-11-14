@@ -228,19 +228,9 @@ func (z *Zip) Exists(filepath, filename string) bool {
 	return false
 }
 
-// Save writes the ZIP archive to disk with the specified filename.
+// Save writes the ZIP archive to dest.
 // Returns error if any I/O operation fails during the save process.
-func (z *Zip) Save(name string) error {
-	if name == "" {
-		return errors.New("filename cannot be empty")
-	}
-
-	dest, err := os.Create(name)
-	if err != nil {
-		return fmt.Errorf("create destination file: %w", err)
-	}
-	defer dest.Close()
-
+func (z *Zip) Save(dest io.WriteSeeker) error {
 	writer := newZipWriter(z, dest)
 	for _, file := range z.files {
 		if err := writer.WriteFile(file); err != nil {
@@ -250,24 +240,14 @@ func (z *Zip) Save(name string) error {
 	return writer.WriteCentralDirAndEndRecords()
 }
 
-// SaveParallel writes the ZIP archive using multiple workers for parallel compression.
+// SaveParallel writes the ZIP archive to dest using multiple workers for parallel compression.
 // Parallel compression is only effective for compression methods other than Stored.
 // Returns a slice of errors encountered during compression.
-func (z *Zip) SaveParallel(name string, maxWorkers int) []error {
-	if name == "" {
-		return []error{errors.New("filename cannot be empty")}
-	}
-
-	dest, err := os.Create(name)
-	if err != nil {
-		return []error{fmt.Errorf("create destination file: %w", err)}
-	}
-	defer dest.Close()
-
+func (z *Zip) SaveParallel(dest io.WriteSeeker, maxWorkers int) []error {
 	writer := newParallelZipWriter(z, dest, maxWorkers)
 	errs := writer.WriteFiles(z.files)
 
-	if err = writer.zw.WriteCentralDirAndEndRecords(); err != nil {
+	if err := writer.zw.WriteCentralDirAndEndRecords(); err != nil {
 		errs = append(errs, err)
 	}
 	return errs
