@@ -56,6 +56,7 @@ type Zip struct {
 	password          string            // Password for encrypted archives
 	files             []*file           // List of files in the archive
 	comment           string            // Global archive comment
+	dirCache          map[string]bool   // Cache of existing directory paths for faster lookup
 }
 
 // NewZip creates a new empty ZIP archive with the specified default compression method.
@@ -64,6 +65,7 @@ func NewZip(c CompressionMethod) *Zip {
 	return &Zip{
 		compressionMethod: c,
 		files:             make([]*file, 0),
+		dirCache:          make(map[string]bool),
 	}
 }
 
@@ -143,6 +145,7 @@ func (z *Zip) AddDirectory(root string, options ...AddOption) ([]*os.File, error
 				return fmt.Errorf("ensure path: %w", err)
 			}
 			z.files = append(z.files, file)
+			z.cacheDirectoryEntry(file)
 		} else {
 			file, err := os.Open(walkPath)
 			if err != nil {
@@ -214,12 +217,20 @@ func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
 	}
 
 	z.files = append(z.files, file)
+	z.cacheDirectoryEntry(file)
 	return nil
 }
 
 // Exists checks if file or directory with given name exists at the specified path.
 // Returns true if an entry with matching path and filename is found in the archive.
 func (z *Zip) Exists(filepath, filename string) bool {
+	if filename == "" || strings.HasSuffix(filename, "/") {
+		cacheKey := z.buildCacheKey(filepath, filename)
+		if _, exists := z.dirCache[cacheKey]; exists {
+			return true
+		}
+	}
+
 	for _, file := range z.files {
 		if file.path == filepath && file.name == filename {
 			return true
@@ -274,12 +285,13 @@ func (z *Zip) ensurePath(f *file) error {
 			continue
 		}
 
-		if !z.Exists(currentPath, component) {
+		if !z.directoryExistsInCache(currentPath, component) {
 			dir, err := newDirectoryFile(currentPath, component)
 			if err != nil {
 				return fmt.Errorf("create directory file: %w", err)
 			}
 			z.files = append(z.files, dir)
+			z.cacheDirectoryEntry(dir)
 		}
 
 		if currentPath == "" {
@@ -290,4 +302,43 @@ func (z *Zip) ensurePath(f *file) error {
 	}
 
 	return nil
+}
+
+// cacheDirectoryEntry adds a directory file to the directory cache for faster lookups.
+// This method should be called whenever a new directory is added to the archive.
+func (z *Zip) cacheDirectoryEntry(dir *file) {
+	if dir == nil || !dir.isDir {
+		return
+	}
+	cacheKey := z.buildCacheKey(dir.path, dir.name)
+	z.dirCache[cacheKey] = true
+}
+
+// directoryExistsInCache checks if a directory exists using the cache with fallback.
+// Returns true if the directory is found in cache or through linear scan.
+func (z *Zip) directoryExistsInCache(path, name string) bool {
+	cacheKey := z.buildCacheKey(path, name)
+	if _, exists := z.dirCache[cacheKey]; exists {
+		return true
+	}
+
+	if z.Exists(path, name) {
+		z.dirCache[cacheKey] = true
+		return true
+	}
+	
+	return false
+}
+
+// buildCacheKey creates a unique cache key for a directory entry
+func (z *Zip) buildCacheKey(p, name string) string {
+	if p == "" {
+		return name + "/"
+	}
+	return path.Join(p, name) + "/"
+}
+
+// ClearCache resets the directory cache
+func (z *Zip) ClearCache() {
+	z.dirCache = make(map[string]bool)
 }
