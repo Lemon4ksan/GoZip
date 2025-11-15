@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"math"
 	"os"
 	"path"
@@ -47,7 +46,7 @@ type file struct {
 	extraField []ExtraFieldEntry
 }
 
-// newFileFromOS creates a File from an [os.File] instance
+// newFileFromOS creates a file from an [os.File] instance
 func newFileFromOS(f *os.File) (*file, error) {
 	stat, err := f.Stat()
 	if err != nil {
@@ -64,7 +63,7 @@ func newFileFromOS(f *os.File) (*file, error) {
 	}, nil
 }
 
-// newFileFromReader creates a File from an [io.Reader]
+// newFileFromReader creates a file from an [io.Reader]
 func newFileFromReader(source io.Reader, name string) (*file, error) {
 	return &file{
 		name:       name,
@@ -74,7 +73,7 @@ func newFileFromReader(source io.Reader, name string) (*file, error) {
 	}, nil
 }
 
-// newDirectoryFile creates a File representing a directory
+// newDirectoryFile creates a file representing a directory
 func newDirectoryFile(dirPath, dirName string) (*file, error) {
 	if dirName == "" {
 		return nil, errors.New("directory name cannot be empty")
@@ -88,22 +87,6 @@ func newDirectoryFile(dirPath, dirName string) (*file, error) {
 	}, nil
 }
 
-// newDirectoryFileFromDirEntry creates a directory file from [fs.DirEntry]
-func newDirectoryFileFromDirEntry(dir fs.DirEntry) (*file, error) {
-	stat, err := dir.Info()
-	if err != nil {
-		return nil, fmt.Errorf("get dir entry info: %w", err)
-	}
-	return &file{
-		name:             stat.Name(),
-		uncompressedSize: stat.Size(),
-		modTime:          stat.ModTime(),
-		isDir:            true,
-		metadata:         getFileMetadata(stat),
-		hostSystem:       getHostSystemByOS(),
-	}, nil
-}
-
 func (f *file) Name() string            { return f.name }
 func (f *file) Path() string            { return f.path }
 func (f *file) IsDir() bool             { return f.isDir }
@@ -113,11 +96,11 @@ func (f *file) CRC32() uint32           { return f.crc32 }
 func (f *file) ModTime() time.Time      { return f.modTime }
 
 func (f *file) SetConfig(config FileConfig) {
-	if !f.isDir {
-		f.config = config
-	} else {
+	if f.isDir {
 		f.config.Path = config.Path
 		f.config.Comment = config.Comment
+	} else {
+		f.config = config
 	}
 }
 
@@ -153,7 +136,7 @@ type fileAttributes struct {
 	file *file
 }
 
-// NewFileAttributes creates a new FileAttributes instance
+// NewFileAttributes creates a new fileAttributes instance
 func NewFileAttributes(f *file) *fileAttributes {
 	return &fileAttributes{file: f}
 }

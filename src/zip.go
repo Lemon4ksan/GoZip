@@ -94,11 +94,10 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	if err != nil {
 		return fmt.Errorf("newFileFromOS: %w", err)
 	}
-	if file.isDir {
-		return errors.New("AddFile: can't add directories, use AddDirectory instead")
+	if !file.isDir {
+		file.config.CompressionMethod = z.compressionMethod
 	}
 
-	file.config.CompressionMethod = z.compressionMethod
 	for _, opt := range options {
 		opt(file)
 	}
@@ -131,31 +130,20 @@ func (z *Zip) AddDirectory(root string, options ...AddOption) ([]*os.File, error
 			return fmt.Errorf("get relative path: %w", err)
 		}
 
+		file, err := os.Open(walkPath)
+		if err != nil {
+			return fmt.Errorf("open file: %w", err)
+		}
+
+		addOptions := append(options, ExtendPath(filepath.Dir(relPath)))
+		if err := z.AddFile(file, addOptions...); err != nil {
+			file.Close()
+			return fmt.Errorf("add file: %w", err)
+		}
+
 		if d.IsDir() {
-			file, err := newDirectoryFileFromDirEntry(d)
-			if err != nil {
-				return fmt.Errorf("create directory file: %w", err)
-			}
-
-			for _, opt := range append(options, ExtendPath(filepath.Dir(relPath))) {
-				opt(file)
-			}
-
-			if err := z.ensurePath(file); err != nil {
-				return fmt.Errorf("ensure path: %w", err)
-			}
-			z.files = append(z.files, file)
-			z.cacheDirectoryEntry(file)
+			file.Close()
 		} else {
-			file, err := os.Open(walkPath)
-			if err != nil {
-				return fmt.Errorf("open file: %w", err)
-			}
-
-			if err := z.AddFile(file, append(options, ExtendPath(filepath.Dir(relPath)))...); err != nil {
-				file.Close()
-				return fmt.Errorf("add file: %w", err)
-			}
 			files = append(files, file)
 		}
 		return nil
