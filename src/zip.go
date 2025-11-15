@@ -57,6 +57,7 @@ type Zip struct {
 	files             []*file           // List of files in the archive
 	comment           string            // Global archive comment
 	dirCache          map[string]bool   // Cache of existing directory paths for faster lookup
+	fileSortStrategy  FileSortStrategy  // In which order files must be processed
 }
 
 // NewZip creates a new empty ZIP archive with the specified default compression method.
@@ -69,6 +70,12 @@ func NewZip(c CompressionMethod) *Zip {
 	}
 }
 
+// SetFileSortStrategy configures file ordering to optimize archive creation.
+// See [FileSortStrategy] for detailed description of strategies.
+func (z *Zip) SetFileSortStrategy(strategy FileSortStrategy) {
+	z.fileSortStrategy = strategy
+}
+
 // SetComment sets a global comment for the entire ZIP archive.
 // The comment is stored in the end of central directory record.
 func (z *Zip) SetComment(comment string) {
@@ -79,6 +86,14 @@ func (z *Zip) SetComment(comment string) {
 func (z *Zip) SetEncryption(e EncryptionMethod, pwd string) {
 	z.encryptionMethod = e
 	z.password = pwd
+}
+
+// GetSortedFiles returns files sorted according to current strategy
+func (z *Zip) GetSortedFiles() []*file {
+	if z.fileSortStrategy == SortDefault {
+		return z.files
+	}
+	return SortFilesOptimized(z.files, z.fileSortStrategy)
 }
 
 // AddFile adds a file from the filesystem to the ZIP archive.
@@ -231,7 +246,7 @@ func (z *Zip) Exists(filepath, filename string) bool {
 // Returns error if any I/O operation fails during the save process.
 func (z *Zip) Save(dest io.WriteSeeker) error {
 	writer := newZipWriter(z, dest)
-	for _, file := range z.files {
+	for _, file := range z.GetSortedFiles() {
 		if err := writer.WriteFile(file); err != nil {
 			return fmt.Errorf("write file %s: %w", file.name, err)
 		}
@@ -244,7 +259,7 @@ func (z *Zip) Save(dest io.WriteSeeker) error {
 // Returns a slice of errors encountered during compression.
 func (z *Zip) SaveParallel(dest io.WriteSeeker, maxWorkers int) []error {
 	writer := newParallelZipWriter(z, dest, maxWorkers)
-	errs := writer.WriteFiles(z.files)
+	errs := writer.WriteFiles(z.GetSortedFiles())
 
 	if err := writer.zw.WriteCentralDirAndEndRecords(); err != nil {
 		errs = append(errs, err)
@@ -314,7 +329,7 @@ func (z *Zip) directoryExistsInCache(path, name string) bool {
 		z.dirCache[cacheKey] = true
 		return true
 	}
-	
+
 	return false
 }
 

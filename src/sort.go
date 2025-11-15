@@ -1,0 +1,172 @@
+package gozip
+
+import "sort"
+
+// SortFilesOptimized returns a sorted slice of files according to the strategy
+func SortFilesOptimized(files []*file, strategy FileSortStrategy) []*file {
+	if len(files) <= 1 {
+		result := make([]*file, len(files))
+		copy(result, files)
+		return result
+	}
+
+	switch strategy {
+	case SortLargeFilesLast:
+		return partitionSortLargeFilesLast(files)
+
+	case SortLargeFilesFirst:
+		return partitionSortLargeFilesFirst(files)
+
+	case SortZIP64Optimized:
+		if len(files) > 1000 {
+			return optimizedSortZIP64OptimizedWithBuckets(files)
+		}
+		return sortZip64Optimized(files)
+
+	case SortSizeAscending:
+		return sortSizeAscending(files)
+
+	case SortSizeDescending:
+		return sortSizeDescending(files)
+
+	default:
+		result := make([]*file, len(files))
+		copy(result, files)
+		return result
+	}
+}
+
+func sortSizeAscending(files []*file) []*file {
+	sorted := make([]*file, len(files))
+	copy(sorted, files)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].uncompressedSize < sorted[j].uncompressedSize
+	})
+	return sorted
+}
+
+func sortSizeDescending(files []*file) []*file {
+	sorted := make([]*file, len(files))
+	copy(sorted, files)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].uncompressedSize > sorted[j].uncompressedSize
+	})
+	return sorted
+}
+
+// partitionSortLargeFilesLast - O(n) time for specific strategy
+func partitionSortLargeFilesLast(files []*file) []*file {
+	if len(files) <= 1 {
+		return files
+	}
+
+	// Single pass partitioning - much faster than full sort for this case
+	result := make([]*file, len(files))
+	smallIdx, largeIdx := 0, len(files)-1
+
+	for _, f := range files {
+		if f.uncompressedSize < 1<<32 { // < 4GB
+			result[smallIdx] = f
+			smallIdx++
+		} else { // >= 4GB
+			result[largeIdx] = f
+			largeIdx--
+		}
+	}
+
+	return result
+}
+
+// optimizedSortZIP64OptimizedWithBuckets - bucket sort approach
+func optimizedSortZIP64OptimizedWithBuckets(files []*file) []*file {
+	var smallCount, mediumCount, largeCount int
+	for _, f := range files {
+		switch getSizePriority(f.uncompressedSize) {
+		case 0:
+			smallCount++
+		case 1:
+			mediumCount++
+		case 2:
+			largeCount++
+		}
+	}
+	small := make([]*file, 0, smallCount)
+	medium := make([]*file, 0, mediumCount)
+	large := make([]*file, 0, largeCount)
+
+	for _, f := range files {
+		switch getSizePriority(f.uncompressedSize) {
+		case 0:
+			small = append(small, f)
+		case 1:
+			medium = append(medium, f)
+		case 2:
+			large = append(large, f)
+		}
+	}
+
+	if len(small) > 1 {
+		sort.Slice(small, func(i, j int) bool {
+			return small[i].uncompressedSize < small[j].uncompressedSize
+		})
+	}
+	if len(medium) > 1 {
+		sort.Slice(medium, func(i, j int) bool {
+			return medium[i].uncompressedSize < medium[j].uncompressedSize
+		})
+	}
+
+	result := make([]*file, len(files))
+	pos := 0
+	pos += copy(result[pos:], small)
+	pos += copy(result[pos:], medium)
+	pos += copy(result[pos:], large)
+	return result
+}
+
+func partitionSortLargeFilesFirst(files []*file) []*file {
+	result := make([]*file, len(files))
+	smallIdx, largeIdx := len(files)-1, 0
+
+	for _, f := range files {
+		if f.uncompressedSize < 1<<32 {
+			result[smallIdx] = f
+			smallIdx--
+		} else {
+			result[largeIdx] = f
+			largeIdx++
+		}
+	}
+	return result
+}
+
+func sortZip64Optimized(files []*file) []*file {
+	sorted := make([]*file, len(files))
+	copy(sorted, files)
+	sort.Slice(sorted, func(i, j int) bool {
+		iSize := sorted[i].uncompressedSize
+		jSize := sorted[j].uncompressedSize
+
+		iPriority := getSizePriority(iSize)
+		jPriority := getSizePriority(jSize)
+
+		if iPriority != jPriority {
+			return iPriority < jPriority
+		}
+		return iSize < jSize
+	})
+	return sorted
+}
+
+func getSizePriority(size int64) int {
+	if size < 0 {
+		return 2
+	}
+	if size < 10485760 {
+		return 0
+	}
+	if size < 1<<32 {
+		return 1
+	}
+	return 2
+}
