@@ -170,14 +170,13 @@ func (zw *zipWriter) updateLocalHeader(file *file) error {
 		return fmt.Errorf("seek to CRC position: %w", err)
 	}
 
-	if err := binary.Write(zw.dest, binary.LittleEndian, file.crc32); err != nil {
-		return fmt.Errorf("write CRC: %w", err)
-	}
-	if err := binary.Write(zw.dest, binary.LittleEndian, uint32(min(math.MaxUint32, file.compressedSize))); err != nil {
-		return fmt.Errorf("write compressed size: %w", err)
-	}
-	if err := binary.Write(zw.dest, binary.LittleEndian, uint32(min(math.MaxUint32, file.uncompressedSize))); err != nil {
-		return fmt.Errorf("write uncompressed size: %w", err)
+	var buf [12]byte
+	binary.LittleEndian.PutUint32(buf[0:4], file.crc32)
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(min(math.MaxUint32, file.compressedSize)))
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(min(math.MaxUint32, file.uncompressedSize)))
+
+	if _, err := zw.dest.Write(buf[:]); err != nil {
+		return fmt.Errorf("write CRC and sizes: %w", err)
 	}
 
 	if file.RequiresZip64() {
@@ -192,39 +191,43 @@ func (zw *zipWriter) updateLocalHeader(file *file) error {
 
 // writeZip64ExtraField writes ZIP64 extra field for large files
 func (zw *zipWriter) writeZip64ExtraField(file *file) error {
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, __ZIP64_EXTRA_FIELD_ID)
-	binary.Write(buf, binary.LittleEndian, uint16(0))
+	buf := make([]byte, 4, 28)
+	binary.LittleEndian.PutUint16(buf[0:2], __ZIP64_EXTRA_FIELD_ID)
 
-	var size uint16
+	var tmp [8]byte
 	if file.uncompressedSize > math.MaxUint32 {
-		binary.Write(buf, binary.LittleEndian, file.uncompressedSize)
-		size += 8
+		binary.LittleEndian.PutUint64(tmp[:], uint64(file.uncompressedSize))
+		buf = append(buf, tmp[:]...)
 	}
 	if file.compressedSize > math.MaxUint32 {
-		binary.Write(buf, binary.LittleEndian, file.compressedSize)
-		size += 8
+		binary.LittleEndian.PutUint64(tmp[:], uint64(file.compressedSize))
+		buf = append(buf, tmp[:]...)
 	}
-	extraField := buf.Bytes()
-	binary.LittleEndian.PutUint16(extraField[2:4], size)
 
-	// Update extra field length
+	fieldSize := uint16(len(buf) - 4)
+	binary.LittleEndian.PutUint16(buf[2:4], fieldSize)
+
+	// Skip filename length
 	if _, err := zw.dest.Seek(2, io.SeekCurrent); err != nil {
 		return fmt.Errorf("seek to extra field length: %w", err)
 	}
-	if err := binary.Write(zw.dest, binary.LittleEndian, size+4); err != nil {
+
+	var lenBuf [2]byte
+	binary.LittleEndian.PutUint16(lenBuf[:], fieldSize+4)
+	if _, err := zw.dest.Write(lenBuf[:]); err != nil {
 		return fmt.Errorf("write extra field length: %w", err)
 	}
 
-	// Skip filename and write extra field
+	// Skip filename
 	if _, err := zw.dest.Seek(int64(file.getFilenameLength()), io.SeekCurrent); err != nil {
 		return fmt.Errorf("seek past filename: %w", err)
 	}
-	if _, err := zw.dest.Write(extraField); err != nil {
+
+	if _, err := zw.dest.Write(buf); err != nil {
 		return fmt.Errorf("write extra field: %w", err)
 	}
 
-	zw.localHeaderOffset += int64(size + 4)
+	zw.localHeaderOffset += int64(len(buf))
 	return nil
 }
 

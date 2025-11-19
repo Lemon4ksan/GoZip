@@ -1,7 +1,6 @@
 package gozip
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -360,68 +359,51 @@ func (fm *FileMetadata) AddFilesystemExtraField() {
 
 // addZip64ExtraField adds ZIP64 extra field for large files
 func (fm *FileMetadata) addZip64ExtraField() {
-	buf := bytes.NewBuffer(nil)
-	binary.Write(buf, binary.LittleEndian, __ZIP64_EXTRA_FIELD_ID)
-	binary.Write(buf, binary.LittleEndian, uint16(0))
+	data := make([]byte, 4, 28) 
+	binary.LittleEndian.PutUint16(data[0:2], __ZIP64_EXTRA_FIELD_ID)
 
-	var size uint16
+	var buf [8]byte
 	if fm.file.uncompressedSize > math.MaxUint32 {
-		binary.Write(buf, binary.LittleEndian, uint64(fm.file.uncompressedSize))
-		size += 8
+		binary.LittleEndian.PutUint64(buf[:], uint64(fm.file.uncompressedSize))
+		data = append(data, buf[:]...)
 	}
 	if fm.file.compressedSize > math.MaxUint32 {
-		binary.Write(buf, binary.LittleEndian, uint64(fm.file.compressedSize))
-		size += 8
+		binary.LittleEndian.PutUint64(buf[:], uint64(fm.file.compressedSize))
+		data = append(data, buf[:]...)
 	}
 	if fm.file.localHeaderOffset > math.MaxUint32 {
-		binary.Write(buf, binary.LittleEndian, uint64(fm.file.localHeaderOffset))
-		size += 8
+		binary.LittleEndian.PutUint64(buf[:], uint64(fm.file.localHeaderOffset))
+		data = append(data, buf[:]...)
 	}
 
-	data := buf.Bytes()
-	binary.LittleEndian.PutUint16(data[2:4], size)
+	binary.LittleEndian.PutUint16(data[2:4], uint16(len(data)-4))
 	fm.AddExtraFieldEntry(ExtraFieldEntry{Tag: __ZIP64_EXTRA_FIELD_ID, Data: data})
 }
 
 // addNTFSExtraField adds NTFS timestamp extra field
 func (fm *FileMetadata) addNTFSExtraField() {
 	var mtime, atime, ctime uint64
-	switch v := fm.file.metadata["LastWriteTime"].(type) {
-	case uint64:
-		mtime = v
-	case time.Time:
-		mtime = uint64(v.UnixNano()/100 + 116444736000000000)
+	if val, ok := fm.file.metadata["LastWriteTime"]; ok {
+		if t, ok := val.(uint64); ok { mtime = t }
 	}
-	switch v := fm.file.metadata["LastAccessTime"].(type) {
-	case uint64:
-		atime = v
-	case time.Time:
-		atime = uint64(v.UnixNano()/100 + 116444736000000000)
+	if val, ok := fm.file.metadata["LastAccessTime"]; ok {
+		if t, ok := val.(uint64); ok { atime = t }
 	}
-	switch v := fm.file.metadata["CreationTime"].(type) {
-	case uint64:
-		ctime = v
-	case time.Time:
-		ctime = uint64(v.UnixNano()/100 + 116444736000000000)
+	if val, ok := fm.file.metadata["CreationTime"]; ok {
+		if t, ok := val.(uint64); ok { ctime = t }
 	}
 
-	ntfs := struct {
-		Tag        uint16
-		Size       uint16
-		Reserved   uint32
-		Attribute1 uint16
-		Size1      uint16
-		Mtime      uint64
-		Atime      uint64
-		Ctime      uint64
-	}{
-		__NTFS_METADATA_FIELD_ID, 32, 0, 1, 24, mtime, atime, ctime,
-	}
+	// Tag(2) + Size(2) + Reserved(4) + Attr1(2) + Size1(2) + Mtime(8) + Atime(8) + Ctime(8)
+	data := make([]byte, 36)
 
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, ntfs)
-	fm.file.extraField = append(fm.file.extraField, ExtraFieldEntry{
-		Tag:  __NTFS_METADATA_FIELD_ID,
-		Data: buf.Bytes(),
-	})
+	binary.LittleEndian.PutUint16(data[0:2], __NTFS_METADATA_FIELD_ID)
+	binary.LittleEndian.PutUint16(data[2:4], 32) // Block size 
+	binary.LittleEndian.PutUint32(data[4:8], 0)  // Reserved
+	binary.LittleEndian.PutUint16(data[8:10], 1) // Attribute1 (Tag 1)
+	binary.LittleEndian.PutUint16(data[10:12], 24) // Size1 (Size of attributes)
+	binary.LittleEndian.PutUint64(data[12:20], mtime)
+	binary.LittleEndian.PutUint64(data[20:28], atime)
+	binary.LittleEndian.PutUint64(data[28:36], ctime)
+
+	fm.AddExtraFieldEntry(ExtraFieldEntry{Tag: __NTFS_METADATA_FIELD_ID, Data: data})
 }
