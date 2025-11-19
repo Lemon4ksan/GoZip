@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func TestNewFileFromOS(t *testing.T) {
+func TestNewFileFromPath(t *testing.T) {
 	tmpfile, err := os.CreateTemp("", "testfile")
 	if err != nil {
 		t.Fatal(err)
@@ -23,9 +23,9 @@ func TestNewFileFromOS(t *testing.T) {
 	}
 	tmpfile.Sync()
 
-	file, err := newFileFromOS(tmpfile)
+	file, err := newFileFromPath(tmpfile.Name())
 	if err != nil {
-		t.Fatalf("newFileFromOS failed: %v", err)
+		t.Fatalf("newFileFromPath failed: %v", err)
 	}
 
 	if file.Name() != filepath.Base(tmpfile.Name()) {
@@ -78,7 +78,6 @@ func TestFileSetters(t *testing.T) {
 	}
 
 	file.SetConfig(config)
-	file.SetSource(strings.NewReader("test"))
 
 	if file.config.CompressionMethod != Deflated {
 		t.Error("compression method not set correctly")

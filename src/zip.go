@@ -5,19 +5,40 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
-// FileConfig holds configuration for file processing
+// CompressFunc is a function that compresses data from src, writes it to dest and returns
+// the amount of bytes read (uncompressed size). See [WriteDeflated] as an example.
+type CompressFunc func(src io.Reader, dest io.Writer, level int) (int64, error)
+
+// FileConfig holds configuration options for individual files in the archive
 type FileConfig struct {
+	// CompressFunc defines the compression algorithm to use for this file.
+	// If nil, uses the default compressor based on CompressionMethod.
+	CompressFunc CompressFunc
+
+	// CompressionMethod specifies the standard compression method to use.
+	// It should match the CompressFunc algorithm implementation.
 	CompressionMethod CompressionMethod
-	CompressionLevel  int
-	Comment           string
-	IsEncrypted       bool
-	Path              string
+
+	// CompressionLevel controls the compression strength (1-9).
+	// Higher values typically provide better compression at the cost of CPU time.
+	// The exact meaning depends on the chosen compressor.
+	// It's preferred that 0 means normal compression level.
+	CompressionLevel int
+
+	// Comment stores optional comment string
+	Comment string
+
+	// IsEncrypted indicates whether the file should be encrypted in the archive
+	IsEncrypted bool
+
+	// Path specifies the file's location and name within the archive
+	Path string
 }
 
 // AddOption defines a function type for configuring file options during addition to archive
@@ -49,8 +70,9 @@ func ExtendPath(p string) AddOption {
 }
 
 // Zip represents an editable ZIP archive in memory.
-// Provides methods to add files, configure compression/encryption, and save the archive.
+// Provides methods to add files, configure compression/encryption, and write the archive.
 type Zip struct {
+	mu                sync.RWMutex
 	compressionMethod CompressionMethod // Default compression for all files
 	encryptionMethod  EncryptionMethod  // Encryption method for the archive
 	password          string            // Password for encrypted archives
@@ -88,26 +110,16 @@ func (z *Zip) SetEncryption(e EncryptionMethod, pwd string) {
 	z.password = pwd
 }
 
-// GetSortedFiles returns files sorted according to current strategy
-func (z *Zip) GetSortedFiles() []*file {
-	if z.fileSortStrategy == SortDefault {
-		return z.files
-	}
-	return SortFilesOptimized(z.files, z.fileSortStrategy)
+// GetFiles returns files stored in the archive
+func (z *Zip) GetFiles() []*file {
+	return z.files
 }
 
-// AddFile adds a file from the filesystem to the ZIP archive.
-// The provided [os.File] must be open and readable.
-// The caller is responsible for closing the file after the ZIP archive is saved.
-// Note: The file should not be modified between adding and saving the archive.
-func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
-	if f == nil {
-		return errors.New("file cannot be nil")
-	}
-
-	file, err := newFileFromOS(f)
+// AddFile adds a file from the filesystem at given path to the ZIP archive
+func (z *Zip) AddFile(filePath string, options ...AddOption) error {
+	file, err := newFileFromPath(filePath)
 	if err != nil {
-		return fmt.Errorf("newFileFromOS: %w", err)
+		return fmt.Errorf("newFileFromPath: %w", err)
 	}
 	if !file.isDir {
 		file.config.CompressionMethod = z.compressionMethod
@@ -116,6 +128,15 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	for _, opt := range options {
 		opt(file)
 	}
+
+	if file.config.CompressFunc == nil {
+		if err = file.SetDefaultCompressFunc(); err != nil {
+			return err
+		}
+	}
+
+	z.mu.Lock()
+	defer z.mu.Unlock()
 
 	if err := z.ensurePath(file); err != nil {
 		return fmt.Errorf("ensure path: %w", err)
@@ -127,12 +148,8 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 
 // AddDirectory recursively goes through the directory at given path
 // and adds all files excluding root to the archive, applying options to each of them.
-// Returns list of opened files that must be closed after archive is saved or error occurs.
-func (z *Zip) AddDirectory(root string, options ...AddOption) ([]*os.File, error) {
-	files := make([]*os.File, 0)
-	root = filepath.Clean(root)
-
-	err := filepath.WalkDir(root, func(walkPath string, d fs.DirEntry, err error) error {
+func (z *Zip) AddDirectory(root string, options ...AddOption) error {
+	return filepath.WalkDir(root, func(walkPath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -145,31 +162,9 @@ func (z *Zip) AddDirectory(root string, options ...AddOption) ([]*os.File, error
 			return fmt.Errorf("get relative path: %w", err)
 		}
 
-		file, err := os.Open(walkPath)
-		if err != nil {
-			return fmt.Errorf("open file: %w", err)
-		}
-
 		addOptions := append(options, ExtendPath(filepath.Dir(relPath)))
-		if err := z.AddFile(file, addOptions...); err != nil {
-			file.Close()
-			return fmt.Errorf("add file: %w", err)
-		}
-
-		if d.IsDir() {
-			file.Close()
-		} else {
-			files = append(files, file)
-		}
-		return nil
+		return z.AddFile(walkPath, addOptions...)
 	})
-	if err != nil {
-		for _, f := range files {
-			f.Close()
-		}
-		return nil, err
-	}
-	return files, nil
 }
 
 // AddReader adds a file to the ZIP archive from an [io.Reader] interface.
@@ -187,10 +182,20 @@ func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) erro
 	if err != nil {
 		return fmt.Errorf("create file from reader: %w", err)
 	}
+	file.config.CompressionMethod = z.compressionMethod
 
 	for _, opt := range options {
 		opt(file)
 	}
+
+	if file.config.CompressFunc == nil {
+		if err := file.SetDefaultCompressFunc(); err != nil {
+			return err
+		}
+	}
+
+	z.mu.Lock()
+	defer z.mu.Unlock()
 
 	if err := z.ensurePath(file); err != nil {
 		return fmt.Errorf("ensure path: %w", err)
@@ -215,6 +220,9 @@ func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
 		opt(file)
 	}
 
+	z.mu.Lock()
+	defer z.mu.Unlock()
+
 	if err := z.ensurePath(file); err != nil {
 		return fmt.Errorf("ensure path: %w", err)
 	}
@@ -227,6 +235,9 @@ func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
 // Exists checks if file or directory with given name exists at the specified path.
 // Returns true if an entry with matching path and filename is found in the archive.
 func (z *Zip) Exists(filepath, filename string) bool {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+
 	if filename == "" || strings.HasSuffix(filename, "/") {
 		cacheKey := z.buildCacheKey(filepath, filename)
 		if _, exists := z.dirCache[cacheKey]; exists {
@@ -242,11 +253,17 @@ func (z *Zip) Exists(filepath, filename string) bool {
 	return false
 }
 
-// Save writes the ZIP archive to dest.
+// Write writes the ZIP archive to dest.
 // Returns error if any I/O operation fails during the save process.
-func (z *Zip) Save(dest io.WriteSeeker) error {
+func (z *Zip) Write(dest io.WriteSeeker) error {
+	z.mu.RLock() 
+	filesToWrite := make([]*file, len(z.files))
+    copy(filesToWrite, z.files)
+	z.mu.RUnlock()
+
 	writer := newZipWriter(z, dest)
-	for _, file := range z.GetSortedFiles() {
+	sortedFiles := SortFilesOptimized(filesToWrite, z.fileSortStrategy)
+	for _, file := range sortedFiles {
 		if err := writer.WriteFile(file); err != nil {
 			return fmt.Errorf("write file %s: %w", file.name, err)
 		}
@@ -254,17 +271,24 @@ func (z *Zip) Save(dest io.WriteSeeker) error {
 	return writer.WriteCentralDirAndEndRecords()
 }
 
-// SaveParallel writes the ZIP archive to dest using multiple workers for parallel compression.
-// Parallel compression is only effective for compression methods other than Stored.
-// Returns a slice of errors encountered during compression.
-func (z *Zip) SaveParallel(dest io.WriteSeeker, maxWorkers int) []error {
+// WriteParallel writes the ZIP archive to dest using multiple workers for parallel compression
+func (z *Zip) WriteParallel(dest io.WriteSeeker, maxWorkers int) error {
+	z.mu.RLock() 
+	filesToWrite := make([]*file, len(z.files))
+    copy(filesToWrite, z.files)
+    z.mu.RUnlock()
+
 	writer := newParallelZipWriter(z, dest, maxWorkers)
-	errs := writer.WriteFiles(z.GetSortedFiles())
+	sortedFiles := SortFilesOptimized(filesToWrite, z.fileSortStrategy)
+	errs := writer.WriteFiles(sortedFiles)
 
 	if err := writer.zw.WriteCentralDirAndEndRecords(); err != nil {
 		errs = append(errs, err)
 	}
-	return errs
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }
 
 // ensurePath verifies that the file's directory path exists in the archive,
@@ -325,9 +349,11 @@ func (z *Zip) directoryExistsInCache(path, name string) bool {
 		return true
 	}
 
-	if z.Exists(path, name) {
-		z.dirCache[cacheKey] = true
-		return true
+	for _, file := range z.files {
+		if file.path == path && file.name == name {
+            z.dirCache[cacheKey] = true
+			return true
+		}
 	}
 
 	return false

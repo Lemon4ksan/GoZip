@@ -5,8 +5,12 @@ type CompressionMethod uint16
 
 // Supported compression methods according to ZIP specification
 const (
-	Stored   CompressionMethod = 0 // No compression - file stored as-is
-	Deflated CompressionMethod = 8 // DEFLATE compression (most common)
+	Stored    CompressionMethod = 0  // No compression - file stored as-is
+	Deflated  CompressionMethod = 8  // DEFLATE compression (most common)
+	Deflate64 CompressionMethod = 9  // DEFLATE64(tm) enhanced compression
+	BZIP2     CompressionMethod = 12 // BZIP2 compression (more efficient but slower compression)
+	LZMA      CompressionMethod = 14 // LZMA compression (high compression ratio)
+	ZStandard CompressionMethod = 93 // Zstandard compression (fastest decompression)
 )
 
 // Compression levels for DEFLATE algorithm
@@ -25,7 +29,7 @@ const (
 	NotEncrypted EncryptionMethod = 0 // No encryption - file stored in plaintext
 )
 
-// Sequential Saving (Save()):
+// Sequential Saving (Write()):
 //   ┌──────────────────┬────────────────────────┬───────────────────────┬──────────────────┐
 //   │ Strategy         │ ZIP64 Overhead         │ Speed                 │ Recommendation   │
 //   ├──────────────────┼────────────────────────┼───────────────────────┼──────────────────┤
@@ -37,7 +41,7 @@ const (
 //   │ SizeDescending   │ Medium                 │ Fast                  │ Specific needs   │
 //   └──────────────────┴────────────────────────┴───────────────────────┴──────────────────┘
 //
-// Parallel Saving (SaveParallel()):
+// Parallel Saving (WriteParallel()):
 //   ┌──────────────────┬────────────────────────┬───────────────────────┬──────────────────┐
 //   │ Strategy         │ Parallel Efficiency    │ ZIP64 Overhead        │ Speed            │
 //   ├──────────────────┼────────────────────────┼───────────────────────┼──────────────────┤

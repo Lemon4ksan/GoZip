@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash"
 	"hash/crc32"
 	"io"
 	"math"
@@ -112,12 +111,11 @@ func (zw *zipWriter) addCentralDirEntry(file *file) error {
 
 // encodeFileData compresses file data according to file config
 func (zw *zipWriter) encodeFileData(file *file) (*os.File, error) {
-	var uncompressedSize int64
 	var tmpFile *os.File
 	var err error
 
 	// Use temporary file for large files that might need ZIP64
-	sizeCounter := &byteCounterWriter{dest: zw.dest}
+	sizeCounter := &byteCountWriter{dest: zw.dest}
 	if file.uncompressedSize > math.MaxUint32 {
 		tmpFile, err = os.CreateTemp("", "zip-compress-*")
 		if err != nil {
@@ -126,15 +124,15 @@ func (zw *zipWriter) encodeFileData(file *file) (*os.File, error) {
 		sizeCounter.dest = tmpFile
 	}
 
-	hasher := crc32.NewIEEE()
-	switch file.config.CompressionMethod {
-	case Stored:
-		uncompressedSize, err = writeStored(file, sizeCounter, hasher)
-	case Deflated:
-		uncompressedSize, err = writeDeflated(file, sizeCounter, hasher)
-	default:
-		err = errors.New("unsupported compression method")
+	src, err := file.openFunc()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source: %w", err)
 	}
+	defer src.Close()
+
+	hasher := crc32.NewIEEE()
+	tee := io.TeeReader(src, hasher)
+	uncompressedSize, err := file.config.CompressFunc(tee, sizeCounter, file.config.CompressionLevel)
 	if err != nil {
 		cleanupTempFile(tmpFile)
 		return nil, fmt.Errorf("compression: %w", err)
@@ -157,8 +155,8 @@ func (zw *zipWriter) encodeFileData(file *file) (*os.File, error) {
 // writeFileData copies data from temporary file to final destination
 func (zw *zipWriter) writeFileData(tmpFile io.Reader) error {
 	if file, ok := tmpFile.(*os.File); ok && file == nil {
-        return nil
-    }
+		return nil
+	}
 	if _, err := io.Copy(zw.dest, tmpFile); err != nil {
 		return fmt.Errorf("copy temp file data: %w", err)
 	}
@@ -184,10 +182,10 @@ func (zw *zipWriter) updateLocalHeader(file *file) error {
 
 	if file.RequiresZip64() {
 		return zw.writeZip64ExtraField(file)
-	} else {
-		if _, err := zw.dest.Seek(0, io.SeekEnd); err != nil {
-			return fmt.Errorf("seek to end of the file: %w", err)
-		}
+	}
+
+	if _, err := zw.dest.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("seek to end of the file: %w", err)
 	}
 	return nil
 }
@@ -230,42 +228,6 @@ func (zw *zipWriter) writeZip64ExtraField(file *file) error {
 	return nil
 }
 
-// writeStored implements the "store" compression method (no compression)
-func writeStored(file *file, counter *byteCounterWriter, hasher hash.Hash32) (int64, error) {
-	multiWriter := io.MultiWriter(counter, hasher)
-	size, err := io.Copy(multiWriter, file.source)
-	if err != nil {
-		return 0, fmt.Errorf("copy data: %w", err)
-	}
-	return size, nil
-}
-
-// writeDeflated implements the DEFLATE compression method
-func writeDeflated(file *file, counter *byteCounterWriter, hasher hash.Hash32) (int64, error) {
-	tee := io.TeeReader(file.source, hasher)
-
-	level := file.config.CompressionLevel
-	if level == 0 {
-		level = DeflateNormal
-	}
-
-	compressor, err := flate.NewWriter(counter, level)
-	if err != nil {
-		return 0, fmt.Errorf("create flate writer: %w", err)
-	}
-	defer compressor.Close()
-
-	uncompressedSize, err := io.Copy(compressor, tee)
-	if err != nil {
-		return 0, fmt.Errorf("compress data: %w", err)
-	}
-
-	if err := compressor.Close(); err != nil {
-		return 0, fmt.Errorf("close compressor: %w", err)
-	}
-	return uncompressedSize, nil
-}
-
 // writeZip64EndHeaders writes ZIP64 end of central directory record and locator
 func (zw *zipWriter) writeZip64EndHeaders() error {
 	zip64EndOfCentralDir := encodeZip64EndOfCentralDirectoryRecord(
@@ -286,6 +248,38 @@ func (zw *zipWriter) writeZip64EndHeaders() error {
 	return nil
 }
 
+// WriteStored implements the "store" compression method (no compression)
+func WriteStored(src io.Reader, dest io.Writer, _ int) (int64, error) {
+	size, err := io.Copy(dest, src)
+	if err != nil {
+		return 0, fmt.Errorf("copy data: %w", err)
+	}
+	return size, nil
+}
+
+// WriteDeflated implements the DEFLATE compression method
+func WriteDeflated(src io.Reader, dest io.Writer, level int) (int64, error) {
+	if level == 0 {
+		level = DeflateNormal
+	}
+
+	compressor, err := flate.NewWriter(dest, level)
+	if err != nil {
+		return 0, fmt.Errorf("create flate writer: %w", err)
+	}
+	defer compressor.Close()
+
+	uncompressedSize, err := io.Copy(compressor, src)
+	if err != nil {
+		return 0, fmt.Errorf("compress data: %w", err)
+	}
+
+	if err := compressor.Close(); err != nil {
+		return 0, fmt.Errorf("close compressor: %w", err)
+	}
+	return uncompressedSize, nil
+}
+
 // cleanupTempFile safely cleans up a temporary file
 func cleanupTempFile(tmpFile *os.File) {
 	if tmpFile != nil {
@@ -296,17 +290,17 @@ func cleanupTempFile(tmpFile *os.File) {
 
 // parallelZipWriter handles parallel compression and writing of files to a ZIP archive
 type parallelZipWriter struct {
-	zw  *zipWriter
-	sem chan struct{}
+	zw              *zipWriter
+	sem             chan struct{}
 	memoryThreshold int64
-	bufferPool sync.Pool
+	bufferPool      sync.Pool
 }
 
 // newParallelZipWriter creates a new parallelZipWriter instance
 func newParallelZipWriter(zip *Zip, dest io.WriteSeeker, workers int) *parallelZipWriter {
 	return &parallelZipWriter{
-		zw:  newZipWriter(zip, dest),
-		sem: make(chan struct{}, workers),
+		zw:              newZipWriter(zip, dest),
+		sem:             make(chan struct{}, workers),
 		memoryThreshold: 10 * 1024 * 1024, // 10MB default
 		bufferPool: sync.Pool{
 			New: func() interface{} {
@@ -322,9 +316,9 @@ func newParallelZipWriter(zip *Zip, dest io.WriteSeeker, workers int) *parallelZ
 func (pzw *parallelZipWriter) WriteFiles(files []*file) []error {
 	var wg sync.WaitGroup
 	results := make(chan struct {
-		file    *file
-		source  io.Reader
-		err     error
+		file   *file
+		source io.Reader
+		err    error
 	}, len(files))
 
 	for _, f := range files {
@@ -337,9 +331,9 @@ func (pzw *parallelZipWriter) WriteFiles(files []*file) []error {
 
 			source, err := pzw.compressFile(f)
 			results <- struct {
-				file    *file
-				source	io.Reader
-				err     error
+				file   *file
+				source io.Reader
+				err    error
 			}{f, source, err}
 		}(f)
 	}
@@ -372,52 +366,51 @@ func (pzw *parallelZipWriter) compressFile(file *file) (io.Reader, error) {
 	}
 
 	if file.uncompressedSize > 0 && file.uncompressedSize <= pzw.memoryThreshold {
-        return pzw.compressToMemory(file)
-    }
-    
-    return pzw.compressToTempFile(file)
+		return pzw.compressToMemory(file)
+	}
+	return pzw.compressToTempFile(file)
 }
 
 // compressToMemory compresses file data to an in-memory buffer instead of temporary file
 // Returns an io.ReadWriteSeeker that can be used like a file but operates entirely in memory
 func (pzw *parallelZipWriter) compressToMemory(file *file) (io.Reader, error) {
-	buffer := pzw.bufferPool.Get().(*MemoryBuffer)
+	buffer := pzw.bufferPool.Get().(*memoryBuffer)
 
-    if int(file.uncompressedSize) > cap(buffer.data) {
-        pzw.bufferPool.Put(buffer)
-        buffer = NewMemoryBuffer(int(file.uncompressedSize))
-    } else {
-        buffer.Reset()
-    }
+	if int(file.uncompressedSize) > cap(buffer.data) {
+		pzw.bufferPool.Put(buffer)
+		buffer = NewMemoryBuffer(int(file.uncompressedSize))
+	} else {
+		buffer.Reset()
+	}
 
-    sizeCounter := &byteCounterWriter{dest: buffer}
-    hasher := crc32.NewIEEE()
+	sizeCounter := &byteCountWriter{dest: buffer}
 
-    var uncompressedSize int64
-    var err error
+	src, err := file.openFunc()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source: %w", err)
+	}
+	defer src.Close()
 
-    switch file.config.CompressionMethod {
-    case Stored:
-        uncompressedSize, err = writeStored(file, sizeCounter, hasher)
-    case Deflated:
-        uncompressedSize, err = writeDeflated(file, sizeCounter, hasher)
-    default:
-        err = errors.New("unsupported compression method")
-    }
-    if err != nil {
-        pzw.bufferPool.Put(buffer)
-        return nil, fmt.Errorf("in-memory compression: %w", err)
-    }
+	hasher := crc32.NewIEEE()
+	uncompressedSize, err := file.config.CompressFunc(
+		io.TeeReader(src, hasher),
+		sizeCounter,
+		file.config.CompressionLevel,
+	)
+	if err != nil {
+		pzw.bufferPool.Put(buffer)
+		return nil, fmt.Errorf("in-memory compression: %w", err)
+	}
 
-    file.uncompressedSize = uncompressedSize
-    file.compressedSize = sizeCounter.bytesWritten
-    file.crc32 = hasher.Sum32()
+	file.uncompressedSize = uncompressedSize
+	file.compressedSize = sizeCounter.bytesWritten
+	file.crc32 = hasher.Sum32()
 
-    if _, err := buffer.Seek(0, io.SeekStart); err != nil {
-        pzw.bufferPool.Put(buffer)
-        return nil, fmt.Errorf("reset buffer position: %w", err)
-    }
-    return buffer, nil
+	if _, err := buffer.Seek(0, io.SeekStart); err != nil {
+		pzw.bufferPool.Put(buffer)
+		return nil, fmt.Errorf("reset buffer position: %w", err)
+	}
+	return buffer, nil
 }
 
 func (pzw *parallelZipWriter) compressToTempFile(file *file) (*os.File, error) {
@@ -425,19 +418,20 @@ func (pzw *parallelZipWriter) compressToTempFile(file *file) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create temp file: %w", err)
 	}
+	sizeCounter := &byteCountWriter{dest: tmpFile}
 
-	sizeCounter := &byteCounterWriter{dest: tmpFile}
-	hasher := crc32.NewIEEE()
-
-	var uncompressedSize int64
-	switch file.config.CompressionMethod {
-	case Stored:
-		uncompressedSize, err = writeStored(file, sizeCounter, hasher)
-	case Deflated:
-		uncompressedSize, err = writeDeflated(file, sizeCounter, hasher)
-	default:
-		err = errors.New("unsupported compression method")
+	src, err := file.openFunc()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source: %w", err)
 	}
+	defer src.Close()
+
+	hasher := crc32.NewIEEE()
+	uncompressedSize, err := file.config.CompressFunc(
+		io.TeeReader(src, hasher),
+		sizeCounter,
+		file.config.CompressionLevel,
+	)
 	if err != nil {
 		cleanupTempFile(tmpFile)
 		return nil, fmt.Errorf("compression: %w", err)
@@ -490,137 +484,123 @@ func (pzw *parallelZipWriter) writeFileData(source io.Reader) error {
 	if _, err := io.Copy(pzw.zw.dest, source); err != nil {
 		return fmt.Errorf("copy temp file data: %w", err)
 	}
-	if mb, ok := source.(*MemoryBuffer); ok {
-        mb.Reset()
-        pzw.bufferPool.Put(mb)
-    }
+	if mb, ok := source.(*memoryBuffer); ok {
+		mb.Reset()
+		pzw.bufferPool.Put(mb)
+	}
 	return nil
 }
 
-// MemoryBuffer implements io.ReadWriteSeeker with in-memory storage
+// memoryBuffer implements io.ReadWriteSeeker with in-memory storage
 // It provides thread-safe operations suitable for parallel compression
-type MemoryBuffer struct {
-    data   []byte        // The underlying byte slice
-    pos    int64         // Current read/write position
-    mu     sync.RWMutex  // Protects concurrent access
-    closed bool          // Whether the buffer is closed
+type memoryBuffer struct {
+	data   []byte // The underlying byte slice
+	pos    int64  // Current read/write position
+	closed bool   // Whether the buffer is closed
 }
 
 // NewMemoryBuffer creates a new empty MemoryBuffer with optional initial capacity
-func NewMemoryBuffer(capacity int) *MemoryBuffer {
-    if capacity < 0 {
-        capacity = 0
-    }
-    return &MemoryBuffer{
-        data: make([]byte, 0, capacity),
-        pos:  0,
-    }
+func NewMemoryBuffer(capacity int) *memoryBuffer {
+	if capacity < 0 {
+		capacity = 0
+	}
+	return &memoryBuffer{
+		data: make([]byte, 0, capacity),
+		pos:  0,
+	}
 }
 
 // Read reads up to len(p) bytes from the current position into p
 // Implements io.Reader interface
-func (mb *MemoryBuffer) Read(p []byte) (n int, err error) {
-    mb.mu.RLock()
-    defer mb.mu.RUnlock()
+func (mb *memoryBuffer) Read(p []byte) (n int, err error) {
+	if mb.closed {
+		return 0, io.ErrClosedPipe
+	}
 
-    if mb.closed {
-        return 0, io.ErrClosedPipe
-    }
+	if mb.pos >= int64(len(mb.data)) {
+		return 0, io.EOF
+	}
 
-    if mb.pos >= int64(len(mb.data)) {
-        return 0, io.EOF
-    }
+	n = copy(p, mb.data[mb.pos:])
+	mb.pos += int64(n)
 
-    n = copy(p, mb.data[mb.pos:])
-    mb.pos += int64(n)
+	if n < len(p) {
+		err = io.EOF
+	}
 
-    if n < len(p) {
-        err = io.EOF
-    }
-
-    return n, err
+	return n, err
 }
 
 // Write writes len(p) bytes from p to the buffer, expanding if necessary
 // Implements io.Writer interface
-func (mb *MemoryBuffer) Write(p []byte) (n int, err error) {
-    mb.mu.Lock()
-    defer mb.mu.Unlock()
+func (mb *memoryBuffer) Write(p []byte) (n int, err error) {
+	if mb.closed {
+		return 0, io.ErrClosedPipe
+	}
 
-    if mb.closed {
-        return 0, io.ErrClosedPipe
-    }
+	// Calculate required capacity
+	required := mb.pos + int64(len(p))
+	if required > int64(cap(mb.data)) {
+		// Grow buffer by at least doubling, but enough to fit required data
+		newCap := max(int64(cap(mb.data))*2, required)
+		if newCap < 64 {
+			newCap = 64
+		}
+		newData := make([]byte, len(mb.data), newCap)
+		copy(newData, mb.data)
+		mb.data = newData
+	}
 
-    // Calculate required capacity
-    required := mb.pos + int64(len(p))
-    if required > int64(cap(mb.data)) {
-        // Grow buffer by at least doubling, but enough to fit required data
-        newCap := max(int64(cap(mb.data))*2, required)
-        if newCap < 64 {
-            newCap = 64
-        }
-        newData := make([]byte, len(mb.data), newCap)
-        copy(newData, mb.data)
-        mb.data = newData
-    }
+	// Extend slice if writing beyond current length
+	if required > int64(len(mb.data)) {
+		mb.data = mb.data[:required]
+	}
 
-    // Extend slice if writing beyond current length
-    if required > int64(len(mb.data)) {
-        mb.data = mb.data[:required]
-    }
+	// Copy data at current position
+	n = copy(mb.data[mb.pos:], p)
+	mb.pos += int64(n)
 
-    // Copy data at current position
-    n = copy(mb.data[mb.pos:], p)
-    mb.pos += int64(n)
-
-    return n, nil
+	return n, nil
 }
 
 // Seek sets the offset for the next Read or Write
 // Implements io.Seeker interface
-func (mb *MemoryBuffer) Seek(offset int64, whence int) (int64, error) {
-    mb.mu.Lock()
-    defer mb.mu.Unlock()
+func (mb *memoryBuffer) Seek(offset int64, whence int) (int64, error) {
+	if mb.closed {
+		return 0, io.ErrClosedPipe
+	}
 
-    if mb.closed {
-        return 0, io.ErrClosedPipe
-    }
+	var newPos int64
+	switch whence {
+	case io.SeekStart:
+		newPos = offset
+	case io.SeekCurrent:
+		newPos = mb.pos + offset
+	case io.SeekEnd:
+		newPos = int64(len(mb.data)) + offset
+	default:
+		return 0, errors.New("invalid whence")
+	}
 
-    var newPos int64
-    switch whence {
-    case io.SeekStart:
-        newPos = offset
-    case io.SeekCurrent:
-        newPos = mb.pos + offset
-    case io.SeekEnd:
-        newPos = int64(len(mb.data)) + offset
-    default:
-        return 0, errors.New("invalid whence")
-    }
+	if newPos < 0 {
+		return 0, errors.New("negative position")
+	}
 
-    if newPos < 0 {
-        return 0, errors.New("negative position")
-    }
-
-    mb.pos = newPos
-    return newPos, nil
+	mb.pos = newPos
+	return newPos, nil
 }
 
 // Close marks the buffer as closed and releases resources
 // Subsequent operations will return io.ErrClosedPipe
-func (mb *MemoryBuffer) Close() error {
-    mb.mu.Lock()
-    defer mb.mu.Unlock()
-    mb.closed = true
-    mb.data = nil // Allow GC to reclaim memory
-    return nil
+func (mb *memoryBuffer) Close() error {
+	mb.closed = true
+	mb.data = nil // Allow GC to reclaim memory
+	return nil
 }
 
 // Reset clears the buffer and resets position to 0
 // Maintains existing capacity to avoid reallocations
-func (mb *MemoryBuffer) Reset() {
-    mb.mu.Lock()
-    defer mb.mu.Unlock()
-    mb.data = mb.data[:0]
-    mb.pos = 0
+func (mb *memoryBuffer) Reset() {
+	mb.data = mb.data[:0]
+	mb.pos = 0
 }

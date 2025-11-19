@@ -65,27 +65,30 @@ func TestZipWriter_CompressFileData(t *testing.T) {
 	testData := "This is a long text with some repetition to demonstrate compression in action"
 
 	tests := []struct {
-		name        string
-		compression CompressionMethod
-		source      io.Reader
-		wantErr     bool
+		name         string
+		compression  CompressionMethod
+		compressFunc CompressFunc
+		openFunc     func() (io.ReadCloser, error) 
+		wantErr      bool
 	}{
 		{
-			name:        "store compression",
-			compression: Stored,
-			source:      strings.NewReader(testData),
-			wantErr:     false,
+			name:         "store compression",
+			compression:  Stored,
+			compressFunc: WriteStored,
+			openFunc:     func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(testData)), nil },
+			wantErr:      false,
 		},
 		{
-			name:        "deflate compression",
-			compression: Deflated,
-			source:      strings.NewReader(testData),
-			wantErr:     false,
+			name:         "deflate compression",
+			compression:  Deflated,
+			compressFunc: WriteDeflated,
+			openFunc:     func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(testData)), nil },
+			wantErr:      false,
 		},
 		{
 			name:        "unsupported compression",
 			compression: CompressionMethod(99), // Invalid method
-			source:      strings.NewReader(testData),
+			openFunc:    func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(testData)), nil },
 			wantErr:     true,
 		},
 	}
@@ -97,8 +100,11 @@ func TestZipWriter_CompressFileData(t *testing.T) {
 
 			file := &file{
 				name:   "test.txt",
-				source: tt.source,
-				config: FileConfig{CompressionMethod: tt.compression},
+				openFunc: tt.openFunc,
+				config: FileConfig{
+					CompressionMethod: tt.compression,
+					CompressFunc: tt.compressFunc,
+				},
 			}
 
 			tmpFile, err := zw.encodeFileData(file)
@@ -281,9 +287,9 @@ func TestZipWriter_Integration(t *testing.T) {
 	// Create test file
 	file := &file{
 		name:    "integration_test.txt",
-		source:  strings.NewReader("Integration test data"),
+		openFunc: func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("Integration test data")), nil },
 		modTime: defaultTime(),
-		config:  FileConfig{CompressionMethod: Deflated},
+		config:  FileConfig{CompressionMethod: Deflated, CompressFunc: WriteStored},
 	}
 
 	// Complete flow

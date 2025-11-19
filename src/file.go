@@ -28,7 +28,7 @@ type file struct {
 	isDir bool
 
 	// File content and source
-	source           io.Reader
+	openFunc         func() (io.ReadCloser, error)
 	uncompressedSize int64
 	compressedSize   int64
 	crc32            uint32
@@ -46,20 +46,32 @@ type file struct {
 	extraField []ExtraFieldEntry
 }
 
-// newFileFromOS creates a file from an [os.File] instance
-func newFileFromOS(f *os.File) (*file, error) {
+// newFileFromPath creates a file by opening file at given filePath
+func newFileFromPath(filePath string) (*file, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("open file for metadata: %w", err)
+	}
+	defer f.Close()
+
 	stat, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("get file stats: %w", err)
 	}
+
+	hostSys := getHostSystem(f.Fd())
+	metadata := getFileMetadata(stat)
+
 	return &file{
 		name:             stat.Name(),
 		uncompressedSize: stat.Size(),
 		modTime:          stat.ModTime(),
 		isDir:            stat.IsDir(),
-		metadata:         getFileMetadata(stat),
-		hostSystem:       getHostSystem(f.Fd()),
-		source:           f,
+		metadata:         metadata,
+		hostSystem:       hostSys,
+		openFunc: func() (io.ReadCloser, error) {
+			return os.Open(filePath)
+		},
 	}, nil
 }
 
@@ -69,7 +81,9 @@ func newFileFromReader(source io.Reader, name string) (*file, error) {
 		name:       name,
 		modTime:    time.Now(),
 		hostSystem: getHostSystemByOS(),
-		source:     source,
+		openFunc: func() (io.ReadCloser, error) {
+			return io.NopCloser(source), nil
+		},
 	}, nil
 }
 
@@ -104,7 +118,19 @@ func (f *file) SetConfig(config FileConfig) {
 	}
 }
 
-func (f *file) SetSource(source io.Reader) { f.source = source }
+func (f *file) SetDefaultCompressFunc() error {
+	switch f.config.CompressionMethod {
+	case Stored:
+		f.config.CompressFunc = WriteStored
+	case Deflated:
+		f.config.CompressFunc = WriteDeflated
+	default:
+		return errors.New("no default compression func for specified method")
+	}
+	return nil
+}
+
+func (f *file) SetOpenFunc(openFunc func() (io.ReadCloser, error)) { f.openFunc = openFunc }
 
 // RequiresZip64 checks whether zip64 extra field should be used for the file
 func (f *file) RequiresZip64() bool {
@@ -143,13 +169,25 @@ func NewFileAttributes(f *file) *fileAttributes {
 
 // GetVersionNeededToExtract returns minimum ZIP version needed
 func (fa *fileAttributes) GetVersionNeededToExtract() uint16 {
+	if fa.file.config.CompressionMethod == LZMA {
+		return 63
+	}
+	if fa.file.config.CompressionMethod == BZIP2 {
+		return 46
+	}
 	if fa.file.RequiresZip64() {
 		return 45
+	}
+	if fa.file.config.CompressionMethod == Deflate64 {
+		return 21
+	}
+	if fa.file.config.CompressionMethod == Deflated {
+		return 20
 	}
 	if fa.file.isDir || fa.file.path != "" {
 		return 20
 	}
-	if fa.file.config.CompressionMethod == Deflated {
+	if fa.file.config.IsEncrypted {
 		return 20
 	}
 	return 10
@@ -269,8 +307,8 @@ type FileMetadata struct {
 
 // ExtraFieldEntry represents an external file data
 type ExtraFieldEntry struct {
-	Tag  uint16  // Extra field identifier
-	Data []byte  // Encoded field data including tag
+	Tag  uint16 // Extra field identifier
+	Data []byte // Encoded field data including tag
 }
 
 // NewFileMetadata creates a new FileMetadata instance
@@ -348,14 +386,23 @@ func (fm *FileMetadata) addZip64ExtraField() {
 // addNTFSExtraField adds NTFS timestamp extra field
 func (fm *FileMetadata) addNTFSExtraField() {
 	var mtime, atime, ctime uint64
-	if mTime, ok := fm.file.metadata["LastWriteTime"].(uint64); ok {
-		mtime = mTime
+	switch v := fm.file.metadata["LastWriteTime"].(type) {
+	case uint64:
+		mtime = v
+	case time.Time:
+		mtime = uint64(v.UnixNano()/100 + 116444736000000000)
 	}
-	if aTime, ok := fm.file.metadata["LastAccessTime"].(uint64); ok {
-		atime = aTime
+	switch v := fm.file.metadata["LastAccessTime"].(type) {
+	case uint64:
+		atime = v
+	case time.Time:
+		atime = uint64(v.UnixNano()/100 + 116444736000000000)
 	}
-	if cTime, ok := fm.file.metadata["CreationTime"].(uint64); ok {
-		ctime = cTime
+	switch v := fm.file.metadata["CreationTime"].(type) {
+	case uint64:
+		ctime = v
+	case time.Time:
+		ctime = uint64(v.UnixNano()/100 + 116444736000000000)
 	}
 
 	ntfs := struct {
