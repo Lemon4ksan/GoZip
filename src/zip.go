@@ -37,7 +37,10 @@ type FileConfig struct {
 	// IsEncrypted indicates whether the file should be encrypted
 	IsEncrypted bool
 
-	// Path specifies the file's location and name within the archive
+	// Name specifies the file's name within the archive
+	Name string
+
+	// Path specifies the file's location within the archive
 	Path string
 }
 
@@ -65,21 +68,32 @@ func WithCompressionLevel(lvl int) AddOption {
 	}
 }
 
-// PrefixPath prefixes the file path with the given path component
-func PrefixPath(p string) AddOption {
+func WithName(name string) AddOption {
 	return func(f *file) {
-		if p != "" {
-			f.config.Path = path.Join(p, f.config.Path)
+		if name != "" {
+			f.config.Name = name
 		}
 	}
 }
 
-// ExtendPath extends the file path with given path component
-func ExtendPath(p string) AddOption {
+// WithPath sets a path for file within the archive
+func WithPath(p string) AddOption {
 	return func(f *file) {
-		if p != "" {
-			f.config.Path = path.Join(f.config.Path, p)
-		}
+		f.config.Path = p
+	}
+}
+
+// WithPrefixedPath prefixes the file path with the given path component
+func WithPrefixedPath(p string) AddOption {
+	return func(f *file) {
+		f.config.Path = path.Join(p, f.config.Path)
+	}
+}
+
+// WithExtendedPath extends the file path with given path component
+func WithExtendedPath(p string) AddOption {
+	return func(f *file) {
+		f.config.Path = path.Join(f.config.Path, p)
 	}
 }
 
@@ -93,8 +107,8 @@ type Zip struct {
 	password          string
 
 	// Concurrency safety
-	mu       sync.RWMutex
-	dirCache map[string]bool
+	mu        sync.RWMutex
+	fileCache map[string]bool
 
 	// Registry for reusable compressors
 	compressors sync.Map
@@ -105,7 +119,7 @@ func NewZip(c CompressionMethod) *Zip {
 	return &Zip{
 		compressionMethod: c,
 		files:             make([]*file, 0),
-		dirCache:          make(map[string]bool),
+		fileCache:         make(map[string]bool),
 	}
 }
 
@@ -159,15 +173,21 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	for _, opt := range options {
 		opt(fileEntry)
 	}
+	fileEntry.normalizeEntry()
 
 	z.mu.Lock()
 	defer z.mu.Unlock()
 
-	if err := z.ensurePath(fileEntry); err != nil {
-		return fmt.Errorf("ensure path: %w", err)
+	if z.existsInCache(fileEntry) {
+		return fmt.Errorf("path collision: '%s' already exists", path.Join(fileEntry.path, fileEntry.name))
+	}
+
+	if err := z.createParentDirs(fileEntry); err != nil {
+		return fmt.Errorf("create parent dirs: %w", err)
 	}
 
 	z.files = append(z.files, fileEntry)
+	z.cacheEntry(fileEntry)
 	return nil
 }
 
@@ -186,15 +206,21 @@ func (z *Zip) AddFromPath(fsPath string, options ...AddOption) error {
 	for _, opt := range options {
 		opt(fileEntry)
 	}
+	fileEntry.normalizeEntry()
 
 	z.mu.Lock()
 	defer z.mu.Unlock()
 
-	if err := z.ensurePath(fileEntry); err != nil {
-		return fmt.Errorf("ensure path: %w", err)
+	if z.existsInCache(fileEntry) {
+		return fmt.Errorf("path collision: '%s' already exists", path.Join(fileEntry.path, fileEntry.name))
+	}
+
+	if err := z.createParentDirs(fileEntry); err != nil {
+		return fmt.Errorf("create parent dirs: %w", err)
 	}
 
 	z.files = append(z.files, fileEntry)
+	z.cacheEntry(fileEntry)
 	return nil
 }
 
@@ -213,7 +239,7 @@ func (z *Zip) AddFromDir(root string, options ...AddOption) error {
 			return fmt.Errorf("get relative path: %w", err)
 		}
 
-		localOpts := append(options, ExtendPath(filepath.ToSlash(filepath.Dir(relPath))))
+		localOpts := append(options, WithPrefixedPath(filepath.ToSlash(filepath.Dir(relPath))))
 
 		if err := z.AddFromPath(walkPath, localOpts...); err != nil {
 			return fmt.Errorf("add file %s: %w", walkPath, err)
@@ -237,15 +263,21 @@ func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) erro
 	for _, opt := range options {
 		opt(fileEntry)
 	}
+	fileEntry.normalizeEntry()
 
 	z.mu.Lock()
 	defer z.mu.Unlock()
 
-	if err := z.ensurePath(fileEntry); err != nil {
-		return fmt.Errorf("ensure path: %w", err)
+	if z.existsInCache(fileEntry) {
+		return fmt.Errorf("path collision: '%s' already exists", path.Join(fileEntry.path, fileEntry.name))
+	}
+
+	if err := z.createParentDirs(fileEntry); err != nil {
+		return fmt.Errorf("create parent dirs: %w", err)
 	}
 
 	z.files = append(z.files, fileEntry)
+	z.cacheEntry(fileEntry)
 	return nil
 }
 
@@ -255,33 +287,40 @@ func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
 		return errors.New("directory name cannot be empty")
 	}
 
-	file, err := newDirectoryFile("", name)
+	dirEntry, err := newDirectoryFile("", name)
 	if err != nil {
 		return fmt.Errorf("create directory file: %w", err)
 	}
 
 	for _, opt := range options {
-		opt(file)
+		opt(dirEntry)
 	}
+	dirEntry.normalizeEntry()
 
 	z.mu.Lock()
 	defer z.mu.Unlock()
 
-	if err := z.ensurePath(file); err != nil {
-		return fmt.Errorf("ensure path: %w", err)
+	if z.existsInCache(dirEntry) {
+		return fmt.Errorf("path collision: '%s' already exists", path.Join(dirEntry.path, dirEntry.name))
 	}
 
-	z.files = append(z.files, file)
-	z.cacheDirectoryEntry(file)
+	if err := z.createParentDirs(dirEntry); err != nil {
+		return fmt.Errorf("create parent dirs: %w", err)
+	}
+
+	z.files = append(z.files, dirEntry)
+	z.cacheEntry(dirEntry)
 	return nil
 }
 
 // Exists checks if file or directory with given name exists at the specified path.
 // Returns true if an entry with matching path and filename is found in the archive.
-func (z *Zip) Exists(filepath, filename string) bool {
+func (z *Zip) Exists(filePath, fileName string) bool {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
-	return z.existsInCache(filepath, filename)
+
+	key := path.Clean(strings.ReplaceAll(filePath, "\\", "/"))
+	return z.fileCache[key] || z.fileCache[key+"/"]
 }
 
 // Write writes the archive sequentially to dest
@@ -323,33 +362,30 @@ func (z *Zip) WriteParallel(dest io.WriteSeeker, maxWorkers int) error {
 
 // Internal helpers
 
-// ensurePath verifies and creates directory structure (Unsafe: requires external Lock)
-func (z *Zip) ensurePath(f *file) error {
-	if f.config.Path == "" || f.config.Path == "/" {
+func (z *Zip) createParentDirs(f *file) error {
+	if f.path == "" {
 		return nil
 	}
 
-	normalizedPath := path.Clean(strings.ReplaceAll(f.config.Path, "\\", "/"))
-	if normalizedPath == "." || normalizedPath == "/" {
-		return nil
-	}
-
-	f.path = normalizedPath
-	pathComponents := strings.Split(normalizedPath, "/")
-
+	components := strings.Split(f.path, "/")
 	currentPath := ""
-	for _, component := range pathComponents {
+
+	for _, component := range components {
 		if component == "" {
 			continue
 		}
 
-		if !z.existsInCache(currentPath, component) {
-			dir, err := newDirectoryFile(currentPath, component)
+		if z.fileExistsInCache(currentPath, component) {
+			return fmt.Errorf("path collision: '%s' is already a file", path.Join(currentPath, component))
+		}
+
+		if !z.dirExistsInCache(currentPath, component) {
+			dirEntry, err := newDirectoryFile(currentPath, component)
 			if err != nil {
-				return fmt.Errorf("create directory file: %w", err)
+				return err
 			}
-			z.files = append(z.files, dir)
-			z.cacheDirectoryEntry(dir)
+			z.files = append(z.files, dirEntry)
+			z.cacheEntry(dirEntry)
 		}
 
 		if currentPath == "" {
@@ -361,34 +397,26 @@ func (z *Zip) ensurePath(f *file) error {
 	return nil
 }
 
-func (z *Zip) cacheDirectoryEntry(dir *file) {
-	if dir == nil || !dir.isDir {
-		return
+func (z *Zip) cacheEntry(f *file) {
+	if f.isDir {
+		z.fileCache[path.Join(f.path, f.name)+"/"] = true
+	} else {
+		z.fileCache[path.Join(f.path, f.name)] = true
 	}
-	cacheKey := z.buildCacheKey(dir.path, dir.name)
-	z.dirCache[cacheKey] = true
 }
 
-func (z *Zip) existsInCache(path, name string) bool {
-	cacheKey := z.buildCacheKey(path, name)
-	if _, exists := z.dirCache[cacheKey]; exists {
-		return true
-	}
-
-	for _, file := range z.files {
-		if file.path == path && file.name == name {
-			z.dirCache[cacheKey] = true
-			return true
-		}
-	}
-	return false
+func (z *Zip) existsInCache(f *file) bool {
+	return z.fileExistsInCache(f.path, f.name) || z.dirExistsInCache(f.path, f.name)
 }
 
-func (z *Zip) buildCacheKey(p, name string) string {
-	if p == "" {
-		return name + "/"
-	}
-	return path.Join(p, name) + "/"
+func (z *Zip) fileExistsInCache(p, n string) bool {
+	cacheKey := path.Join(p, n)
+	return z.fileCache[cacheKey]
+}
+
+func (z *Zip) dirExistsInCache(p, n string) bool {
+	cacheKey := path.Join(p, n) + "/"
+	return z.fileCache[cacheKey]
 }
 
 // resolveCompressor determines the correct compressor for a file.

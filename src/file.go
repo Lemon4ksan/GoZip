@@ -51,7 +51,7 @@ func newFileFromOS(f *os.File) (*file, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stat file: %w", err)
 	}
-	
+
 	return &file{
 		name:             stat.Name(),
 		uncompressedSize: stat.Size(),
@@ -148,6 +148,21 @@ func (f *file) RequiresZip64() bool {
 	return f.compressedSize > math.MaxUint32 ||
 		f.uncompressedSize > math.MaxUint32 ||
 		f.localHeaderOffset > math.MaxUint32
+}
+
+// normalizeEntry stores serialized path from config to struct
+func (f *file) normalizeEntry() {
+	if f.config.Name != "" {
+		f.name = f.config.Name
+	}
+	if f.config.Path != "" {
+		fullPath := path.Clean(strings.ReplaceAll(f.config.Path, "\\", "/"))
+		if fullPath == "." || fullPath == "/" {
+			fullPath = ""
+		}
+
+		f.path = fullPath
+	}
 }
 
 // getExtraFieldLength returns the total length of all extra field entries
@@ -396,22 +411,28 @@ func (fm *FileMetadata) addZip64ExtraField() {
 func (fm *FileMetadata) addNTFSExtraField() {
 	var mtime, atime, ctime uint64
 	if val, ok := fm.file.metadata["LastWriteTime"]; ok {
-		if t, ok := val.(uint64); ok { mtime = t }
+		if t, ok := val.(uint64); ok {
+			mtime = t
+		}
 	}
 	if val, ok := fm.file.metadata["LastAccessTime"]; ok {
-		if t, ok := val.(uint64); ok { atime = t }
+		if t, ok := val.(uint64); ok {
+			atime = t
+		}
 	}
 	if val, ok := fm.file.metadata["CreationTime"]; ok {
-		if t, ok := val.(uint64); ok { ctime = t }
+		if t, ok := val.(uint64); ok {
+			ctime = t
+		}
 	}
 
 	// Tag(2) + Size(2) + Reserved(4) + Attr1(2) + Size1(2) + Mtime(8) + Atime(8) + Ctime(8)
 	data := make([]byte, 36)
 
 	binary.LittleEndian.PutUint16(data[0:2], __NTFS_METADATA_FIELD_ID)
-	binary.LittleEndian.PutUint16(data[2:4], 32) // Block size 
-	binary.LittleEndian.PutUint32(data[4:8], 0)  // Reserved
-	binary.LittleEndian.PutUint16(data[8:10], 1) // Attribute1 (Tag 1)
+	binary.LittleEndian.PutUint16(data[2:4], 32)   // Block size
+	binary.LittleEndian.PutUint32(data[4:8], 0)    // Reserved
+	binary.LittleEndian.PutUint16(data[8:10], 1)   // Attribute1 (Tag 1)
 	binary.LittleEndian.PutUint16(data[10:12], 24) // Size1 (Size of attributes)
 	binary.LittleEndian.PutUint64(data[12:20], mtime)
 	binary.LittleEndian.PutUint64(data[20:28], atime)
