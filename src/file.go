@@ -45,6 +45,30 @@ type file struct {
 	extraField []ExtraFieldEntry
 }
 
+// newFileFromOS creates a file from an [os.File]
+func newFileFromOS(f *os.File) (*file, error) {
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat file: %w", err)
+	}
+	
+	return &file{
+		name:             stat.Name(),
+		uncompressedSize: stat.Size(),
+		modTime:          stat.ModTime(),
+		isDir:            stat.IsDir(),
+		metadata:         getFileMetadata(stat),
+		hostSystem:       getHostSystem(f.Fd()),
+		// Create a closure that attempts to seek to start before reading
+		openFunc: func() (io.ReadCloser, error) {
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				return nil, fmt.Errorf("seek failed (stream?): %w", err)
+			}
+			return io.NopCloser(f), nil
+		},
+	}, nil
+}
+
 // newFileFromPath creates a file by opening file at given filePath
 func newFileFromPath(filePath string) (*file, error) {
 	f, err := os.Open(filePath)
@@ -115,18 +139,6 @@ func (f *file) SetConfig(config FileConfig) {
 	} else {
 		f.config = config
 	}
-}
-
-func (f *file) SetDefaultCompressFunc() error {
-	switch f.config.CompressionMethod {
-	case Stored:
-		f.config.CompressFunc = WriteStored
-	case Deflated:
-		f.config.CompressFunc = WriteDeflated
-	default:
-		return errors.New("no default compression func for specified method")
-	}
-	return nil
 }
 
 func (f *file) SetOpenFunc(openFunc func() (io.ReadCloser, error)) { f.openFunc = openFunc }
@@ -359,7 +371,7 @@ func (fm *FileMetadata) AddFilesystemExtraField() {
 
 // addZip64ExtraField adds ZIP64 extra field for large files
 func (fm *FileMetadata) addZip64ExtraField() {
-	data := make([]byte, 4, 28) 
+	data := make([]byte, 4, 28)
 	binary.LittleEndian.PutUint16(data[0:2], __ZIP64_EXTRA_FIELD_ID)
 
 	var buf [8]byte

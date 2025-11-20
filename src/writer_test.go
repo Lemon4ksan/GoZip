@@ -67,21 +67,21 @@ func TestZipWriter_CompressFileData(t *testing.T) {
 	tests := []struct {
 		name         string
 		compression  CompressionMethod
-		compressFunc CompressFunc
-		openFunc     func() (io.ReadCloser, error) 
+		compressor   Compressor
+		openFunc     func() (io.ReadCloser, error)
 		wantErr      bool
 	}{
 		{
 			name:         "store compression",
 			compression:  Stored,
-			compressFunc: WriteStored,
+			compressor:   new(StoredCompressor),
 			openFunc:     func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(testData)), nil },
 			wantErr:      false,
 		},
 		{
 			name:         "deflate compression",
 			compression:  Deflated,
-			compressFunc: WriteDeflated,
+			compressor:   new(DeflateCompressor),
 			openFunc:     func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(testData)), nil },
 			wantErr:      false,
 		},
@@ -99,12 +99,9 @@ func TestZipWriter_CompressFileData(t *testing.T) {
 			zw := newZipWriter(NewZip(tt.compression), &seekableBuffer{Buffer: &buf})
 
 			file := &file{
-				name:   "test.txt",
+				name:     "test.txt",
 				openFunc: tt.openFunc,
-				config: FileConfig{
-					CompressionMethod: tt.compression,
-					CompressFunc: tt.compressFunc,
-				},
+				config:   FileConfig{CompressionMethod: tt.compression},
 			}
 
 			tmpFile, err := zw.encodeFileData(file)
@@ -286,10 +283,10 @@ func TestZipWriter_Integration(t *testing.T) {
 
 	// Create test file
 	file := &file{
-		name:    "integration_test.txt",
+		name:     "integration_test.txt",
 		openFunc: func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("Integration test data")), nil },
-		modTime: defaultTime(),
-		config:  FileConfig{CompressionMethod: Deflated, CompressFunc: WriteStored},
+		modTime:  defaultTime(),
+		config:   FileConfig{CompressionMethod: Deflated},
 	}
 
 	// Complete flow

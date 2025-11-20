@@ -131,8 +131,12 @@ func (zw *zipWriter) encodeFileData(file *file) (*os.File, error) {
 	defer src.Close()
 
 	hasher := crc32.NewIEEE()
-	tee := io.TeeReader(src, hasher)
-	uncompressedSize, err := file.config.CompressFunc(tee, sizeCounter, file.config.CompressionLevel)
+
+	comp, err := zw.zip.resolveCompressor(file)
+	if err != nil {
+		return nil, err
+	} 
+	uncompressedSize, err := comp.Compress(io.TeeReader(src, hasher), sizeCounter)
 	if err != nil {
 		cleanupTempFile(tmpFile)
 		return nil, fmt.Errorf("compression: %w", err)
@@ -371,7 +375,18 @@ func (pzw *parallelZipWriter) compressFile(file *file) (io.Reader, error) {
 	if file.uncompressedSize > 0 && file.uncompressedSize <= pzw.memoryThreshold {
 		return pzw.compressToMemory(file)
 	}
-	return pzw.compressToTempFile(file)
+
+	tmpFile, err := os.CreateTemp("", "zip-compress-*")
+	if err != nil {
+		return nil, err
+	}
+    
+    res, err := pzw.compressToTempFile(file, tmpFile)
+    if err != nil {
+        cleanupTempFile(tmpFile)
+        return nil, err
+    }
+	return res, nil
 }
 
 // compressToMemory compresses file data to an in-memory buffer instead of temporary file
@@ -395,14 +410,13 @@ func (pzw *parallelZipWriter) compressToMemory(file *file) (io.Reader, error) {
 	defer src.Close()
 
 	hasher := crc32.NewIEEE()
-	uncompressedSize, err := file.config.CompressFunc(
-		io.TeeReader(src, hasher),
-		sizeCounter,
-		file.config.CompressionLevel,
-	)
+	comp, err := pzw.zw.zip.resolveCompressor(file)
+    if err != nil {
+        return nil, err
+    }
+	uncompressedSize, err := comp.Compress(io.TeeReader(src, hasher), sizeCounter)
 	if err != nil {
-		pzw.bufferPool.Put(buffer)
-		return nil, fmt.Errorf("in-memory compression: %w", err)
+		return nil, fmt.Errorf("compression error: %w", err)
 	}
 
 	file.uncompressedSize = uncompressedSize
@@ -416,11 +430,7 @@ func (pzw *parallelZipWriter) compressToMemory(file *file) (io.Reader, error) {
 	return buffer, nil
 }
 
-func (pzw *parallelZipWriter) compressToTempFile(file *file) (*os.File, error) {
-	tmpFile, err := os.CreateTemp("", "zip-compress-*")
-	if err != nil {
-		return nil, fmt.Errorf("create temp file: %w", err)
-	}
+func (pzw *parallelZipWriter) compressToTempFile(file *file, tmpFile io.ReadWriteSeeker) (io.Reader, error) {
 	sizeCounter := &byteCountWriter{dest: tmpFile}
 
 	src, err := file.openFunc()
@@ -430,14 +440,13 @@ func (pzw *parallelZipWriter) compressToTempFile(file *file) (*os.File, error) {
 	defer src.Close()
 
 	hasher := crc32.NewIEEE()
-	uncompressedSize, err := file.config.CompressFunc(
-		io.TeeReader(src, hasher),
-		sizeCounter,
-		file.config.CompressionLevel,
-	)
+	comp, err := pzw.zw.zip.resolveCompressor(file)
+    if err != nil {
+        return nil, err
+    }
+	uncompressedSize, err := comp.Compress(io.TeeReader(src, hasher), sizeCounter)
 	if err != nil {
-		cleanupTempFile(tmpFile)
-		return nil, fmt.Errorf("compression: %w", err)
+		return nil, fmt.Errorf("compression error: %w", err)
 	}
 
 	file.uncompressedSize = uncompressedSize
@@ -445,8 +454,7 @@ func (pzw *parallelZipWriter) compressToTempFile(file *file) (*os.File, error) {
 	file.crc32 = hasher.Sum32()
 
 	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
-		cleanupTempFile(tmpFile)
-		return nil, fmt.Errorf("seek temp file: %w", err)
+		return nil, fmt.Errorf("reset buffer: %w", err)
 	}
 	return tmpFile, nil
 }
