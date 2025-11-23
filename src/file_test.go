@@ -3,6 +3,7 @@ package gozip
 import (
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -53,19 +54,14 @@ func TestNewFileFromReader(t *testing.T) {
 
 func TestNewDirectoryFile(t *testing.T) {
 	dirPath := "path/to"
-	dirName := "directory"
 
-	file, err := newDirectoryFile(dirPath, dirName)
+	file, err := newDirectoryFile(path.Join(dirPath, "directory"))
 	if err != nil {
 		t.Fatalf("NewDirectoryFile failed: %v", err)
 	}
 
 	if !file.IsDir() {
 		t.Error("expected file to be a directory")
-	}
-
-	if file.Path() != dirPath {
-		t.Errorf("expected path %s, got %s", dirPath, file.Path())
 	}
 }
 
@@ -109,8 +105,7 @@ func TestZipHeaders(t *testing.T) {
 
 func TestZipHeaders_Directory(t *testing.T) {
 	file := &file{
-		name:  "docs",
-		path:  "archive",
+		name:  "archive/docs",
 		isDir: true,
 	}
 
@@ -121,161 +116,6 @@ func TestZipHeaders_Directory(t *testing.T) {
 	if localHeader.FilenameLength != expectedLength {
 		t.Errorf("directory filename length incorrect: got %d, expected %d",
 			localHeader.FilenameLength, expectedLength)
-	}
-}
-
-func TestFileMetadata_ExtraFields(t *testing.T) {
-	file := &file{}
-	metadata := NewFileMetadata(file)
-
-	entry := ExtraFieldEntry{
-		Tag:  0x1234,
-		Data: []byte{0x01, 0x02, 0x03, 0x04},
-	}
-
-	err := metadata.AddExtraFieldEntry(entry)
-	if err != nil {
-		t.Fatalf("AddExtraFieldEntry failed: %v", err)
-	}
-
-	if !metadata.HasExtraField(0x1234) {
-		t.Error("extra field was not added")
-	}
-}
-
-func TestFileMetadata_ExtraFieldLength(t *testing.T) {
-	file := &file{
-		extraField: []ExtraFieldEntry{
-			{Tag: 0x0001, Data: []byte{0x01, 0x02, 0x03}},
-			{Tag: 0x0002, Data: []byte{0x04, 0x05}},
-		},
-	}
-
-	expected := uint16(5)
-	actual := file.getExtraFieldLength()
-
-	if actual != expected {
-		t.Errorf("extra field length incorrect: got %d, expected %d", actual, expected)
-	}
-}
-
-func TestFileAttributes_Version(t *testing.T) {
-	tests := []struct {
-		name     string
-		file     *file
-		expected uint16
-	}{
-		{
-			name: "Regular file stored",
-			file: &file{
-				config: FileConfig{CompressionMethod: Stored},
-			},
-			expected: 10,
-		},
-		{
-			name: "Directory",
-			file: &file{
-				isDir: true,
-			},
-			expected: 20,
-		},
-		{
-			name: "Deflated file",
-			file: &file{
-				config: FileConfig{CompressionMethod: Deflated},
-			},
-			expected: 20,
-		},
-		{
-			name: "Zip64 file",
-			file: &file{
-				uncompressedSize: math.MaxUint32 + 1,
-			},
-			expected: 45,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			attrs := NewFileAttributes(tt.file)
-			version := attrs.GetVersionNeededToExtract()
-			if version != tt.expected {
-				t.Errorf("got version %d, expected %d", version, tt.expected)
-			}
-		})
-	}
-}
-
-func TestFileAttributes_BitFlags(t *testing.T) {
-	tests := []struct {
-		name     string
-		file     *file
-		expected uint16
-	}{
-		{
-			name: "Encrypted deflated",
-			file: &file{
-				config: FileConfig{
-					CompressionMethod: Deflated,
-					IsEncrypted:       true,
-				},
-			},
-			expected: 0x0001,
-		},
-		{
-			name: "Stored no flags",
-			file: &file{
-				config: FileConfig{
-					CompressionMethod: Stored,
-				},
-			},
-			expected: 0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			attrs := NewFileAttributes(tt.file)
-			flags := attrs.GetFileBitFlag()
-			if flags != tt.expected {
-				t.Errorf("got flags %04x, expected %04x", flags, tt.expected)
-			}
-		})
-	}
-}
-
-func TestFileAttributes_ExternalAttributes(t *testing.T) {
-	tests := []struct {
-		name     string
-		file     *file
-		expected uint32
-	}{
-		{
-			name: "FAT directory",
-			file: &file{
-				hostSystem: HostSystemFAT,
-				isDir:      true,
-			},
-			expected: 0x10,
-		},
-		{
-			name: "NTFS file",
-			file: &file{
-				hostSystem: HostSystemNTFS,
-				isDir:      false,
-			},
-			expected: 0x20,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			attrs := NewFileAttributes(tt.file)
-			attributes := attrs.GetExternalFileAttributes()
-			if attributes != tt.expected {
-				t.Errorf("got attributes %x, expected %x", attributes, tt.expected)
-			}
-		})
 	}
 }
 
@@ -331,23 +171,20 @@ func TestFile_GetFilenameLength(t *testing.T) {
 			name: "Simple file",
 			file: &file{
 				name: "file.txt",
-				path: "",
 			},
 			expected: 8,
 		},
 		{
 			name: "File with path",
 			file: &file{
-				name: "file.txt",
-				path: "path/to",
+				name: "path/to/file.txt",
 			},
 			expected: 16,
 		},
 		{
 			name: "Directory",
 			file: &file{
-				name:  "docs",
-				path:  "archive",
+				name:  "archive/docs",
 				isDir: true,
 			},
 			expected: 13,
@@ -356,7 +193,7 @@ func TestFile_GetFilenameLength(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			length := tt.file.getFilenameLength()
+			length := uint16(len(tt.file.getFilename()))
 			if length != tt.expected {
 				t.Errorf("getFilenameLength() = %d, expected %d", length, tt.expected)
 			}

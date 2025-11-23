@@ -3,7 +3,6 @@ package gozip
 import (
 	"encoding/binary"
 	"math"
-	"path"
 )
 
 // Each record type must be identified using a header signature that identifies the record type.
@@ -29,19 +28,13 @@ type localFileHeader struct {
 	UncompressedSize       uint32
 	FilenameLength         uint16
 	ExtraFieldLength       uint16
+	Filename               string
 }
 
-func (h localFileHeader) encode(f *file) []byte {
-	filename := path.Join(f.path, f.name)
-	if f.isDir {
-		filename += "/"
-	}
-	filenameLen := len(filename)
-
+func (h localFileHeader) encode() []byte {
 	// Fixed size (30 bytes) + variable filename length
 	// Signature(4) + Header(26) = 30 bytes
-	buf := make([]byte, 30+filenameLen)
-
+	buf := make([]byte, 30+h.FilenameLength)
 	binary.LittleEndian.PutUint32(buf[0:4], __LOCAL_FILE_HEADER_SIGNATURE)
 	binary.LittleEndian.PutUint16(buf[4:6], h.VersionNeededToExtract)
 	binary.LittleEndian.PutUint16(buf[6:8], h.GeneralPurposeBitFlag)
@@ -54,7 +47,7 @@ func (h localFileHeader) encode(f *file) []byte {
 	binary.LittleEndian.PutUint16(buf[26:28], h.FilenameLength)
 	binary.LittleEndian.PutUint16(buf[28:30], h.ExtraFieldLength)
 
-	copy(buf[30:], filename)
+	copy(buf[30:], h.Filename)
 
 	return buf
 }
@@ -76,22 +69,15 @@ type centralDirectory struct {
 	InternalFileAttributes uint16
 	ExternalFileAttributes uint32
 	LocalHeaderOffset      uint32
+	Filename               string
+	ExtraField             map[uint16][]byte
+	Comment                string
 }
 
-func (d centralDirectory) encode(f *file) []byte {
-	filename := path.Join(f.path, f.name)
-	if f.isDir {
-		filename += "/"
-	}
-
-	extraFieldTotalLen := 0
-	for _, field := range f.extraField {
-		extraFieldTotalLen += len(field.Data)
-	}
-
+func (d centralDirectory) encode() []byte {
 	// Fixed header (46 bytes) + Filename + Extra Fields + Comment
 	// Signature(4) + Header(42) = 46 bytes
-	totalSize := 46 + len(filename) + extraFieldTotalLen + len(f.config.Comment)
+	totalSize := 46 + d.FilenameLength + d.ExtraFieldLength + d.FileCommentLength
 	buf := make([]byte, totalSize)
 
 	binary.LittleEndian.PutUint32(buf[0:4], __CENTRAL_DIRECTORY_SIGNATURE)
@@ -115,17 +101,15 @@ func (d centralDirectory) encode(f *file) []byte {
 	offset := 46
 
 	// Write Filename
-	copy(buf[offset:], filename)
-	offset += len(filename)
+	offset += copy(buf[offset:], d.Filename)
 
 	// Write Extra Fields
-	for _, field := range f.extraField {
-		copy(buf[offset:], field.Data)
-		offset += len(field.Data)
+	for _, entry := range d.ExtraField {
+		offset += copy(buf[offset:], entry)
 	}
 
 	// Write Comment
-	copy(buf[offset:], f.config.Comment)
+	copy(buf[offset:], d.Comment)
 
 	return buf
 }
@@ -140,23 +124,21 @@ type endOfCentralDirectory struct {
 	CommentLength                   uint16
 }
 
-func encodeEndOfCentralDirRecord(z *Zip, centralDirSize uint64, centralDirOffset uint64) []byte {
-	commentLen := len(z.comment)
-	
+func encodeEndOfCentralDirRecord(entriesNum int, centralDirSize uint64, centralDirOffset uint64, comment string) []byte {
 	// Fixed header (22 bytes) + Comment length
 	// Signature(4) + Header(18) = 22 bytes
-	buf := make([]byte, 22+commentLen)
+	buf := make([]byte, 22+len(comment))
 
 	binary.LittleEndian.PutUint32(buf[0:4], __END_OF_CENTRAL_DIRECTORY_SIGNATURE)
 	binary.LittleEndian.PutUint16(buf[4:6], 0) // ThisDiskNum
 	binary.LittleEndian.PutUint16(buf[6:8], 0) // DiskNumWithTheStartOfCentralDir
-	binary.LittleEndian.PutUint16(buf[8:10], uint16(len(z.files))) // TotalNumberOfEntriesOnThisDisk
-	binary.LittleEndian.PutUint16(buf[10:12], uint16(len(z.files))) // TotalNumberOfEntries
+	binary.LittleEndian.PutUint16(buf[8:10], uint16(min(math.MaxUint16, entriesNum))) // TotalNumberOfEntriesOnThisDisk
+	binary.LittleEndian.PutUint16(buf[10:12], uint16(min(math.MaxUint16, entriesNum))) // TotalNumberOfEntries
 	binary.LittleEndian.PutUint32(buf[12:16], uint32(min(math.MaxUint32, centralDirSize)))
 	binary.LittleEndian.PutUint32(buf[16:20], uint32(min(math.MaxUint32, centralDirOffset)))
-	binary.LittleEndian.PutUint16(buf[20:22], uint16(commentLen))
+	binary.LittleEndian.PutUint16(buf[20:22], uint16(len(comment)))
 
-	copy(buf[22:], z.comment)
+	copy(buf[22:], comment)
 
 	return buf
 }
@@ -173,9 +155,9 @@ type zip64EndOfCentralDirectory struct {
 	CentralDirOffset                uint64
 }
 
-func encodeZip64EndOfCentralDirectoryRecord(z *Zip, centralDirSize uint64, centralDirOffset uint64) []byte {
-	// Fixed size: Signature(4) + Header(56) = 60 bytes
-	buf := make([]byte, 60)
+func encodeZip64EndOfCentralDirectoryRecord(entriesNum uint64, centralDirSize uint64, centralDirOffset uint64) []byte {
+	// Fixed size: Signature(4) + Header(52) = 56 bytes
+	buf := make([]byte, 56)
 
 	binary.LittleEndian.PutUint32(buf[0:4], __ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE)
 	binary.LittleEndian.PutUint64(buf[4:12], 44) // Size of the rest of the record
@@ -183,8 +165,8 @@ func encodeZip64EndOfCentralDirectoryRecord(z *Zip, centralDirSize uint64, centr
 	binary.LittleEndian.PutUint16(buf[14:16], 1) // VersionNeededToExtract
 	binary.LittleEndian.PutUint32(buf[16:20], 0) // ThisDiskNum
 	binary.LittleEndian.PutUint32(buf[20:24], 0) // DiskNumWithTheStartOfCentralDir
-	binary.LittleEndian.PutUint64(buf[24:32], uint64(len(z.files))) // TotalEntriesDisk
-	binary.LittleEndian.PutUint64(buf[32:40], uint64(len(z.files))) // TotalEntries
+	binary.LittleEndian.PutUint64(buf[24:32], entriesNum) // TotalEntriesDisk
+	binary.LittleEndian.PutUint64(buf[32:40], entriesNum) // TotalEntries
 	binary.LittleEndian.PutUint64(buf[40:48], centralDirSize)
 	binary.LittleEndian.PutUint64(buf[48:56], centralDirOffset)
 

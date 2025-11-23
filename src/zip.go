@@ -13,13 +13,32 @@ import (
 	"sync"
 )
 
-// Compressor defines a strategy for compressing data.
-// Implementations are responsible for thread-safety and memory pooling.
-// See [DeflateCompressor] as an example on how to implement efficient compressor.
+// Compressor defines a strategy for compressing data. See [DeflateCompressor] as an example
 type Compressor interface {
 	// Compress reads from src, compresses the data, and writes to dest.
 	// Returns the number of uncompressed bytes read from src.
 	Compress(src io.Reader, dest io.Writer) (int64, error)
+}
+
+// ZipConfig holds configuration options for archive
+type ZipConfig struct {
+	// CompressionMethod specifies default compression method
+	CompressionMethod CompressionMethod
+
+	// CompressionLevel specifies default compression level
+	CompressionLevel int
+
+	// EncryptionMethod specifies the encryption method
+	EncryptionMethod  EncryptionMethod
+
+	// FileSortStrategy specifies the strategy for file sorting before writing
+	FileSortStrategy  FileSortStrategy
+
+	// Comment stores archive comment
+	Comment           string
+
+	// Password stores password for encryption
+	Password          string
 }
 
 // FileConfig holds configuration options for individual files in the archive
@@ -37,11 +56,8 @@ type FileConfig struct {
 	// IsEncrypted indicates whether the file should be encrypted
 	IsEncrypted bool
 
-	// Name specifies the file's name within the archive
+	// Name specifies the file's name and path within the archive
 	Name string
-
-	// Path specifies the file's location within the archive
-	Path string
 }
 
 // AddOption defines a function type for configuring file options
@@ -54,99 +70,50 @@ func WithConfig(c FileConfig) AddOption {
 	}
 }
 
-// WithCompression sets a compression method for file
-func WithCompressionMethod(c CompressionMethod) AddOption {
+// WithCompression sets a compression for file
+func WithCompression(c CompressionMethod, lvl int) AddOption {
 	return func(f *file) {
-		f.config.CompressionMethod = c
-	}
-}
-
-// WithCompression sets a compression level for file
-func WithCompressionLevel(lvl int) AddOption {
-	return func(f *file) {
-		f.config.CompressionLevel = lvl
-	}
-}
-
-func WithName(name string) AddOption {
-	return func(f *file) {
-		if name != "" {
-			f.config.Name = name
+		if !f.isDir {
+			f.config.CompressionMethod = c
+			f.config.CompressionLevel = lvl
 		}
 	}
 }
 
-// WithPath sets a path for file within the archive
+// WithName sets file's name and path within the archive
+func WithName(name string) AddOption {
+	return func(f *file) {
+		if name != "" {
+			f.name = name
+		}
+	}
+}
+
+// WithPath prefixes file's path within the archive
 func WithPath(p string) AddOption {
 	return func(f *file) {
-		f.config.Path = p
-	}
-}
-
-// WithPrefixedPath prefixes the file path with the given path component
-func WithPrefixedPath(p string) AddOption {
-	return func(f *file) {
-		f.config.Path = path.Join(p, f.config.Path)
-	}
-}
-
-// WithExtendedPath extends the file path with given path component
-func WithExtendedPath(p string) AddOption {
-	return func(f *file) {
-		f.config.Path = path.Join(f.config.Path, p)
+		if p != "" && p != "." {
+			f.name = path.Join(p, f.name)
+		}
 	}
 }
 
 // Zip represents an editable ZIP archive in memory
 type Zip struct {
-	compressionMethod CompressionMethod
-	encryptionMethod  EncryptionMethod
-	fileSortStrategy  FileSortStrategy
-	files             []*file
-	comment           string
-	password          string
-
-	// Concurrency safety
-	mu        sync.RWMutex
-	fileCache map[string]bool
-
-	// Registry for reusable compressors
+	mu          sync.RWMutex
 	compressors sync.Map
+
+	config      ZipConfig
+	files       []*file
+	fileCache   map[string]bool
 }
 
 // NewZip creates a new empty ZIP archive
-func NewZip(c CompressionMethod) *Zip {
+func NewZip() *Zip {
 	return &Zip{
-		compressionMethod: c,
-		files:             make([]*file, 0),
-		fileCache:         make(map[string]bool),
+		files:     make([]*file, 0),
+		fileCache: make(map[string]bool),
 	}
-}
-
-// SetFileSortStrategy configures file ordering to optimize archive creation.
-// See [FileSortStrategy] for detailed description of strategies.
-func (z *Zip) SetFileSortStrategy(strategy FileSortStrategy) {
-	z.fileSortStrategy = strategy
-}
-
-// RegisterCompressor registers a custom compressor for a specific compression method.
-// The compressor instance must be thread-safe (e.g. use internal sync.Pool).
-// This allows overriding standard methods or adding support for new ones (e.g. Zstd, Brotli).
-func (z *Zip) RegisterCompressor(method CompressionMethod, level int, c Compressor) {
-	z.compressors.Store(fmt.Sprintf("%d::%d", method, level), c)
-}
-
-// SetComment sets a global comment for the archive
-func (z *Zip) SetComment(comment string) {
-	z.mu.Lock()
-	defer z.mu.Unlock()
-	z.comment = comment
-}
-
-// SetEncryption configures global encryption settings for the archive
-func (z *Zip) SetEncryption(e EncryptionMethod, pwd string) {
-	z.encryptionMethod = e
-	z.password = pwd
 }
 
 // GetFiles returns files stored in the archive
@@ -154,9 +121,19 @@ func (z *Zip) GetFiles() []*file {
 	return z.files
 }
 
-// AddFile adds an existing open file to the archive.
-// NOTE: For best performance and resource management, use [Zip.AddFromPath] instead.
-// This method reads metadata immediately but defers reading content until Write.
+// SetConfig sets config for zip
+func (z *Zip) SetConfig(c ZipConfig) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.config = c
+}
+
+// RegisterCompressor registers a custom compressor for a specific compression method
+func (z *Zip) RegisterCompressor(method CompressionMethod, level int, c Compressor) {
+	z.compressors.Store(fmt.Sprintf("%d::%d", method, level), c)
+}
+
+// AddFile adds an existing open file to the archive
 func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	if f == nil {
 		return errors.New("file cannot be nil")
@@ -165,30 +142,7 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	if err != nil {
 		return err
 	}
-
-	if !fileEntry.isDir {
-		fileEntry.config.CompressionMethod = z.compressionMethod
-	}
-
-	for _, opt := range options {
-		opt(fileEntry)
-	}
-	fileEntry.normalizeEntry()
-
-	z.mu.Lock()
-	defer z.mu.Unlock()
-
-	if z.existsInCache(fileEntry) {
-		return fmt.Errorf("path collision: '%s' already exists", path.Join(fileEntry.path, fileEntry.name))
-	}
-
-	if err := z.createParentDirs(fileEntry); err != nil {
-		return fmt.Errorf("create parent dirs: %w", err)
-	}
-
-	z.files = append(z.files, fileEntry)
-	z.cacheEntry(fileEntry)
-	return nil
+	return z.addEntry(fileEntry, options)
 }
 
 // AddFromPath adds a file specified by fsPath.
@@ -198,30 +152,7 @@ func (z *Zip) AddFromPath(fsPath string, options ...AddOption) error {
 	if err != nil {
 		return err
 	}
-
-	if !fileEntry.isDir {
-		fileEntry.config.CompressionMethod = z.compressionMethod
-	}
-
-	for _, opt := range options {
-		opt(fileEntry)
-	}
-	fileEntry.normalizeEntry()
-
-	z.mu.Lock()
-	defer z.mu.Unlock()
-
-	if z.existsInCache(fileEntry) {
-		return fmt.Errorf("path collision: '%s' already exists", path.Join(fileEntry.path, fileEntry.name))
-	}
-
-	if err := z.createParentDirs(fileEntry); err != nil {
-		return fmt.Errorf("create parent dirs: %w", err)
-	}
-
-	z.files = append(z.files, fileEntry)
-	z.cacheEntry(fileEntry)
-	return nil
+	return z.addEntry(fileEntry, options)
 }
 
 // AddFromDir recursively adds files from a directory
@@ -239,9 +170,9 @@ func (z *Zip) AddFromDir(root string, options ...AddOption) error {
 			return fmt.Errorf("get relative path: %w", err)
 		}
 
-		localOpts := append(options, WithPrefixedPath(filepath.ToSlash(filepath.Dir(relPath))))
-
-		if err := z.AddFromPath(walkPath, localOpts...); err != nil {
+		pathOpt := WithPath(filepath.ToSlash(filepath.Dir(relPath)))
+		fileOpts := append([]AddOption{pathOpt}, options...)
+		if err := z.AddFromPath(walkPath, fileOpts...); err != nil {
 			return fmt.Errorf("add file %s: %w", walkPath, err)
 		}
 		return nil
@@ -258,27 +189,7 @@ func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) erro
 	}
 
 	fileEntry, _ := newFileFromReader(r, filename)
-	fileEntry.config.CompressionMethod = z.compressionMethod
-
-	for _, opt := range options {
-		opt(fileEntry)
-	}
-	fileEntry.normalizeEntry()
-
-	z.mu.Lock()
-	defer z.mu.Unlock()
-
-	if z.existsInCache(fileEntry) {
-		return fmt.Errorf("path collision: '%s' already exists", path.Join(fileEntry.path, fileEntry.name))
-	}
-
-	if err := z.createParentDirs(fileEntry); err != nil {
-		return fmt.Errorf("create parent dirs: %w", err)
-	}
-
-	z.files = append(z.files, fileEntry)
-	z.cacheEntry(fileEntry)
-	return nil
+	return z.addEntry(fileEntry, options)
 }
 
 // CreateDirectory adds a directory entry to the ZIP archive
@@ -287,39 +198,19 @@ func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
 		return errors.New("directory name cannot be empty")
 	}
 
-	dirEntry, err := newDirectoryFile("", name)
+	dirEntry, err := newDirectoryFile(name)
 	if err != nil {
 		return fmt.Errorf("create directory file: %w", err)
 	}
-
-	for _, opt := range options {
-		opt(dirEntry)
-	}
-	dirEntry.normalizeEntry()
-
-	z.mu.Lock()
-	defer z.mu.Unlock()
-
-	if z.existsInCache(dirEntry) {
-		return fmt.Errorf("path collision: '%s' already exists", path.Join(dirEntry.path, dirEntry.name))
-	}
-
-	if err := z.createParentDirs(dirEntry); err != nil {
-		return fmt.Errorf("create parent dirs: %w", err)
-	}
-
-	z.files = append(z.files, dirEntry)
-	z.cacheEntry(dirEntry)
-	return nil
+	return z.addEntry(dirEntry, options)
 }
 
-// Exists checks if file or directory with given name exists at the specified path.
-// Returns true if an entry with matching path and filename is found in the archive.
-func (z *Zip) Exists(filePath, fileName string) bool {
+// Exists checks if file or directory with given name exists
+func (z *Zip) Exists(name string) bool {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
 
-	key := path.Clean(strings.ReplaceAll(filePath, "\\", "/"))
+	key := path.Clean(strings.ReplaceAll(name, "\\", "/"))
 	return z.fileCache[key] || z.fileCache[key+"/"]
 }
 
@@ -331,7 +222,7 @@ func (z *Zip) Write(dest io.WriteSeeker) error {
 	z.mu.RUnlock()
 
 	writer := newZipWriter(z, dest)
-	sortedFiles := SortFilesOptimized(filesSnapshot, z.fileSortStrategy)
+	sortedFiles := SortFilesOptimized(filesSnapshot, z.config.FileSortStrategy)
 	for _, file := range sortedFiles {
 		if err := writer.WriteFile(file); err != nil {
 			return fmt.Errorf("write file %s: %w", file.name, err)
@@ -348,7 +239,7 @@ func (z *Zip) WriteParallel(dest io.WriteSeeker, maxWorkers int) error {
 	z.mu.RUnlock()
 
 	writer := newParallelZipWriter(z, dest, maxWorkers)
-	sortedFiles := SortFilesOptimized(filesSnapshot, z.fileSortStrategy)
+	sortedFiles := SortFilesOptimized(filesSnapshot, z.config.FileSortStrategy)
 	errs := writer.WriteFiles(sortedFiles)
 
 	if err := writer.zw.WriteCentralDirAndEndRecords(); err != nil {
@@ -362,91 +253,78 @@ func (z *Zip) WriteParallel(dest io.WriteSeeker, maxWorkers int) error {
 
 // Internal helpers
 
-func (z *Zip) createParentDirs(f *file) error {
-	if f.path == "" {
-		return nil
+// addEntry verifies validity and adds file to the archive
+func (z *Zip) addEntry(f *file, options []AddOption) error {
+	if !f.isDir {
+		f.config.CompressionMethod = z.config.CompressionMethod
+		f.config.CompressionLevel = z.config.CompressionLevel
+	}
+	for _, opt := range options {
+		opt(f)
+	}
+	f.name = strings.TrimPrefix(path.Clean(strings.ReplaceAll(f.name, "\\", "/")), "/")
+
+	z.mu.Lock()
+	defer z.mu.Unlock()
+
+	if z.fileCache[f.name] {
+		return fmt.Errorf("duplicate entry: %s", f.name)
+	}
+	if !f.isDir && z.fileCache[f.name+"/"] {
+		return fmt.Errorf("collision: %s is already a directory", f.name)
+	}
+	if f.isDir && z.fileCache[strings.TrimSuffix(f.name, "/")] {
+		return fmt.Errorf("collision: directory %s conflicts with existing file", f.name)
 	}
 
-	components := strings.Split(f.path, "/")
-	currentPath := ""
+	if err := z.createParentDirs(f.name); err != nil {
+		return fmt.Errorf("create parent dirs: %w", err)
+	}
 
-	for _, component := range components {
-		if component == "" {
-			continue
-		}
-
-		if z.fileExistsInCache(currentPath, component) {
-			return fmt.Errorf("path collision: '%s' is already a file", path.Join(currentPath, component))
-		}
-
-		if !z.dirExistsInCache(currentPath, component) {
-			dirEntry, err := newDirectoryFile(currentPath, component)
-			if err != nil {
-				return err
-			}
-			z.files = append(z.files, dirEntry)
-			z.cacheEntry(dirEntry)
-		}
-
-		if currentPath == "" {
-			currentPath = component
-		} else {
-			currentPath = path.Join(currentPath, component)
-		}
+	z.files = append(z.files, f)
+	if f.isDir {
+		z.fileCache[f.name+"/"] = true
+	} else {
+		z.fileCache[f.name] = true
 	}
 	return nil
 }
 
-func (z *Zip) cacheEntry(f *file) {
-	if f.isDir {
-		z.fileCache[path.Join(f.path, f.name)+"/"] = true
-	} else {
-		z.fileCache[path.Join(f.path, f.name)] = true
+// createParentDirs creates missing directories according to path
+func (z *Zip) createParentDirs(filePath string) error {
+	dir := path.Dir(filePath)
+	if dir == "." || dir == "/" {
+		return nil
 	}
-}
-
-func (z *Zip) existsInCache(f *file) bool {
-	return z.fileExistsInCache(f.path, f.name) || z.dirExistsInCache(f.path, f.name)
-}
-
-func (z *Zip) fileExistsInCache(p, n string) bool {
-	cacheKey := path.Join(p, n)
-	return z.fileCache[cacheKey]
-}
-
-func (z *Zip) dirExistsInCache(p, n string) bool {
-	cacheKey := path.Join(p, n) + "/"
-	return z.fileCache[cacheKey]
-}
-
-// resolveCompressor determines the correct compressor for a file.
-func (z *Zip) resolveCompressor(file *file) (Compressor, error) {
-	if file.config.CompressionMethod == Stored {
-		return &StoredCompressor{}, nil
+	if z.fileCache[dir+"/"] {
+		return nil
 	}
 
-	key := fmt.Sprintf("%d::%d", file.config.CompressionMethod, file.config.CompressionLevel)
-	if val, ok := z.compressors.Load(key); ok {
-		return val.(Compressor), nil
+	var missingDirs []string
+	for dir != "." && dir != "/" {
+		if z.fileCache[dir+"/"] {
+			break
+		}
+		if z.fileCache[dir] {
+			return fmt.Errorf("path collision: '%s' is a file, cannot create directory", dir)
+		}
+		missingDirs = append(missingDirs, dir)
+		dir = path.Dir(dir)
 	}
 
-	if file.config.CompressionMethod == Deflated {
-		level := file.config.CompressionLevel
-		if level == 0 {
-			level = flate.DefaultCompression
+	for i := len(missingDirs) - 1; i >= 0; i-- {
+		missingDir := missingDirs[i]
+
+		dirEntry, err := newDirectoryFile(missingDir)
+		if err != nil {
+			return err
 		}
 
-		key := fmt.Sprintf("__deflate::%d", level)
-		if val, ok := z.compressors.Load(key); ok {
-			return val.(Compressor), nil
-		}
-
-		comp := NewDeflateCompressor(level)
-		actual, _ := z.compressors.LoadOrStore(key, comp)
-		return actual.(Compressor), nil
+		z.files = append(z.files, dirEntry)
+		z.fileCache[missingDir+"/"] = true
 	}
 
-	return nil, fmt.Errorf("unsupported compression method: %d", file.config.CompressionMethod)
+	return nil
 }
 
 // StoredCompressor implements no compression (STORE method)
