@@ -39,6 +39,7 @@ const (
 //   │ ZIP64Optimized   │ Low (good balance)     │ Fast                  │ General purpose  │
 //   │ SizeAscending    │ Medium                 │ Fast                  │ Specific needs   │
 //   │ SizeDescending   │ Medium                 │ Fast                  │ Specific needs   │
+//   │ Alphabetical     │ Depends on file order  │ Slow                  │ Avoid            │
 //   └──────────────────┴────────────────────────┴───────────────────────┴──────────────────┘
 //
 // Parallel Saving (WriteParallel()):
@@ -52,6 +53,7 @@ const (
 //   │ ZIP64Optimized   │ Medium (good balance)  │ Low                   │ Fast             │
 //   │ SizeAscending    │ Medium                 │ Medium                │ Fast             │
 //   │ SizeDescending   │ Medium                 │ Medium                │ Fast             │
+//   │ Alphabetical     │ No Effect              │ Depends on file order │ Slow             │
 //   └──────────────────┴────────────────────────┴───────────────────────┴──────────────────┘
 type FileSortStrategy int
 
@@ -62,6 +64,7 @@ const (
 	SortSizeAscending   // Smallest first (slower)
 	SortSizeDescending  // Largest first (slower)
 	SortZIP64Optimized  // Smart ZIP64 optimization
+	SortAlphabetical    // A-Z by filename (folders first naturally)
 )
 
 // FileSystemType represents the type of file system on which the ZIP file was created

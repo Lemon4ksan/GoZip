@@ -41,7 +41,7 @@ func TestZipWriter_WriteFileHeader(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mw := NewMemoryWriteSeeker()
 			z := NewZip()
-			zw := newZipWriter(z, mw)
+			zw := newZipWriter(z.config, nil, mw)
 
 			err := zw.writeFileHeader(tt.file)
 
@@ -96,7 +96,7 @@ func TestZipWriter_EncodeToWriter(t *testing.T) {
 			var destBuf bytes.Buffer
 			// Here we rely on resolveCompressor logic inside encodeToWriter
 			z := NewZip()
-			zw := newZipWriter(z, NewMemoryWriteSeeker())
+			zw := newZipWriter(z.config, nil, NewMemoryWriteSeeker())
 
 			src := strings.NewReader(testData)
 			config := FileConfig{
@@ -171,7 +171,7 @@ func TestZipWriter_WriteFile_Strategies(t *testing.T) {
 			mw := NewMemoryWriteSeeker()
 			z := NewZip()
 			z.SetConfig(ZipConfig{CompressionMethod: Stored}) // Use Store for simplicity
-			zw := newZipWriter(z, mw)
+			zw := newZipWriter(z.config, nil, mw)
 
 			file := &file{
 				name:             "test",
@@ -224,7 +224,7 @@ func TestZipWriter_UpdateLocalHeader(t *testing.T) {
 	}
 
 	mw := NewMemoryWriteSeeker()
-	zw := newZipWriter(NewZip(), mw)
+	zw := newZipWriter(NewZip().config, nil, mw)
 
 	// 1. Write initial header
 	err := zw.writeFileHeader(file)
@@ -259,7 +259,7 @@ func TestZipWriter_Integration(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
 	z := NewZip()
 	z.SetConfig(ZipConfig{CompressionMethod: Deflated})
-	zw := newZipWriter(z, mw)
+	zw := newZipWriter(z.config, nil, mw)
 
 	content := "Integration test data"
 	file := &file{
@@ -321,7 +321,7 @@ func TestParallelZipWriter_Basic(t *testing.T) {
 	}
 
 	// Initialize parallel writer with 2 workers
-	pzw := newParallelZipWriter(z, mw, 2)
+	pzw := newParallelZipWriter(z.config, nil, mw, 2)
 
 	// Run WriteFiles
 	errs := pzw.WriteFiles(files)
@@ -389,7 +389,7 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 		},
 	}
 
-	pzw := newParallelZipWriter(z, mw, 1)
+	pzw := newParallelZipWriter(z.config, nil, mw, 1)
 	
 	// HACK: Manually set threshold low to force the second file to disk
 	// Accessing private field since we are in the same package
@@ -423,12 +423,13 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
 	z := NewZip()
-	pzw := newParallelZipWriter(z, mw, 2)
+	pzw := newParallelZipWriter(z.config, nil, mw, 2)
 
 	expectedErr := errors.New("simulated open error")
 	files := []*file{
 		{
 			name: "bad_file.txt",
+			uncompressedSize: sizeUnknown,
 			openFunc: func() (io.ReadCloser, error) {
 				return nil, expectedErr
 			},

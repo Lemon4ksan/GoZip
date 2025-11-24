@@ -2,6 +2,8 @@ package gozip
 
 import (
 	"encoding/binary"
+	"fmt"
+	"io"
 	"math"
 )
 
@@ -74,6 +76,54 @@ type centralDirectory struct {
 	Comment                string
 }
 
+func readCentralDirEntry(src io.Reader) (centralDirectory, error) {
+	buf := make([]byte, 42)
+	if _, err := io.ReadFull(src, buf); err != nil {
+		return centralDirectory{}, fmt.Errorf("read source: %w", err)
+	}
+
+	entry := centralDirectory{
+		VersionMadeBy:          binary.LittleEndian.Uint16(buf[0:2]),
+		VersionNeededToExtract: binary.LittleEndian.Uint16(buf[2:4]),
+		GeneralPurposeBitFlag:  binary.LittleEndian.Uint16(buf[4:6]),
+		CompressionMethod:      binary.LittleEndian.Uint16(buf[6:8]),
+		LastModFileTime:        binary.LittleEndian.Uint16(buf[8:10]),
+		LastModFileDate:        binary.LittleEndian.Uint16(buf[10:12]),
+		CRC32:                  binary.LittleEndian.Uint32(buf[12:16]),
+		CompressedSize:         binary.LittleEndian.Uint32(buf[16:20]),
+		UncompressedSize:       binary.LittleEndian.Uint32(buf[20:24]),
+		FilenameLength:         binary.LittleEndian.Uint16(buf[24:26]),
+		ExtraFieldLength:       binary.LittleEndian.Uint16(buf[26:28]),
+		FileCommentLength:      binary.LittleEndian.Uint16(buf[28:30]),
+		DiskNumberStart:        binary.LittleEndian.Uint16(buf[30:32]),
+		InternalFileAttributes: binary.LittleEndian.Uint16(buf[32:34]),
+		ExternalFileAttributes: binary.LittleEndian.Uint32(buf[34:38]),
+		LocalHeaderOffset:      binary.LittleEndian.Uint32(buf[38:42]),
+	}
+	if entry.FilenameLength > 0 {
+		filename := make([]byte, entry.FilenameLength)
+		if _, err := io.ReadFull(src, filename); err != nil {
+			return centralDirectory{}, fmt.Errorf("read source: %w", err)
+		}
+		entry.Filename = string(filename)
+	}
+	if entry.ExtraFieldLength > 0 {
+		extraField := make([]byte, entry.ExtraFieldLength)
+		if _, err := io.ReadFull(src, extraField); err != nil {
+			return centralDirectory{}, fmt.Errorf("read source: %w", err)
+		}
+		entry.ExtraField = parseExtraField(extraField)
+	}
+	if entry.FileCommentLength > 0 {
+		comment := make([]byte, entry.FileCommentLength)
+		if _, err := io.ReadFull(src, comment); err != nil {
+			return centralDirectory{}, fmt.Errorf("read source: %w", err)
+		}
+		entry.Comment = string(comment)
+	}
+	return entry, nil
+}
+
 func (d centralDirectory) encode() []byte {
 	// Fixed header (46 bytes) + Filename + Extra Fields + Comment
 	// Signature(4) + Header(42) = 46 bytes
@@ -122,6 +172,7 @@ type endOfCentralDirectory struct {
 	CentralDirSize                  uint32
 	CentralDirOffset                uint32
 	CommentLength                   uint16
+	Comment                         string
 }
 
 func encodeEndOfCentralDirRecord(entriesNum int, centralDirSize uint64, centralDirOffset uint64, comment string) []byte {
@@ -130,9 +181,9 @@ func encodeEndOfCentralDirRecord(entriesNum int, centralDirSize uint64, centralD
 	buf := make([]byte, 22+len(comment))
 
 	binary.LittleEndian.PutUint32(buf[0:4], __END_OF_CENTRAL_DIRECTORY_SIGNATURE)
-	binary.LittleEndian.PutUint16(buf[4:6], 0) // ThisDiskNum
-	binary.LittleEndian.PutUint16(buf[6:8], 0) // DiskNumWithTheStartOfCentralDir
-	binary.LittleEndian.PutUint16(buf[8:10], uint16(min(math.MaxUint16, entriesNum))) // TotalNumberOfEntriesOnThisDisk
+	binary.LittleEndian.PutUint16(buf[4:6], 0)                                         // ThisDiskNum
+	binary.LittleEndian.PutUint16(buf[6:8], 0)                                         // DiskNumWithTheStartOfCentralDir
+	binary.LittleEndian.PutUint16(buf[8:10], uint16(min(math.MaxUint16, entriesNum)))  // TotalNumberOfEntriesOnThisDisk
 	binary.LittleEndian.PutUint16(buf[10:12], uint16(min(math.MaxUint16, entriesNum))) // TotalNumberOfEntries
 	binary.LittleEndian.PutUint32(buf[12:16], uint32(min(math.MaxUint32, centralDirSize)))
 	binary.LittleEndian.PutUint32(buf[16:20], uint32(min(math.MaxUint32, centralDirOffset)))
@@ -141,6 +192,29 @@ func encodeEndOfCentralDirRecord(entriesNum int, centralDirSize uint64, centralD
 	copy(buf[22:], comment)
 
 	return buf
+}
+
+func readEndOfCentralDir(src io.Reader) (endOfCentralDirectory, error) {
+	buf := make([]byte, 18)
+	if _, err := io.ReadFull(src, buf); err != nil {
+		return endOfCentralDirectory{}, fmt.Errorf("read source: %w", err)
+	}
+	end := endOfCentralDirectory{
+		ThisDiskNum:                     binary.LittleEndian.Uint16(buf[0:2]),
+		DiskNumWithTheStartOfCentralDir: binary.LittleEndian.Uint16(buf[2:4]),
+		TotalNumberOfEntriesOnThisDisk:  binary.LittleEndian.Uint16(buf[4:6]),
+		TotalNumberOfEntries:            binary.LittleEndian.Uint16(buf[6:8]),
+		CentralDirSize:                  binary.LittleEndian.Uint32(buf[8:12]),
+		CentralDirOffset:                binary.LittleEndian.Uint32(buf[12:16]),
+		CommentLength:                   binary.LittleEndian.Uint16(buf[16:18]),
+	}
+	if end.CommentLength > 0 {
+		buf := make([]byte, end.CommentLength)
+		io.ReadFull(src, buf)
+		end.Comment = string(buf)
+	}
+
+	return end, nil
 }
 
 type zip64EndOfCentralDirectory struct {
@@ -155,16 +229,34 @@ type zip64EndOfCentralDirectory struct {
 	CentralDirOffset                uint64
 }
 
+func readZip64EndOfCentralDir(src io.Reader) (zip64EndOfCentralDirectory, error) {
+	buf := make([]byte, 52)
+	if _, err := io.ReadFull(src, buf); err != nil {
+		return zip64EndOfCentralDirectory{}, fmt.Errorf("read source: %w", err)
+	}
+	return zip64EndOfCentralDirectory{
+		Size:                            binary.LittleEndian.Uint64(buf[0:8]),
+		VersionMadeBy:                   binary.LittleEndian.Uint16(buf[8:10]),
+		VersionNeededToExtract:          binary.LittleEndian.Uint16(buf[10:12]),
+		ThisDiskNum:                     binary.LittleEndian.Uint32(buf[12:16]),
+		DiskNumWithTheStartOfCentralDir: binary.LittleEndian.Uint32(buf[16:20]),
+		TotalNumberOfEntriesOnThisDisk:  binary.LittleEndian.Uint64(buf[20:28]),
+		TotalNumberOfEntries:            binary.LittleEndian.Uint64(buf[28:36]),
+		CentralDirSize:                  binary.LittleEndian.Uint64(buf[36:44]),
+		CentralDirOffset:                binary.LittleEndian.Uint64(buf[44:52]),
+	}, nil
+}
+
 func encodeZip64EndOfCentralDirectoryRecord(entriesNum uint64, centralDirSize uint64, centralDirOffset uint64) []byte {
 	// Fixed size: Signature(4) + Header(52) = 56 bytes
 	buf := make([]byte, 56)
 
 	binary.LittleEndian.PutUint32(buf[0:4], __ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE)
-	binary.LittleEndian.PutUint64(buf[4:12], 44) // Size of the rest of the record
-	binary.LittleEndian.PutUint16(buf[12:14], 1) // VersionMadeBy
-	binary.LittleEndian.PutUint16(buf[14:16], 1) // VersionNeededToExtract
-	binary.LittleEndian.PutUint32(buf[16:20], 0) // ThisDiskNum
-	binary.LittleEndian.PutUint32(buf[20:24], 0) // DiskNumWithTheStartOfCentralDir
+	binary.LittleEndian.PutUint64(buf[4:12], 44)          // Size of the rest of the record
+	binary.LittleEndian.PutUint16(buf[12:14], 1)          // VersionMadeBy
+	binary.LittleEndian.PutUint16(buf[14:16], 1)          // VersionNeededToExtract
+	binary.LittleEndian.PutUint32(buf[16:20], 0)          // ThisDiskNum
+	binary.LittleEndian.PutUint32(buf[20:24], 0)          // DiskNumWithTheStartOfCentralDir
 	binary.LittleEndian.PutUint64(buf[24:32], entriesNum) // TotalEntriesDisk
 	binary.LittleEndian.PutUint64(buf[32:40], entriesNum) // TotalEntries
 	binary.LittleEndian.PutUint64(buf[40:48], centralDirSize)
@@ -175,8 +267,20 @@ func encodeZip64EndOfCentralDirectoryRecord(entriesNum uint64, centralDirSize ui
 
 type zip64EndOfCentralDirectoryLocator struct {
 	EndOfCentralDirStartDiskNum uint32
-	EndOfCentralDirOffset       uint64
+	Zip64EndOfCentralDirOffset  uint64
 	TotalNumberOfDisks          uint32
+}
+
+func readZip64EndOfCentralDirLocator(src io.Reader) (zip64EndOfCentralDirectoryLocator, error) {
+	buf := make([]byte, 16)
+	if _, err := io.ReadFull(src, buf); err != nil {
+		return zip64EndOfCentralDirectoryLocator{}, fmt.Errorf("read source: %w", err)
+	}
+	return zip64EndOfCentralDirectoryLocator{
+		EndOfCentralDirStartDiskNum: binary.LittleEndian.Uint32(buf[0:4]),
+		Zip64EndOfCentralDirOffset:  binary.LittleEndian.Uint64(buf[4:12]),
+		TotalNumberOfDisks:          binary.LittleEndian.Uint32(buf[12:16]),
+	}, nil
 }
 
 func encodeZip64EndOfCentralDirectoryLocator(endOfCentralDirOffset uint64) []byte {

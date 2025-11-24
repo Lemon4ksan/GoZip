@@ -1,7 +1,6 @@
 package gozip
 
 import (
-	"compress/flate"
 	"errors"
 	"fmt"
 	"io"
@@ -13,13 +12,6 @@ import (
 	"sync"
 )
 
-// Compressor defines a strategy for compressing data. See [DeflateCompressor] as an example
-type Compressor interface {
-	// Compress reads from src, compresses the data, and writes to dest.
-	// Returns the number of uncompressed bytes read from src.
-	Compress(src io.Reader, dest io.Writer) (int64, error)
-}
-
 // ZipConfig holds configuration options for archive
 type ZipConfig struct {
 	// CompressionMethod specifies default compression method
@@ -29,16 +21,16 @@ type ZipConfig struct {
 	CompressionLevel int
 
 	// EncryptionMethod specifies the encryption method
-	EncryptionMethod  EncryptionMethod
+	EncryptionMethod EncryptionMethod
 
 	// FileSortStrategy specifies the strategy for file sorting before writing
-	FileSortStrategy  FileSortStrategy
+	FileSortStrategy FileSortStrategy
 
 	// Comment stores archive comment
-	Comment           string
+	Comment string
 
 	// Password stores password for encryption
-	Password          string
+	Password string
 }
 
 // FileConfig holds configuration options for individual files in the archive
@@ -100,19 +92,30 @@ func WithPath(p string) AddOption {
 
 // Zip represents an editable ZIP archive in memory
 type Zip struct {
-	mu          sync.RWMutex
-	compressors sync.Map
-
-	config      ZipConfig
-	files       []*file
-	fileCache   map[string]bool
+	mu            sync.RWMutex
+	config        ZipConfig
+	files         []*file
+	fileCache     map[string]bool
+	compressors   map[string]Compressor
+	decompressors map[CompressionMethod]Decompressor
+	bufferPool    sync.Pool
 }
 
-// NewZip creates a new empty ZIP archive
+// NewZip creates a new empty ZIP archive object.
+// Note that only [Stored] and [Deflated] compression methods are supported by default.
+// You can add your implementation by using AddCompressor and AddDecompressor.
 func NewZip() *Zip {
 	return &Zip{
-		files:     make([]*file, 0),
-		fileCache: make(map[string]bool),
+		files:         make([]*file, 0),
+		fileCache:     make(map[string]bool),
+		compressors:   make(map[string]Compressor),
+		decompressors: make(map[CompressionMethod]Decompressor),
+		bufferPool: sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, 64*1024) // 64KB buffer
+				return &b
+			},
+		},
 	}
 }
 
@@ -130,7 +133,16 @@ func (z *Zip) SetConfig(c ZipConfig) {
 
 // RegisterCompressor registers a custom compressor for a specific compression method
 func (z *Zip) RegisterCompressor(method CompressionMethod, level int, c Compressor) {
-	z.compressors.Store(fmt.Sprintf("%d::%d", method, level), c)
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.compressors[fmt.Sprintf("%d::%d", method, level)] = c
+}
+
+// RegisterDecompressor registers a custom decompressor for a specific compression method
+func (z *Zip) RegisterDecompressor(method CompressionMethod, c Decompressor) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.decompressors[method] = c
 }
 
 // AddFile adds an existing open file to the archive
@@ -147,8 +159,8 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 
 // AddFromPath adds a file specified by fsPath.
 // This is the preferred method as it manages file descriptors efficiently.
-func (z *Zip) AddFromPath(fsPath string, options ...AddOption) error {
-	fileEntry, err := newFileFromPath(fsPath)
+func (z *Zip) AddFromPath(path string, options ...AddOption) error {
+	fileEntry, err := newFileFromPath(path)
 	if err != nil {
 		return err
 	}
@@ -156,16 +168,16 @@ func (z *Zip) AddFromPath(fsPath string, options ...AddOption) error {
 }
 
 // AddFromDir recursively adds files from a directory
-func (z *Zip) AddFromDir(root string, options ...AddOption) error {
-	return filepath.WalkDir(root, func(walkPath string, d fs.DirEntry, err error) error {
+func (z *Zip) AddFromDir(path string, options ...AddOption) error {
+	return filepath.WalkDir(path, func(walkPath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if walkPath == root {
+		if walkPath == path {
 			return nil
 		}
 
-		relPath, err := filepath.Rel(root, walkPath)
+		relPath, err := filepath.Rel(path, walkPath)
 		if err != nil {
 			return fmt.Errorf("get relative path: %w", err)
 		}
@@ -221,7 +233,7 @@ func (z *Zip) Write(dest io.WriteSeeker) error {
 	copy(filesSnapshot, z.files)
 	z.mu.RUnlock()
 
-	writer := newZipWriter(z, dest)
+	writer := newZipWriter(z.config, z.compressors, dest)
 	sortedFiles := SortFilesOptimized(filesSnapshot, z.config.FileSortStrategy)
 	for _, file := range sortedFiles {
 		if err := writer.WriteFile(file); err != nil {
@@ -238,7 +250,7 @@ func (z *Zip) WriteParallel(dest io.WriteSeeker, maxWorkers int) error {
 	copy(filesSnapshot, z.files)
 	z.mu.RUnlock()
 
-	writer := newParallelZipWriter(z, dest, maxWorkers)
+	writer := newParallelZipWriter(z.config, z.compressors, dest, maxWorkers)
 	sortedFiles := SortFilesOptimized(filesSnapshot, z.config.FileSortStrategy)
 	errs := writer.WriteFiles(sortedFiles)
 
@@ -248,6 +260,116 @@ func (z *Zip) WriteParallel(dest io.WriteSeeker, maxWorkers int) error {
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
+	return nil
+}
+
+// Read reads the archive and appends its files to struct files
+func (z *Zip) Read(src io.ReadSeeker) error {
+	reader := newZipReader(src, z.decompressors)
+	files, err := reader.ReadFiles()
+	z.files = append(z.files, files...)
+	return err
+}
+
+// Extract sequentially extracts all files stored in archive to the disk at the given path
+func (z *Zip) Extract(path string) error {
+	// Alphabetical sort guarantees the right order of directories
+	files := sortAlphabetical(z.files)
+	path = filepath.Clean(path)
+	var errs []error
+
+	for _, f := range files {
+		fpath := filepath.Join(path, f.name)
+
+		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
+			errs = append(errs, fmt.Errorf("illegal file path: %s", fpath))
+			continue
+		}
+		if f.isDir {
+			if err := os.Mkdir(fpath, 0755); err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
+
+		if err := z.extractFile(f, fpath); err != nil {
+			errs = append(errs, fmt.Errorf("failed to extract %s: %w", f.name, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
+// Extract parallel extracts all files stored in archive using multiple workers
+func (z *Zip) ExtractParallel(path string, workers int) error {
+	path = filepath.Clean(path)
+
+	var filesToExtract []*file
+	dirsToCreate := make(map[string]struct{})
+	dirsToCreate[path] = struct{}{}
+
+	var errs []error
+
+	for _, f := range z.files {
+		fpath := filepath.Join(path, f.name)
+
+		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
+			errs = append(errs, fmt.Errorf("illegal file path: %s", fpath))
+			continue
+		}
+
+		if f.isDir {
+			dirsToCreate[fpath] = struct{}{}
+			continue
+		}
+
+		dirsToCreate[filepath.Dir(fpath)] = struct{}{}
+		filesToExtract = append(filesToExtract, f)
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	for dir := range dirsToCreate {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	sem := make(chan struct{}, workers)
+	errChan := make(chan error, len(filesToExtract))
+	var wg sync.WaitGroup
+
+	for _, f := range filesToExtract {
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(f *file) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			fpath := filepath.Join(path, f.name)
+			if err := z.extractFile(f, fpath); err != nil {
+				errChan <- fmt.Errorf("failed to extract %s: %w", f.name, err)
+			}
+		}(f)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
 	return nil
 }
 
@@ -277,7 +399,7 @@ func (z *Zip) addEntry(f *file, options []AddOption) error {
 		return fmt.Errorf("collision: directory %s conflicts with existing file", f.name)
 	}
 
-	if err := z.createParentDirs(f.name); err != nil {
+	if err := z.createMissingDirs(f.name); err != nil {
 		return fmt.Errorf("create parent dirs: %w", err)
 	}
 
@@ -290,8 +412,8 @@ func (z *Zip) addEntry(f *file, options []AddOption) error {
 	return nil
 }
 
-// createParentDirs creates missing directories according to path
-func (z *Zip) createParentDirs(filePath string) error {
+// createMissingDirs creates missing directories according to path
+func (z *Zip) createMissingDirs(filePath string) error {
 	dir := path.Dir(filePath)
 	if dir == "." || dir == "/" {
 		return nil
@@ -327,44 +449,37 @@ func (z *Zip) createParentDirs(filePath string) error {
 	return nil
 }
 
-// StoredCompressor implements no compression (STORE method)
-type StoredCompressor struct{}
-
-func (sc *StoredCompressor) Compress(src io.Reader, dest io.Writer) (int64, error) {
-	return io.Copy(dest, src)
-}
-
-// DeflateCompressor implements DEFLATE compression with memory pooling
-type DeflateCompressor struct {
-	pool sync.Pool
-}
-
-// NewDeflateCompressor creates a reusable compressor for a specific level
-func NewDeflateCompressor(level int) *DeflateCompressor {
-	return &DeflateCompressor{
-		pool: sync.Pool{
-			New: func() interface{} {
-				w, _ := flate.NewWriter(io.Discard, level)
-				return w
-			},
-		},
-	}
-}
-
-func (d *DeflateCompressor) Compress(src io.Reader, dest io.Writer) (int64, error) {
-	w := d.pool.Get().(*flate.Writer)
-	defer d.pool.Put(w)
-
-	w.Reset(dest)
-
-	n, err := io.Copy(w, src)
+// extractFile extracts single file to disk
+func (z *Zip) extractFile(f *file, path string) error {
+	src, err := f.Open()
 	if err != nil {
-		return n, err
+		return err
+	}
+	defer src.Close()
+
+	dst, err := os.Create(path)
+	if err != nil {
+		return err
 	}
 
-	if err := w.Close(); err != nil {
-		return n, err
+	if f.uncompressedSize > 0 {
+		if err := dst.Truncate(f.uncompressedSize); err != nil {
+			dst.Close()
+			return err
+		}
 	}
 
-	return n, nil
+	bufPtr := z.bufferPool.Get().(*[]byte)
+	_, err = io.CopyBuffer(dst, src, *bufPtr)
+	z.bufferPool.Put(bufPtr)
+
+	if err != nil {
+		dst.Close()
+		return err
+	}
+
+	if err := dst.Close(); err != nil {
+		return err
+	}
+	return nil
 }

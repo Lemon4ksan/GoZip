@@ -28,6 +28,9 @@ func SortFilesOptimized(files []*file, strategy FileSortStrategy) []*file {
 
 	case SortSizeDescending:
 		return sortSizeDescending(files)
+	
+	case SortAlphabetical:
+		return sortAlphabetical(files)
 
 	default:
 		result := make([]*file, len(files))
@@ -169,4 +172,16 @@ func getSizePriority(size int64) int {
 		return 1
 	}
 	return 2
+}
+
+// sortAlphabetical sorts files by name A-Z
+func sortAlphabetical(files []*file) []*file {
+	sorted := make([]*file, len(files))
+	copy(sorted, files)
+	
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].name < sorted[j].name
+	})
+	
+	return sorted
 }

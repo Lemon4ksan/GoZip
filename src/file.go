@@ -1,7 +1,6 @@
 package gozip
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -11,11 +10,14 @@ import (
 	"time"
 )
 
+// sizeUnknown applies to uncompressed size of files made from io.Reader
+const sizeUnknown int64 = -1
+
 // Constants for ZIP format
 const (
-	latestZipVersion   uint16 = 63
-	zip64ExtraFieldTag uint16 = 0x0001
-	ntfsFieldTag       uint16 = 0x000A
+	LatestZipVersion   uint16 = 63
+	Zip64ExtraFieldTag uint16 = 0x0001
+	NTFSFieldTag       uint16 = 0x000A
 )
 
 // file represents a file to be compressed and added to a ZIP archive
@@ -49,10 +51,14 @@ func newFileFromOS(f *os.File) (*file, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stat file: %w", err)
 	}
+	uncompressedSize := stat.Size()
+	if stat.IsDir() {
+		uncompressedSize = 0
+	}
 
 	return &file{
 		name:             stat.Name(),
-		uncompressedSize: stat.Size(),
+		uncompressedSize: uncompressedSize,
 		modTime:          stat.ModTime(),
 		isDir:            stat.IsDir(),
 		metadata:         getFileMetadata(stat),
@@ -80,10 +86,14 @@ func newFileFromPath(filePath string) (*file, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get file stats: %w", err)
 	}
+	uncompressedSize := stat.Size()
+	if stat.IsDir() {
+		uncompressedSize = 0
+	}
 
 	return &file{
 		name:             stat.Name(),
-		uncompressedSize: stat.Size(),
+		uncompressedSize: uncompressedSize,
 		modTime:          stat.ModTime(),
 		isDir:            stat.IsDir(),
 		metadata:         getFileMetadata(stat),
@@ -96,14 +106,15 @@ func newFileFromPath(filePath string) (*file, error) {
 }
 
 // newFileFromReader creates a file from an [io.Reader]
-func newFileFromReader(source io.Reader, name string) (*file, error) {
+func newFileFromReader(src io.Reader, name string) (*file, error) {
 	return &file{
-		name:       name,
-		modTime:    time.Now(),
-		hostSystem: getHostSystemByOS(),
-		extraField: make(map[uint16][]byte),
+		name:             name,
+		uncompressedSize: sizeUnknown,
+		modTime:          time.Now(),
+		hostSystem:       getHostSystemByOS(),
+		extraField:       make(map[uint16][]byte),
 		openFunc: func() (io.ReadCloser, error) {
-			return io.NopCloser(source), nil
+			return io.NopCloser(src), nil
 		},
 	}, nil
 }
@@ -142,6 +153,11 @@ func (f *file) SetConfig(config FileConfig) {
 }
 
 func (f *file) SetOpenFunc(openFunc func() (io.ReadCloser, error)) { f.openFunc = openFunc }
+
+// Open opens the decompressed file source for reading
+func (f *file) Open() (io.ReadCloser, error) {
+	return f.openFunc()
+}
 
 // RequiresZip64 checks whether zip64 extra field should be used for the file
 func (f *file) RequiresZip64() bool {
@@ -211,8 +227,8 @@ func (zh *zipHeaders) LocalHeader() localFileHeader {
 		CompressionMethod:      uint16(zh.file.config.CompressionMethod),
 		LastModFileTime:        dosTime,
 		LastModFileDate:        dosDate,
-		CRC32:                  0, // Will be updated later
-		CompressedSize:         0, // Will be updated later
+		CRC32:                  zh.file.crc32, // Will be updated later
+		CompressedSize:         uint32(zh.file.compressedSize), // Will be updated later
 		UncompressedSize:       uint32(min(math.MaxUint32, zh.file.uncompressedSize)),
 		FilenameLength:         uint16(len(filename)),
 		ExtraFieldLength:       0, // Will be updated if ZIP64 is needed
@@ -280,7 +296,7 @@ func (zh *zipHeaders) getVersionMadeBy() uint16 {
 	if fs == HostSystemNTFS {
 		fs = HostSystemFAT
 	}
-	return uint16(fs)<<8 | latestZipVersion
+	return uint16(fs)<<8 | LatestZipVersion
 }
 
 // GetFileBitFlag returns general purpose bit flag
@@ -326,66 +342,4 @@ func (zh *zipHeaders) getCompressionLevelBits() uint16 {
 	default: // DeflateNormal
 		return 0x0000
 	}
-}
-
-// addFilesystemExtraField creates and sets extra fields with file metadata
-func addFilesystemExtraField(f *file) {
-	if f.metadata == nil {
-		return
-	}
-
-	if f.hostSystem == HostSystemNTFS && !f.HasExtraField(ntfsFieldTag) && hasPreciseTimestamps(f.metadata) {
-		f.AddExtraField(ntfsFieldTag, encodeNTFSExtraField(f.metadata))
-	}
-}
-
-func encodeZip64ExtraField(f *file) []byte {
-	data := make([]byte, 4, 28)
-	binary.LittleEndian.PutUint16(data[0:2], zip64ExtraFieldTag)
-
-	if f.uncompressedSize > math.MaxUint32 {
-		data = binary.LittleEndian.AppendUint64(data, uint64(f.uncompressedSize))
-	}
-	if f.compressedSize > math.MaxUint32 {
-		data = binary.LittleEndian.AppendUint64(data, uint64(f.compressedSize))
-	}
-	if f.localHeaderOffset > math.MaxUint32 {
-		data = binary.LittleEndian.AppendUint64(data, uint64(f.localHeaderOffset))
-	}
-
-	binary.LittleEndian.PutUint16(data[2:4], uint16(len(data)-4))
-	return data
-}
-
-func encodeNTFSExtraField(metadata map[string]interface{}) []byte {
-	var mtime, atime, ctime uint64
-	if val, ok := metadata["LastWriteTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			mtime = t
-		}
-	}
-	if val, ok := metadata["LastAccessTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			atime = t
-		}
-	}
-	if val, ok := metadata["CreationTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			ctime = t
-		}
-	}
-
-	// Tag(2) + Size(2) + Reserved(4) + Attr1(2) + Size1(2) + Mtime(8) + Atime(8) + Ctime(8)
-	data := make([]byte, 36)
-
-	binary.LittleEndian.PutUint16(data[0:2], ntfsFieldTag)
-	binary.LittleEndian.PutUint16(data[2:4], 32)   // Block size
-	binary.LittleEndian.PutUint32(data[4:8], 0)    // Reserved
-	binary.LittleEndian.PutUint16(data[8:10], 1)   // Attribute1 (Tag 1)
-	binary.LittleEndian.PutUint16(data[10:12], 24) // Size1 (Size of attributes)
-	binary.LittleEndian.PutUint64(data[12:20], mtime)
-	binary.LittleEndian.PutUint64(data[20:28], atime)
-	binary.LittleEndian.PutUint64(data[28:36], ctime)
-
-	return data
 }
