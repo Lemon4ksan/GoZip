@@ -226,8 +226,11 @@ func (z *Zip) Exists(name string) bool {
 	return z.fileCache[key] || z.fileCache[key+"/"]
 }
 
-// Write writes the archive sequentially to dest
-func (z *Zip) Write(dest io.WriteSeeker) error {
+// Write writes the archive sequentially to dest.
+// It's more memory efficient compared to parallel version.
+// If dest implements [io.Seeker], file source will be written
+// to dest without creating temp file when possible.
+func (z *Zip) Write(dest io.Writer) error {
 	z.mu.RLock()
 	filesSnapshot := make([]*file, len(z.files))
 	copy(filesSnapshot, z.files)
@@ -243,8 +246,9 @@ func (z *Zip) Write(dest io.WriteSeeker) error {
 	return writer.WriteCentralDirAndEndRecords()
 }
 
-// WriteParallel writes the archive using multiple workers
-func (z *Zip) WriteParallel(dest io.WriteSeeker, maxWorkers int) error {
+// WriteParallel writes the archive using multiple workers.
+// Temp files and memory buffers are used to store compressed data before writing.
+func (z *Zip) WriteParallel(dest io.Writer, maxWorkers int) error {
 	z.mu.RLock()
 	filesSnapshot := make([]*file, len(z.files))
 	copy(filesSnapshot, z.files)

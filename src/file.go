@@ -220,6 +220,16 @@ func newZipHeaders(f *file) *zipHeaders {
 func (zh *zipHeaders) LocalHeader() localFileHeader {
 	dosDate, dosTime := timeToMsDos(zh.file.modTime)
 	filename := zh.file.getFilename()
+	var extraFieldLength uint16
+	if zh.file.uncompressedSize > math.MaxUint32 {
+		extraFieldLength += 8
+	}
+	if zh.file.compressedSize > math.MaxUint32 {
+		extraFieldLength += 8
+	}
+	if extraFieldLength > 0 {
+		extraFieldLength += 4 // Tag + Size
+	}
 
 	return localFileHeader{
 		VersionNeededToExtract: zh.getVersionNeededToExtract(),
@@ -227,11 +237,11 @@ func (zh *zipHeaders) LocalHeader() localFileHeader {
 		CompressionMethod:      uint16(zh.file.config.CompressionMethod),
 		LastModFileTime:        dosTime,
 		LastModFileDate:        dosDate,
-		CRC32:                  zh.file.crc32, // Will be updated later
-		CompressedSize:         uint32(zh.file.compressedSize), // Will be updated later
+		CRC32:                  zh.file.crc32,
+		CompressedSize:         uint32(min(math.MaxUint32, zh.file.compressedSize)),
 		UncompressedSize:       uint32(min(math.MaxUint32, zh.file.uncompressedSize)),
 		FilenameLength:         uint16(len(filename)),
-		ExtraFieldLength:       0, // Will be updated if ZIP64 is needed
+		ExtraFieldLength:       extraFieldLength,
 		Filename:               filename,
 	}
 }
