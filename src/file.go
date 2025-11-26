@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"strings"
@@ -25,6 +26,7 @@ type file struct {
 	// Basic file identification
 	name  string
 	isDir bool
+	mode  fs.FileMode 
 
 	// File content and source
 	openFunc         func() (io.ReadCloser, error)
@@ -61,6 +63,7 @@ func newFileFromOS(f *os.File) (*file, error) {
 		uncompressedSize: uncompressedSize,
 		modTime:          stat.ModTime(),
 		isDir:            stat.IsDir(),
+		mode:             stat.Mode(),
 		metadata:         getFileMetadata(stat),
 		hostSystem:       getHostSystem(f.Fd()),
 		extraField:       make(map[uint16][]byte),
@@ -96,6 +99,7 @@ func newFileFromPath(filePath string) (*file, error) {
 		uncompressedSize: uncompressedSize,
 		modTime:          stat.ModTime(),
 		isDir:            stat.IsDir(),
+		mode:             stat.Mode(),
 		metadata:         getFileMetadata(stat),
 		hostSystem:       getHostSystem(f.Fd()),
 		extraField:       make(map[uint16][]byte),
@@ -127,11 +131,12 @@ func newDirectoryFile(name string) (*file, error) {
 	return &file{
 		name:       name,
 		isDir:      true,
+		mode:       0755 | fs.ModeDir,
 		hostSystem: getHostSystemByOS(),
 		modTime:    time.Now(),
 		extraField: make(map[uint16][]byte),
-	}, nil
-}
+		}, nil
+	}
 
 func (f *file) Name() string            { return f.name }
 func (f *file) IsDir() bool             { return f.isDir }
@@ -326,13 +331,35 @@ func (zh *zipHeaders) getFileBitFlag() uint16 {
 
 // GetExternalFileAttributes returns external file attributes
 func (zh *zipHeaders) getExternalFileAttributes() uint32 {
-	if zh.file.hostSystem == HostSystemFAT || zh.file.hostSystem == HostSystemNTFS {
-		if zh.file.isDir {
-			return 0x10 // Directory attribute
+	var externalAttrs uint32
+
+	switch zh.file.hostSystem {
+    case HostSystemUNIX, HostSystemDarwin:
+		mode := uint32(zh.file.mode & fs.ModePerm)
+	
+		switch {
+		case zh.file.isDir:
+			mode |= s_IFDIR
+		case zh.file.mode & fs.ModeSymlink != 0:
+			mode |= s_IFLNK
+		default:
+			mode |= s_IFREG
 		}
-		return 0x20 // Archive attribute
+	
+		externalAttrs = mode << 16
+
+	case HostSystemFAT, HostSystemNTFS:
+		if zh.file.isDir {
+			externalAttrs |= 0x10 // DOS Directory
+		} else {
+			externalAttrs |= 0x20 // DOS Archive
+		}
+		if zh.file.mode&0200 == 0 {
+			externalAttrs |= 0x01 // DOS ReadOnly
+		}
 	}
-	return 0
+
+	return externalAttrs
 }
 
 // getCompressionLevelBits returns compression level bits for DEFLATE compression

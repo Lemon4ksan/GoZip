@@ -138,3 +138,10 @@ func (h HostSystem) String() string {
 	}
 	return "Unknown"
 }
+
+// Unix constants for file types (standard POSIX)
+const (
+	s_IFREG = 0100000 // Regular file
+	s_IFDIR = 0040000 // Directory
+	s_IFLNK = 0120000 // Symlink
+)

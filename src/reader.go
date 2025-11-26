@@ -7,6 +7,7 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"math"
 	"strings"
 	"sync"
@@ -184,6 +185,7 @@ func (zr *zipReader) newFileFromCentralDir(entry centralDirectory) *file {
 	f := &file{
 		name:              filename,
 		isDir:             isDir,
+		mode:              parseFileExternalAttributes(entry),
 		uncompressedSize:  int64(uncompressedSize),
 		compressedSize:    int64(compressedSize),
 		crc32:             entry.CRC32,
@@ -289,6 +291,33 @@ func parseExtraField(extraField []byte) map[uint16][]byte {
 		offset += size
 	}
 	return m
+}
+
+func parseFileExternalAttributes(entry centralDirectory) fs.FileMode {
+	var mode fs.FileMode
+	hostSystem := HostSystem(entry.VersionMadeBy >> 8)
+
+	if hostSystem == HostSystemUNIX {
+		unixMode := uint32(entry.ExternalFileAttributes >> 16)
+		mode = fs.FileMode(unixMode & 0777)
+
+		switch {
+		case unixMode&s_IFDIR != 0:
+			mode |= fs.ModeDir
+		case unixMode&s_IFLNK != 0:
+			mode |= fs.ModeSymlink
+		}
+	} else {
+		if strings.HasSuffix(entry.Filename, "/") {
+			mode = 0755 | fs.ModeDir
+		} else {
+			mode = 0644
+		}
+		if entry.ExternalFileAttributes&0x01 != 0 {
+			mode &^= 0222 // Remove write permission (a-w)
+		}
+	}
+	return mode
 }
 
 // checksumReader wraps io.ReadCloser for checksum verification

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ZipConfig holds configuration options for archive
@@ -87,6 +88,13 @@ func WithPath(p string) AddOption {
 		if p != "" && p != "." {
 			f.name = path.Join(p, f.name)
 		}
+	}
+}
+
+// WithMode sets file mode bits
+func WithMode(mode fs.FileMode) AddOption {
+	return func(f *file) {
+		f.mode = mode
 	}
 }
 
@@ -485,5 +493,13 @@ func (z *Zip) extractFile(f *file, path string) error {
 	if err := dst.Close(); err != nil {
 		return err
 	}
+
+	perm := f.mode & fs.ModePerm
+	if perm == 0 {
+		perm = 0644
+	}
+	os.Chmod(path, perm)
+	os.Chtimes(path, time.Now(), f.modTime)
+
 	return nil
 }
