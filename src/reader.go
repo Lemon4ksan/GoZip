@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
+	"hash/crc32"
 	"io"
 	"math"
 	"strings"
@@ -244,7 +246,18 @@ func (zr *zipReader) openFile(f *file) (io.ReadCloser, error) {
 	if !ok {
 		return nil, fmt.Errorf("unsupported compression method: %d", f.config.CompressionMethod)
 	}
-	return decompressor.Decompress(dataR)
+
+	rc, err := decompressor.Decompress(dataR)
+	if err != nil {
+		return nil, fmt.Errorf("decompress data: %w", err)
+	}
+
+	return &checksumReader{
+		rc:   rc,
+		hash: crc32.NewIEEE(),
+		want: f.crc32,
+		size: uint64(f.uncompressedSize),
+	}, nil
 }
 
 // verifySignatures checks whether next 4 bytes match given signature by reading from source
@@ -276,4 +289,38 @@ func parseExtraField(extraField []byte) map[uint16][]byte {
 		offset += size
 	}
 	return m
+}
+
+// checksumReader wraps io.ReadCloser for checksum verification
+type checksumReader struct {
+	rc   io.ReadCloser
+	hash hash.Hash32
+	want uint32
+	read uint64
+	size uint64
+}
+
+func (cr *checksumReader) Read(p []byte) (int, error) {
+	n, err := cr.rc.Read(p)
+	if n > 0 {
+		cr.read += uint64(n)
+		if cr.read > cr.size {
+			return n, errors.New("file is larger than declared in header")
+		}
+		cr.hash.Write(p[:n])
+	}
+	return n, err
+}
+
+func (cr *checksumReader) Close() error {
+	defer cr.rc.Close()
+	
+	if cr.read != cr.size {
+		return fmt.Errorf("size mismatch: read %d, want %d", cr.read, cr.size)
+	}
+	
+	if got := cr.hash.Sum32(); got != cr.want {
+		return fmt.Errorf("checksum mismatch: got %x, want %x", got, cr.want)
+	}
+	return nil
 }
