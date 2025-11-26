@@ -41,13 +41,18 @@ func newZipWriter(config ZipConfig, compressors map[string]Compressor, dest io.W
 func (zw *zipWriter) WriteFile(file *file) error {
 	var err error
 	_, isSeeker := zw.dest.(io.WriteSeeker)
-	if file.uncompressedSize > math.MaxUint32 || file.uncompressedSize == sizeUnknown || !isSeeker {
+	shouldBuffer := file.uncompressedSize == sizeUnknown ||
+		file.uncompressedSize > math.MaxUint32 ||
+		!isSeeker ||
+		file.config.IsEncrypted
+
+	if shouldBuffer {
 		err = zw.writeBuffered(file)
 	} else {
 		err = zw.writeStream(file)
 	}
 	if err != nil {
-		return fmt.Errorf("write file: %w", err)
+		return err
 	}
 
 	return zw.addCentralDirEntry(file)
@@ -103,7 +108,7 @@ func (zw *zipWriter) writeStream(file *file) error {
 		zw.localHeaderOffset += stats.compressedSize
 
 		if file.compressedSize > math.MaxUint32 || file.uncompressedSize > math.MaxUint32 {
-			return errors.New("cannot add zip64 extra field to stream")
+			return errors.New("file too large for stream mode (zip64 required but header already written)")
 		}
 
 		if err := zw.updateLocalHeader(file); err != nil {
@@ -116,6 +121,7 @@ func (zw *zipWriter) writeStream(file *file) error {
 func (zw *zipWriter) writeBuffered(file *file) error {
 	var tmpFile *os.File
 	var err error
+	var compressedSize int64
 
 	if !file.isDir {
 		tmpFile, err = os.CreateTemp("", "zip-buffer-*")
@@ -123,13 +129,13 @@ func (zw *zipWriter) writeBuffered(file *file) error {
 			return err
 		}
 		defer cleanupTempFile(tmpFile)
-	
+
 		src, err := file.Open()
 		if err != nil {
 			return fmt.Errorf("open source: %w", err)
 		}
 		defer src.Close()
-	
+
 		stats, err := zw.encodeToWriter(src, tmpFile, file.config)
 		if err != nil {
 			return fmt.Errorf("encode to writer: %w", err)
@@ -137,12 +143,13 @@ func (zw *zipWriter) writeBuffered(file *file) error {
 		file.uncompressedSize = stats.uncompressedSize
 		file.compressedSize = stats.compressedSize
 		file.crc32 = stats.crc32
-		zw.localHeaderOffset += stats.compressedSize
+		compressedSize = stats.compressedSize
 	}
 
 	if err := zw.writeFileHeader(file); err != nil {
 		return fmt.Errorf("write header: %w", err)
 	}
+	zw.localHeaderOffset += compressedSize
 
 	if file.compressedSize > math.MaxUint32 || file.uncompressedSize > math.MaxUint32 {
 		if err := zw.writeZip64ExtraField(file); err != nil {
@@ -162,29 +169,109 @@ func (zw *zipWriter) writeBuffered(file *file) error {
 	return nil
 }
 
-type compressionStats struct {
+type encodingStats struct {
 	crc32            uint32
 	compressedSize   int64
 	uncompressedSize int64
 }
 
-func (zw *zipWriter) encodeToWriter(src io.Reader, dest io.Writer, cfg FileConfig) (compressionStats, error) {
+func (zw *zipWriter) encodeToWriter(src io.Reader, dest io.Writer, cfg FileConfig) (encodingStats, error) {
+	if !cfg.IsEncrypted {
+		return zw.encodeUnencrypted(src, dest, cfg)
+	}
+
+	// If file implements seeker it can be read twice:
+	// once for crc and compression, a second time for encryption
+	if seeker, ok := src.(io.ReadSeeker); ok {
+		return zw.encodeWithSeeker(seeker, dest, cfg)
+	}
+
+	// Otherwise use double buffering
+	return zw.encodeWithTempFile(src, dest, cfg)
+}
+
+func (zw *zipWriter) encodeUnencrypted(src io.Reader, dest io.Writer, cfg FileConfig) (encodingStats, error) {
 	sizeCounter := &byteCountWriter{dest: dest}
 	hasher := crc32.NewIEEE()
 
 	comp, err := zw.resolveCompressor(cfg.CompressionMethod, cfg.CompressionLevel)
 	if err != nil {
-		return compressionStats{}, err
+		return encodingStats{}, err
 	}
 
 	uncompressed, err := comp.Compress(io.TeeReader(src, hasher), sizeCounter)
 	if err != nil {
-		return compressionStats{}, fmt.Errorf("compress: %w", err)
+		return encodingStats{}, fmt.Errorf("compress: %w", err)
 	}
 
-	return compressionStats{
+	return encodingStats{
 		crc32:            hasher.Sum32(),
 		uncompressedSize: uncompressed,
+		compressedSize:   sizeCounter.bytesWritten,
+	}, nil
+}
+
+func (zw *zipWriter) encodeWithSeeker(src io.ReadSeeker, dest io.Writer, cfg FileConfig) (encodingStats, error) {
+	hasher := crc32.NewIEEE()
+	uncompressedSize, err := io.Copy(io.Discard, io.TeeReader(src, hasher))
+	if err != nil {
+		return encodingStats{}, fmt.Errorf("calc crc: %w", err)
+	}
+	
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return encodingStats{}, fmt.Errorf("reset source: %w", err)
+	}
+	
+	return zw.encodeEncrypted(src, dest, cfg, hasher.Sum32(), uncompressedSize)
+}
+
+func (zw *zipWriter) encodeWithTempFile(src io.Reader, dest io.Writer, cfg FileConfig) (encodingStats, error) {
+	hasher := crc32.NewIEEE()
+	bufFile, err := os.CreateTemp("", "zip-cipher-*")
+	if err != nil {
+		return encodingStats{}, err
+	}
+	defer cleanupTempFile(bufFile)
+
+	comp, err := zw.resolveCompressor(cfg.CompressionMethod, cfg.CompressionLevel)
+	if err != nil {
+		return encodingStats{}, err
+	}
+
+	uncompressedSize, err := comp.Compress(io.TeeReader(src, hasher), bufFile)
+	if err != nil {
+		return encodingStats{}, fmt.Errorf("compress to buffer: %w", err)
+	}
+	
+	if _, err := bufFile.Seek(0, io.SeekStart); err != nil {
+		return encodingStats{}, err
+	}
+
+	return zw.encodeEncrypted(bufFile, dest, cfg, hasher.Sum32(), uncompressedSize)
+}
+
+func (zw *zipWriter) encodeEncrypted(src io.Reader, dest io.Writer, cfg FileConfig,
+	                                 fileCRC uint32, uncompressedSize int64) (encodingStats, error) {
+	sizeCounter := &byteCountWriter{dest: dest}
+	encryptor, err := NewZipCryptoWriter(sizeCounter, cfg.Password, byte(fileCRC>>24))
+	if err != nil {
+		return encodingStats{}, err
+	}
+	defer encryptor.Close()
+
+	comp, err := zw.resolveCompressor(cfg.CompressionMethod, cfg.CompressionLevel)
+	if err != nil {
+		return encodingStats{}, err
+	}
+
+	_, err = comp.Compress(src, encryptor)
+	if err != nil {
+		return encodingStats{}, fmt.Errorf("compress & encrypt: %w", err)
+	}
+
+	return encodingStats{
+		crc32:            fileCRC,
+		uncompressedSize: uncompressedSize,
 		compressedSize:   sizeCounter.bytesWritten,
 	}, nil
 }
@@ -196,14 +283,14 @@ func (zw *zipWriter) writeFileHeader(file *file) error {
 	header := newZipHeaders(file).LocalHeader()
 	n, err := zw.dest.Write(header.encode())
 	if err != nil {
-		return fmt.Errorf("write local header: %w", err)
+		return err
 	}
 	zw.localHeaderOffset += int64(n)
 	return nil
 }
 
 // addCentralDirEntry adds a central directory entry
-// for a file and update size of central directory
+// for a file and updates size of central directory
 func (zw *zipWriter) addCentralDirEntry(file *file) error {
 	if file.RequiresZip64() {
 		file.AddExtraField(Zip64ExtraFieldTag, encodeZip64ExtraField(file))
@@ -220,7 +307,8 @@ func (zw *zipWriter) addCentralDirEntry(file *file) error {
 	return nil
 }
 
-// updateLocalHeader updates the local file header with actual compression results
+// updateLocalHeader updates the local file header
+// with actual compression results for stream write
 func (zw *zipWriter) updateLocalHeader(file *file) error {
 	ws, ok := zw.dest.(io.WriteSeeker)
 	if !ok {
@@ -247,7 +335,7 @@ func (zw *zipWriter) updateLocalHeader(file *file) error {
 	return nil
 }
 
-// writeZip64ExtraField writes ZIP64 extra field for large files
+// writeZip64ExtraField writes ZIP64 extra field
 func (zw *zipWriter) writeZip64ExtraField(file *file) error {
 	extraField := encodeZip64ExtraField(file)
 	n, err := zw.dest.Write(extraField)
@@ -429,7 +517,7 @@ func (pzw *parallelZipWriter) compressFile(file *file) (io.Reader, error) {
 	return fileBuffer, nil
 }
 
-// writeCompressedFile writes a compressed file to the ZIP archive and creates central directory entry
+// writeCompressedFile writes a compressed file header and encoded data to the ZIP archive
 func (pzw *parallelZipWriter) writeCompressedFile(file *file, src io.Reader) error {
 	if err := pzw.zw.writeFileHeader(file); err != nil {
 		return fmt.Errorf("write header: %w", err)

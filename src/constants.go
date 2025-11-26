@@ -27,6 +27,8 @@ type EncryptionMethod uint16
 // Supported encryption methods
 const (
 	NotEncrypted EncryptionMethod = 0 // No encryption - file stored in plaintext
+    ZipCrypto    EncryptionMethod = 1 // Legacy ZipCrypto encryption. Vulnerable to brute force attacks
+    AES256       EncryptionMethod = 2 // Modern AES256 encryption
 )
 
 // Sequential Saving (Write()):

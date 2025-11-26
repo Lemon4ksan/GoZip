@@ -197,6 +197,7 @@ func (zr *zipReader) newFileFromCentralDir(entry centralDirectory) *file {
 			CompressionMethod: CompressionMethod(entry.CompressionMethod),
 			Name:              filename,
 			Comment:           entry.Comment,
+			IsEncrypted:       (entry.GeneralPurposeBitFlag & 0x1) != 0,
 		},
 	}
 	f.openFunc = func() (io.ReadCloser, error) {
@@ -227,6 +228,9 @@ func (zr *zipReader) openFile(f *file) (io.ReadCloser, error) {
 		return nil, errors.New("invalid local file header signature")
 	}
 
+	generalPurposeBitFlag := binary.LittleEndian.Uint16(buf[6:8])
+	isEncrypted := generalPurposeBitFlag&0x1 != 0
+	
 	filenameLen := int64(binary.LittleEndian.Uint16(buf[26:28]))
 	extraLen := int64(binary.LittleEndian.Uint16(buf[28:30]))
 
@@ -240,6 +244,24 @@ func (zr *zipReader) openFile(f *file) (io.ReadCloser, error) {
 			return nil, fmt.Errorf("seek to file data: %w", err)
 		}
 		dataR = io.LimitReader(zr.src, f.compressedSize)
+	}
+
+	if isEncrypted {
+		if f.config.Password == "" {
+			return nil, errors.New("file is encrypted but no password provided")
+		}
+
+		cryptoR, err := NewZipCryptoReader(
+			dataR, 
+			f.config.Password, 
+			generalPurposeBitFlag, 
+			f.crc32, 
+			f.modTime,
+		)
+		if err != nil {
+			return nil, err
+		}
+		dataR = cryptoR
 	}
 
 	zr.mu.RLock()

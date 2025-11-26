@@ -46,6 +46,9 @@ type FileConfig struct {
 	// Comment stores optional comment string
 	Comment string
 
+	// Passwords stores a password for data encryption
+	Password string
+
 	// IsEncrypted indicates whether the file should be encrypted
 	IsEncrypted bool
 
@@ -291,6 +294,7 @@ func (z *Zip) Extract(path string) error {
 	var errs []error
 
 	for _, f := range files {
+		f.config.Password = z.config.Password
 		fpath := filepath.Join(path, f.name)
 
 		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
@@ -326,6 +330,7 @@ func (z *Zip) ExtractParallel(path string, workers int) error {
 	var errs []error
 
 	for _, f := range z.files {
+		f.config.Password = z.config.Password
 		fpath := filepath.Join(path, f.name)
 
 		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
@@ -392,6 +397,11 @@ func (z *Zip) addEntry(f *file, options []AddOption) error {
 	if !f.isDir {
 		f.config.CompressionMethod = z.config.CompressionMethod
 		f.config.CompressionLevel = z.config.CompressionLevel
+
+		if z.config.EncryptionMethod != NotEncrypted {
+			f.config.IsEncrypted = true
+			f.config.Password = z.config.Password
+		}
 	}
 	for _, opt := range options {
 		opt(f)
