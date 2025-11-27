@@ -182,6 +182,17 @@ func (zr *zipReader) newFileFromCentralDir(entry centralDirectory) *file {
 		}
 	}
 
+	var encryptionMethod EncryptionMethod
+	compressionMethod := entry.CompressionMethod
+	switch {
+	case entry.CompressionMethod == winZipAESMarker:
+		extraField := entry.ExtraField[AESEncryptionTag]
+		compressionMethod = binary.LittleEndian.Uint16(extraField[9:11])
+		encryptionMethod = AES256
+	case (entry.GeneralPurposeBitFlag & 0x1) != 0:
+		encryptionMethod = ZipCrypto
+	}
+
 	f := &file{
 		name:              filename,
 		isDir:             isDir,
@@ -194,10 +205,10 @@ func (zr *zipReader) newFileFromCentralDir(entry centralDirectory) *file {
 		modTime:           msDosToTime(entry.LastModFileDate, entry.LastModFileTime),
 		extraField:        entry.ExtraField,
 		config: FileConfig{
-			CompressionMethod: CompressionMethod(entry.CompressionMethod),
+			CompressionMethod: CompressionMethod(compressionMethod),
 			Name:              filename,
 			Comment:           entry.Comment,
-			IsEncrypted:       (entry.GeneralPurposeBitFlag & 0x1) != 0,
+			EncryptionMethod:  encryptionMethod,
 		},
 	}
 	f.openFunc = func() (io.ReadCloser, error) {
@@ -228,9 +239,9 @@ func (zr *zipReader) openFile(f *file) (io.ReadCloser, error) {
 		return nil, errors.New("invalid local file header signature")
 	}
 
-	generalPurposeBitFlag := binary.LittleEndian.Uint16(buf[6:8])
-	isEncrypted := generalPurposeBitFlag&0x1 != 0
-	
+	bitFlag := binary.LittleEndian.Uint16(buf[6:8])
+	isEncrypted := bitFlag&0x1 != 0
+
 	filenameLen := int64(binary.LittleEndian.Uint16(buf[26:28]))
 	extraLen := int64(binary.LittleEndian.Uint16(buf[28:30]))
 
@@ -251,13 +262,7 @@ func (zr *zipReader) openFile(f *file) (io.ReadCloser, error) {
 			return nil, errors.New("file is encrypted but no password provided")
 		}
 
-		cryptoR, err := NewZipCryptoReader(
-			dataR, 
-			f.config.Password, 
-			generalPurposeBitFlag, 
-			f.crc32, 
-			f.modTime,
-		)
+		cryptoR, err := zr.createDecrypter(dataR, f.config, f.crc32)
 		if err != nil {
 			return nil, err
 		}
@@ -282,6 +287,20 @@ func (zr *zipReader) openFile(f *file) (io.ReadCloser, error) {
 		want: f.crc32,
 		size: uint64(f.uncompressedSize),
 	}, nil
+}
+
+// createDecrypter factory
+func (zr *zipReader) createDecrypter(src io.Reader, cfg FileConfig, CRC32 uint32) (io.Reader, error) {
+	switch cfg.EncryptionMethod {
+	case ZipCrypto:
+		// ZipCrypto uses MSB of CRC32 for password verification
+		return NewZipCryptoReader(src, cfg.Password, CRC32)
+	case AES256:
+		// AES uses internal Salt for verification
+		return NewAes256Reader(src, cfg.Password)
+	default:
+		return nil, fmt.Errorf("unknown encryption method: %d", cfg.EncryptionMethod)
+	}
 }
 
 // verifySignatures checks whether next 4 bytes match given signature by reading from source
@@ -309,7 +328,7 @@ func parseExtraField(extraField []byte) map[uint16][]byte {
 			break
 		}
 
-		m[tag] = extraField[offset : offset+size]
+		m[tag] = extraField[offset-4 : offset+size]
 		offset += size
 	}
 	return m
@@ -365,11 +384,11 @@ func (cr *checksumReader) Read(p []byte) (int, error) {
 
 func (cr *checksumReader) Close() error {
 	defer cr.rc.Close()
-	
+
 	if cr.read != cr.size {
 		return fmt.Errorf("size mismatch: read %d, want %d", cr.read, cr.size)
 	}
-	
+
 	if got := cr.hash.Sum32(); got != cr.want {
 		return fmt.Errorf("checksum mismatch: got %x, want %x", got, cr.want)
 	}

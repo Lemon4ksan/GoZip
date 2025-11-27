@@ -39,6 +39,9 @@ type FileConfig struct {
 	// CompressionMethod specifies the standard compression method to use
 	CompressionMethod CompressionMethod
 
+	// EncryptionMethod specifies the encryption method
+	EncryptionMethod EncryptionMethod
+
 	// CompressionLevel controls the compression strength (0-9).
 	// Higher values typically provide better compression at the cost of CPU time.
 	CompressionLevel int
@@ -48,9 +51,6 @@ type FileConfig struct {
 
 	// Passwords stores a password for data encryption
 	Password string
-
-	// IsEncrypted indicates whether the file should be encrypted
-	IsEncrypted bool
 
 	// Name specifies the file's name and path within the archive
 	Name string
@@ -72,6 +72,16 @@ func WithCompression(c CompressionMethod, lvl int) AddOption {
 		if !f.isDir {
 			f.config.CompressionMethod = c
 			f.config.CompressionLevel = lvl
+		}
+	}
+}
+
+// WithEncryption sets an encryption for file
+func WithEncryption(e EncryptionMethod, pwd string) AddOption {
+	return func(f *file) {
+		if !f.isDir {
+			f.config.EncryptionMethod = e
+			f.config.Password = pwd
 		}
 	}
 }
@@ -150,10 +160,10 @@ func (z *Zip) RegisterCompressor(method CompressionMethod, level int, c Compress
 }
 
 // RegisterDecompressor registers a custom decompressor for a specific compression method
-func (z *Zip) RegisterDecompressor(method CompressionMethod, c Decompressor) {
+func (z *Zip) RegisterDecompressor(method CompressionMethod, d Decompressor) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	z.decompressors[method] = c
+	z.decompressors[method] = d
 }
 
 // AddFile adds an existing open file to the archive
@@ -397,11 +407,8 @@ func (z *Zip) addEntry(f *file, options []AddOption) error {
 	if !f.isDir {
 		f.config.CompressionMethod = z.config.CompressionMethod
 		f.config.CompressionLevel = z.config.CompressionLevel
-
-		if z.config.EncryptionMethod != NotEncrypted {
-			f.config.IsEncrypted = true
-			f.config.Password = z.config.Password
-		}
+		f.config.EncryptionMethod = z.config.EncryptionMethod
+		f.config.Password = z.config.Password
 	}
 	for _, opt := range options {
 		opt(f)
@@ -422,7 +429,7 @@ func (z *Zip) addEntry(f *file, options []AddOption) error {
 	}
 
 	if err := z.createMissingDirs(f.name); err != nil {
-		return fmt.Errorf("create parent dirs: %w", err)
+		return fmt.Errorf("create missing dirs: %w", err)
 	}
 
 	z.files = append(z.files, f)

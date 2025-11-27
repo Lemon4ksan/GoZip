@@ -44,8 +44,11 @@ func (zw *zipWriter) WriteFile(file *file) error {
 	shouldBuffer := file.uncompressedSize == sizeUnknown ||
 		file.uncompressedSize > math.MaxUint32 ||
 		!isSeeker ||
-		file.config.IsEncrypted
+		file.config.EncryptionMethod != NotEncrypted
 
+	if file.config.EncryptionMethod == AES256 {
+		file.AddExtraField(AESEncryptionTag, encodeAESExtraField(file))
+	}
 	if shouldBuffer {
 		err = zw.writeBuffered(file)
 	} else {
@@ -156,6 +159,13 @@ func (zw *zipWriter) writeBuffered(file *file) error {
 			return fmt.Errorf("write zip64 extra field: %w", err)
 		}
 	}
+	if file.HasExtraField(AESEncryptionTag) {
+		n, err := zw.dest.Write(file.GetExtraField(AESEncryptionTag))
+		if err != nil {
+			return fmt.Errorf("write aes encryption extra field: %w", err)
+		}
+		zw.localHeaderOffset += int64(n)
+	}
 
 	if tmpFile != nil {
 		if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
@@ -175,18 +185,18 @@ type encodingStats struct {
 	uncompressedSize int64
 }
 
+// encodeToWriter selects the best strategy for compression and encryption
 func (zw *zipWriter) encodeToWriter(src io.Reader, dest io.Writer, cfg FileConfig) (encodingStats, error) {
-	if !cfg.IsEncrypted {
+	if cfg.EncryptionMethod == NotEncrypted {
 		return zw.encodeUnencrypted(src, dest, cfg)
 	}
 
-	// If file implements seeker it can be read twice:
-	// once for crc and compression, a second time for encryption
+	// If the source is a file, we read it twice: once for CRC, once for processing
 	if seeker, ok := src.(io.ReadSeeker); ok {
 		return zw.encodeWithSeeker(seeker, dest, cfg)
 	}
 
-	// Otherwise use double buffering
+	// We compress to a temp file first to calculate CRC, then encrypt the already compressed data
 	return zw.encodeWithTempFile(src, dest, cfg)
 }
 
@@ -217,12 +227,12 @@ func (zw *zipWriter) encodeWithSeeker(src io.ReadSeeker, dest io.Writer, cfg Fil
 	if err != nil {
 		return encodingStats{}, fmt.Errorf("calc crc: %w", err)
 	}
-	
+
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
 		return encodingStats{}, fmt.Errorf("reset source: %w", err)
 	}
-	
-	return zw.encodeEncrypted(src, dest, cfg, hasher.Sum32(), uncompressedSize)
+
+	return zw.compressAndEncrypt(src, dest, cfg, hasher.Sum32(), uncompressedSize)
 }
 
 func (zw *zipWriter) encodeWithTempFile(src io.Reader, dest io.Writer, cfg FileConfig) (encodingStats, error) {
@@ -242,22 +252,24 @@ func (zw *zipWriter) encodeWithTempFile(src io.Reader, dest io.Writer, cfg FileC
 	if err != nil {
 		return encodingStats{}, fmt.Errorf("compress to buffer: %w", err)
 	}
-	
+
 	if _, err := bufFile.Seek(0, io.SeekStart); err != nil {
 		return encodingStats{}, err
 	}
 
-	return zw.encodeEncrypted(bufFile, dest, cfg, hasher.Sum32(), uncompressedSize)
+	return zw.encryptCompressed(bufFile, dest, cfg, hasher.Sum32(), uncompressedSize)
 }
 
-func (zw *zipWriter) encodeEncrypted(src io.Reader, dest io.Writer, cfg FileConfig,
-	                                 fileCRC uint32, uncompressedSize int64) (encodingStats, error) {
+// compressAndEncrypt takes RAW data, compresses it, and then encrypts
+func (zw *zipWriter) compressAndEncrypt(src io.Reader, dest io.Writer, cfg FileConfig,
+	fileCRC uint32, uncompressedSize int64) (encodingStats, error) {
+
 	sizeCounter := &byteCountWriter{dest: dest}
-	encryptor, err := NewZipCryptoWriter(sizeCounter, cfg.Password, byte(fileCRC>>24))
+
+	encryptor, err := zw.createEncryptor(sizeCounter, cfg, fileCRC)
 	if err != nil {
 		return encodingStats{}, err
 	}
-	defer encryptor.Close()
 
 	comp, err := zw.resolveCompressor(cfg.CompressionMethod, cfg.CompressionLevel)
 	if err != nil {
@@ -269,11 +281,56 @@ func (zw *zipWriter) encodeEncrypted(src io.Reader, dest io.Writer, cfg FileConf
 		return encodingStats{}, fmt.Errorf("compress & encrypt: %w", err)
 	}
 
+	if c, ok := encryptor.(io.Closer); ok {
+		c.Close()
+	}
+
 	return encodingStats{
 		crc32:            fileCRC,
 		uncompressedSize: uncompressedSize,
 		compressedSize:   sizeCounter.bytesWritten,
 	}, nil
+}
+
+// encryptCompressed takes already compressed data and just encrypts it
+func (zw *zipWriter) encryptCompressed(compressedSrc io.Reader, dest io.Writer, cfg FileConfig,
+	fileCRC uint32, uncompressedSize int64) (encodingStats, error) {
+
+	sizeCounter := &byteCountWriter{dest: dest}
+
+	encryptor, err := zw.createEncryptor(sizeCounter, cfg, fileCRC)
+	if err != nil {
+		return encodingStats{}, err
+	}
+	defer func() {
+		if c, ok := encryptor.(io.Closer); ok {
+			c.Close()
+		}
+	}()
+
+	if _, err := io.Copy(encryptor, compressedSrc); err != nil {
+		return encodingStats{}, fmt.Errorf("encrypt: %w", err)
+	}
+
+	return encodingStats{
+		crc32:            fileCRC,
+		uncompressedSize: uncompressedSize,
+		compressedSize:   sizeCounter.bytesWritten,
+	}, nil
+}
+
+// createEncryptor factory
+func (zw *zipWriter) createEncryptor(dest io.Writer, cfg FileConfig, crc32Val uint32) (io.Writer, error) {
+	switch cfg.EncryptionMethod {
+	case ZipCrypto:
+		// ZipCrypto uses MSB of CRC32 for password verification
+		return NewZipCryptoWriter(dest, cfg.Password, byte(crc32Val>>24))
+	case AES256:
+		// AES uses internal Salt for verification
+		return NewAes256Writer(dest, cfg.Password)
+	default:
+		return nil, fmt.Errorf("unknown encryption method: %d", cfg.EncryptionMethod)
+	}
 }
 
 // writeFileHeader writes the local file header
@@ -519,6 +576,10 @@ func (pzw *parallelZipWriter) compressFile(file *file) (io.Reader, error) {
 
 // writeCompressedFile writes a compressed file header and encoded data to the ZIP archive
 func (pzw *parallelZipWriter) writeCompressedFile(file *file, src io.Reader) error {
+	if file.config.EncryptionMethod == AES256 {
+		file.AddExtraField(AESEncryptionTag, encodeAESExtraField(file))
+	}
+
 	if err := pzw.zw.writeFileHeader(file); err != nil {
 		return fmt.Errorf("write header: %w", err)
 	}
@@ -530,6 +591,13 @@ func (pzw *parallelZipWriter) writeCompressedFile(file *file, src io.Reader) err
 		if err := pzw.zw.writeZip64ExtraField(file); err != nil {
 			return fmt.Errorf("write zip64 extra field: %w", err)
 		}
+	}
+	if file.HasExtraField(AESEncryptionTag) {
+		n, err := pzw.zw.dest.Write(file.GetExtraField(AESEncryptionTag))
+		if err != nil {
+			return fmt.Errorf("write aes encryption extra field: %w", err)
+		}
+		pzw.zw.localHeaderOffset += int64(n)
 	}
 	if err := pzw.writeFileData(src); err != nil {
 		return fmt.Errorf("write data: %w", err)
@@ -740,6 +808,28 @@ func encodeNTFSExtraField(metadata map[string]interface{}) []byte {
 	binary.LittleEndian.PutUint64(data[12:20], mtime)
 	binary.LittleEndian.PutUint64(data[20:28], atime)
 	binary.LittleEndian.PutUint64(data[28:36], ctime)
+
+	return data
+}
+
+// encodeAESExtraField generates the WinZip AES Extra Field
+func encodeAESExtraField(file *file) []byte {
+	// Fixed size: 2+2+2+2+1+2 = 11 bytes header, 7 bytes data
+	data := make([]byte, 11)
+
+	// Header ID
+	binary.LittleEndian.PutUint16(data[0:2], AESEncryptionTag)
+	// Data Size (7 bytes)
+	binary.LittleEndian.PutUint16(data[2:4], 7)
+	// Version Number (0x0002 for AE-2)
+	binary.LittleEndian.PutUint16(data[4:6], 0x0002)
+	// Vendor ID ("AE")
+	data[6] = 'A'
+	data[7] = 'E'
+	// AES Strength (0x03 for AES-256)
+	data[8] = 0x03
+	// Actual Compression Method
+	binary.LittleEndian.PutUint16(data[9:11], uint16(file.config.CompressionMethod))
 
 	return data
 }

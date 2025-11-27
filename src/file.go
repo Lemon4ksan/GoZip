@@ -19,6 +19,7 @@ const (
 	LatestZipVersion   uint16 = 63
 	Zip64ExtraFieldTag uint16 = 0x0001
 	NTFSFieldTag       uint16 = 0x000A
+	AESEncryptionTag   uint16 = 0x9901
 )
 
 // file represents a file to be compressed and added to a ZIP archive
@@ -26,7 +27,7 @@ type file struct {
 	// Basic file identification
 	name  string
 	isDir bool
-	mode  fs.FileMode 
+	mode  fs.FileMode
 
 	// File content and source
 	openFunc         func() (io.ReadCloser, error)
@@ -135,8 +136,8 @@ func newDirectoryFile(name string) (*file, error) {
 		hostSystem: getHostSystemByOS(),
 		modTime:    time.Now(),
 		extraField: make(map[uint16][]byte),
-		}, nil
-	}
+	}, nil
+}
 
 func (f *file) Name() string            { return f.name }
 func (f *file) IsDir() bool             { return f.isDir }
@@ -152,7 +153,8 @@ func (f *file) SetConfig(config FileConfig) {
 	if !f.isDir {
 		f.config.CompressionMethod = config.CompressionMethod
 		f.config.CompressionLevel = config.CompressionLevel
-		f.config.IsEncrypted = config.IsEncrypted
+		f.config.EncryptionMethod = config.EncryptionMethod
+		f.config.Password = config.Password
 	}
 	f.config.Comment = config.Comment
 }
@@ -235,11 +237,14 @@ func (zh *zipHeaders) LocalHeader() localFileHeader {
 	if extraFieldLength > 0 {
 		extraFieldLength += 4 // Tag + Size
 	}
+	if zh.file.HasExtraField(AESEncryptionTag) {
+		extraFieldLength += 11
+	}
 
 	return localFileHeader{
 		VersionNeededToExtract: zh.getVersionNeededToExtract(),
 		GeneralPurposeBitFlag:  zh.getFileBitFlag(),
-		CompressionMethod:      uint16(zh.file.config.CompressionMethod),
+		CompressionMethod:      zh.getCompressionMethod(),
 		LastModFileTime:        dosTime,
 		LastModFileDate:        dosDate,
 		CRC32:                  zh.file.crc32,
@@ -260,7 +265,7 @@ func (zh *zipHeaders) CentralDirEntry() centralDirectory {
 		VersionMadeBy:          zh.getVersionMadeBy(),
 		VersionNeededToExtract: zh.getVersionNeededToExtract(),
 		GeneralPurposeBitFlag:  zh.getFileBitFlag(),
-		CompressionMethod:      uint16(zh.file.config.CompressionMethod),
+		CompressionMethod:      zh.getCompressionMethod(),
 		LastModFileTime:        dosTime,
 		LastModFileDate:        dosDate,
 		CRC32:                  zh.file.crc32,
@@ -279,10 +284,13 @@ func (zh *zipHeaders) CentralDirEntry() centralDirectory {
 	}
 }
 
-// GetVersionNeededToExtract returns minimum ZIP version needed
+// getVersionNeededToExtract returns minimum ZIP version needed
 func (zh *zipHeaders) getVersionNeededToExtract() uint16 {
 	if zh.file.config.CompressionMethod == LZMA {
 		return 63
+	}
+	if zh.file.config.EncryptionMethod == AES256 {
+		return 51
 	}
 	if zh.file.config.CompressionMethod == BZIP2 {
 		return 46
@@ -299,13 +307,13 @@ func (zh *zipHeaders) getVersionNeededToExtract() uint16 {
 	if zh.file.isDir || strings.Contains(zh.file.name, "/") {
 		return 20
 	}
-	if zh.file.config.IsEncrypted {
+	if zh.file.config.EncryptionMethod == ZipCrypto {
 		return 20
 	}
 	return 10
 }
 
-// GetVersionMadeBy returns version made by field
+// getVersionMadeBy returns version made by field
 func (zh *zipHeaders) getVersionMadeBy() uint16 {
 	fs := zh.file.hostSystem
 	if fs == HostSystemNTFS {
@@ -314,12 +322,12 @@ func (zh *zipHeaders) getVersionMadeBy() uint16 {
 	return uint16(fs)<<8 | LatestZipVersion
 }
 
-// GetFileBitFlag returns general purpose bit flag
+// getFileBitFlag returns general purpose bit flag
 func (zh *zipHeaders) getFileBitFlag() uint16 {
 	var flag uint16
 
-	if zh.file.config.IsEncrypted {
-		flag |= 0x0001
+	if zh.file.config.EncryptionMethod != NotEncrypted {
+		flag |= 0x1
 	}
 
 	if zh.file.config.CompressionMethod == Deflated {
@@ -329,14 +337,21 @@ func (zh *zipHeaders) getFileBitFlag() uint16 {
 	return flag
 }
 
-// GetExternalFileAttributes returns external file attributes
+func (zh *zipHeaders) getCompressionMethod() uint16 {
+	if zh.file.config.EncryptionMethod == AES256 {
+		return winZipAESMarker
+	}
+	return uint16(zh.file.config.CompressionMethod)
+}
+
+// getExternalFileAttributes returns external file attributes
 func (zh *zipHeaders) getExternalFileAttributes() uint32 {
 	var externalAttrs uint32
 
 	switch zh.file.hostSystem {
-    case HostSystemUNIX, HostSystemDarwin:
+	case HostSystemUNIX, HostSystemDarwin:
 		mode := uint32(zh.file.mode & fs.ModePerm)
-	
+
 		switch {
 		case zh.file.isDir:
 			mode |= s_IFDIR
@@ -345,7 +360,7 @@ func (zh *zipHeaders) getExternalFileAttributes() uint32 {
 		default:
 			mode |= s_IFREG
 		}
-	
+
 		externalAttrs = mode << 16
 
 	case HostSystemFAT, HostSystemNTFS:

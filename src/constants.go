@@ -27,9 +27,13 @@ type EncryptionMethod uint16
 // Supported encryption methods
 const (
 	NotEncrypted EncryptionMethod = 0 // No encryption - file stored in plaintext
-    ZipCrypto    EncryptionMethod = 1 // Legacy ZipCrypto encryption. Vulnerable to brute force attacks
-    AES256       EncryptionMethod = 2 // Modern AES256 encryption
+	ZipCrypto    EncryptionMethod = 1 // Legacy encryption. Vulnerable to brute force attacks
+	AES256       EncryptionMethod = 2 // Modern AES256 encryption
 )
+
+// Compression method indicates AES256 encryption.
+// The actual compression method is stored in extra field.
+const winZipAESMarker = 99
 
 // Sequential Saving (Write()):
 //   ┌──────────────────┬────────────────────────┬───────────────────────┬──────────────────┐
@@ -73,13 +77,13 @@ const (
 type FileSystemType int
 
 const (
-    FileSystemUnknown FileSystemType = iota
-    FileSystemFAT
-    FileSystemNTFS
-    FileSystemEXT4
-    FileSystemAPFS
-    FileSystemHFSPlus
-    FileSystemZFS
+	FileSystemUnknown FileSystemType = iota
+	FileSystemFAT
+	FileSystemNTFS
+	FileSystemEXT4
+	FileSystemAPFS
+	FileSystemHFSPlus
+	FileSystemZFS
 )
 
 // HostSystem represents the host system on which the ZIP file was created
