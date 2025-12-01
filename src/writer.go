@@ -15,20 +15,20 @@ import (
 // zipWriter handles the low-level writing of ZIP archive structure
 type zipWriter struct {
 	mu               sync.RWMutex
-	dest             io.Writer             // Target stream for writing archive data
-	config           ZipConfig             // Archive-wide configuration settings
-	compressors      map[string]Compressor // Registry of available compressors keyed by "method::level"
-	entriesNum       int                   // Number of files written to the archive
-	sizeOfCentralDir int64                 // Cumulative size of central directory entries
-	headerOffset     int64                 // Current write position for local file headers
-	centralDir       *bytes.Buffer         // Buffer for accumulating central directory before final write
+	dest             io.Writer      // Target stream for writing archive data
+	config           ZipConfig      // Archive-wide configuration settings
+	compressors      compressorsMap // Registry of available compressors
+	entriesNum       int            // Number of files written to the archive
+	sizeOfCentralDir int64          // Cumulative size of central directory entries
+	headerOffset     int64          // Current write position for local file headers
+	centralDir       *bytes.Buffer  // Buffer for accumulating central directory before final write
 }
 
 // newZipWriter creates and initializes a new zipWriter instance.
 // compressors map can be nil and will be initialized automatically.
-func newZipWriter(config ZipConfig, compressors map[string]Compressor, dest io.Writer) *zipWriter {
+func newZipWriter(config ZipConfig, compressors compressorsMap, dest io.Writer) *zipWriter {
 	if compressors == nil {
-		compressors = make(map[string]Compressor)
+		compressors = make(compressorsMap)
 	}
 	return &zipWriter{
 		dest:        dest,
@@ -430,10 +430,9 @@ func (zw *zipWriter) writeZip64EndHeaders() error {
 
 // resolveCompressor determines the correct compressor for a file.
 // Looks up custom compressors first, falls back to built-in Deflate/Store methods.
-func (zw *zipWriter) resolveCompressor(method CompressionMethod, lvl int) (Compressor, error) {
+func (zw *zipWriter) resolveCompressor(method CompressionMethod, level int) (Compressor, error) {
 	zw.mu.RLock()
-	key := fmt.Sprintf("%d::%d", method, lvl)
-	val, ok := zw.compressors[key]
+	val, ok := zw.compressors[compressorKey{method: method, level: level}]
 	zw.mu.RUnlock()
 	if ok {
 		return val, nil
@@ -445,7 +444,8 @@ func (zw *zipWriter) resolveCompressor(method CompressionMethod, lvl int) (Compr
 	case Deflated:
 		zw.mu.Lock()
 		defer zw.mu.Unlock()
-		zw.compressors[key] = NewDeflateCompressor(lvl)
+		key := compressorKey{method: Deflated, level: level}
+		zw.compressors[key] = NewDeflateCompressor(level)
 		return zw.compressors[key], nil
 	default:
 		return nil, fmt.Errorf("unsupported compression method: %d", method)
@@ -492,8 +492,7 @@ type parallelZipWriter struct {
 
 // newParallelZipWriter creates a new parallelZipWriter instance.
 // Workers parameter controls maximum concurrent compression operations.
-func newParallelZipWriter(config ZipConfig, compressors map[string]Compressor,
-	dest io.Writer, workers int) *parallelZipWriter {
+func newParallelZipWriter(config ZipConfig, compressors compressorsMap, dest io.Writer, workers int) *parallelZipWriter {
 	return &parallelZipWriter{
 		zw:              newZipWriter(config, compressors, dest),
 		sem:             make(chan struct{}, workers),

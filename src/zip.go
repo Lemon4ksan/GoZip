@@ -140,17 +140,26 @@ func WithMode(mode fs.FileMode) AddOption {
 	}
 }
 
+// compressorKey defines a key for compressors map
+type compressorKey struct {
+    method CompressionMethod
+    level  int
+}
+
+type compressorsMap map[compressorKey]Compressor
+type decompressorsMap map[CompressionMethod]Decompressor
+
 // Zip represents an in-memory ZIP archive that can be created, modified, and written.
 // It provides thread-safe operations for concurrent access and supports both
 // sequential and parallel processing modes.
 type Zip struct {
-	mu            sync.RWMutex          // Protects concurrent access to archive state
-	config        ZipConfig             // Global archive configuration
-	files         []*File               // List of files in the archive (including directories)
-	fileCache     map[string]bool       // Fast lookup for file existence and type detection
-	compressors   map[string]Compressor // Registry of custom compressors by "method::level"
-	decompressors map[CompressionMethod]Decompressor // Registry of custom decompressors
-	bufferPool    sync.Pool             // Reusable byte buffers for I/O operations
+	mu            sync.RWMutex     // Protects concurrent access to archive state
+	config        ZipConfig        // Global archive configuration
+	files         []*File          // List of files in the archive (including directories)
+	fileCache     map[string]bool  // Fast lookup for file existence and type detection
+	compressors   compressorsMap   // Registry of custom compressors
+	decompressors decompressorsMap // Registry of custom decompressors
+	bufferPool    sync.Pool        // Reusable byte buffers for I/O operations
 }
 
 // NewZip creates a new empty ZIP archive with default settings.
@@ -161,8 +170,8 @@ func NewZip() *Zip {
 	return &Zip{
 		files:         make([]*File, 0),
 		fileCache:     make(map[string]bool),
-		compressors:   make(map[string]Compressor),
-		decompressors: make(map[CompressionMethod]Decompressor),
+		compressors:   make(compressorsMap),
+		decompressors: make(decompressorsMap),
 		bufferPool: sync.Pool{
 			New: func() interface{} {
 				b := make([]byte, 64*1024) // 64KB buffer
@@ -191,13 +200,11 @@ func (z *Zip) SetConfig(c ZipConfig) {
 
 // RegisterCompressor registers a custom compressor implementation for a specific
 // compression method and level combination. This is required when reading archives that
-// use compression methods not natively supported by the library.
-// The key format is "method::level" (e.g., "8::6" for method 8, level 6).
-// Thread-safe.
+// use compression methods not natively supported by the library. Thread-safe.
 func (z *Zip) RegisterCompressor(method CompressionMethod, level int, c Compressor) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	z.compressors[fmt.Sprintf("%d::%d", method, level)] = c
+	z.compressors[compressorKey{method: method, level: level}] = c
 }
 
 // RegisterDecompressor registers a custom decompressor implementation for a
@@ -442,8 +449,7 @@ func (z *Zip) ExtractParallel(path string, workers int) error {
 		sem <- struct{}{}
 
 		go func(f *File) {
-			defer wg.Done()
-			defer func() { <-sem }()
+			defer func() { <-sem; wg.Done() }()
 
 			fpath := filepath.Join(path, f.name)
 			if err := z.extractFile(f, fpath); err != nil {
