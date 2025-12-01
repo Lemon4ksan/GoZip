@@ -2,10 +2,11 @@ package gozip
 
 import "sort"
 
-// SortFilesOptimized returns a sorted slice of files according to the strategy
-func SortFilesOptimized(files []*file, strategy FileSortStrategy) []*file {
+// SortFilesOptimized returns a sorted slice of files according to the strategy.
+// Returns copy of the original slice.
+func SortFilesOptimized(files []*File, strategy FileSortStrategy) []*File {
 	if len(files) <= 1 {
-		result := make([]*file, len(files))
+		result := make([]*File, len(files))
 		copy(result, files)
 		return result
 	}
@@ -28,19 +29,19 @@ func SortFilesOptimized(files []*file, strategy FileSortStrategy) []*file {
 
 	case SortSizeDescending:
 		return sortSizeDescending(files)
-	
+
 	case SortAlphabetical:
 		return sortAlphabetical(files)
 
 	default:
-		result := make([]*file, len(files))
+		result := make([]*File, len(files))
 		copy(result, files)
 		return result
 	}
 }
 
-func sortSizeAscending(files []*file) []*file {
-	sorted := make([]*file, len(files))
+func sortSizeAscending(files []*File) []*File {
+	sorted := make([]*File, len(files))
 	copy(sorted, files)
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].uncompressedSize < sorted[j].uncompressedSize
@@ -48,8 +49,8 @@ func sortSizeAscending(files []*file) []*file {
 	return sorted
 }
 
-func sortSizeDescending(files []*file) []*file {
-	sorted := make([]*file, len(files))
+func sortSizeDescending(files []*File) []*File {
+	sorted := make([]*File, len(files))
 	copy(sorted, files)
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].uncompressedSize > sorted[j].uncompressedSize
@@ -58,13 +59,13 @@ func sortSizeDescending(files []*file) []*file {
 }
 
 // partitionSortLargeFilesLast - O(n) time for specific strategy
-func partitionSortLargeFilesLast(files []*file) []*file {
+func partitionSortLargeFilesLast(files []*File) []*File {
 	if len(files) <= 1 {
 		return files
 	}
 
 	// Single pass partitioning - much faster than full sort for this case
-	result := make([]*file, len(files))
+	result := make([]*File, len(files))
 	smallIdx, largeIdx := 0, len(files)-1
 
 	for _, f := range files {
@@ -81,7 +82,7 @@ func partitionSortLargeFilesLast(files []*file) []*file {
 }
 
 // optimizedSortZIP64OptimizedWithBuckets - bucket sort approach
-func optimizedSortZIP64OptimizedWithBuckets(files []*file) []*file {
+func optimizedSortZIP64OptimizedWithBuckets(files []*File) []*File {
 	var smallCount, mediumCount, largeCount int
 	for _, f := range files {
 		switch getSizePriority(f.uncompressedSize) {
@@ -93,9 +94,9 @@ func optimizedSortZIP64OptimizedWithBuckets(files []*file) []*file {
 			largeCount++
 		}
 	}
-	small := make([]*file, 0, smallCount)
-	medium := make([]*file, 0, mediumCount)
-	large := make([]*file, 0, largeCount)
+	small := make([]*File, 0, smallCount)
+	medium := make([]*File, 0, mediumCount)
+	large := make([]*File, 0, largeCount)
 
 	for _, f := range files {
 		switch getSizePriority(f.uncompressedSize) {
@@ -119,7 +120,7 @@ func optimizedSortZIP64OptimizedWithBuckets(files []*file) []*file {
 		})
 	}
 
-	result := make([]*file, len(files))
+	result := make([]*File, len(files))
 	pos := 0
 	pos += copy(result[pos:], small)
 	pos += copy(result[pos:], medium)
@@ -127,8 +128,8 @@ func optimizedSortZIP64OptimizedWithBuckets(files []*file) []*file {
 	return result
 }
 
-func partitionSortLargeFilesFirst(files []*file) []*file {
-	result := make([]*file, len(files))
+func partitionSortLargeFilesFirst(files []*File) []*File {
+	result := make([]*File, len(files))
 	smallIdx, largeIdx := len(files)-1, 0
 
 	for _, f := range files {
@@ -143,8 +144,8 @@ func partitionSortLargeFilesFirst(files []*file) []*file {
 	return result
 }
 
-func sortZip64Optimized(files []*file) []*file {
-	sorted := make([]*file, len(files))
+func sortZip64Optimized(files []*File) []*File {
+	sorted := make([]*File, len(files))
 	copy(sorted, files)
 	sort.Slice(sorted, func(i, j int) bool {
 		iSize := sorted[i].uncompressedSize
@@ -175,13 +176,13 @@ func getSizePriority(size int64) int {
 }
 
 // sortAlphabetical sorts files by name A-Z
-func sortAlphabetical(files []*file) []*file {
-	sorted := make([]*file, len(files))
+func sortAlphabetical(files []*File) []*File {
+	sorted := make([]*File, len(files))
 	copy(sorted, files)
-	
+
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].name < sorted[j].name
 	})
-	
+
 	return sorted
 }

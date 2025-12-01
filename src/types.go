@@ -247,7 +247,7 @@ func readZip64EndOfCentralDir(src io.Reader) (zip64EndOfCentralDirectory, error)
 	}, nil
 }
 
-func encodeZip64EndOfCentralDirectoryRecord(entriesNum uint64, centralDirSize uint64, centralDirOffset uint64) []byte {
+func encodeZip64EndOfCentralDirRecord(entriesNum uint64, centralDirSize uint64, centralDirOffset uint64) []byte {
 	// Fixed size: Signature(4) + Header(52) = 56 bytes
 	buf := make([]byte, 56)
 
@@ -283,7 +283,7 @@ func readZip64EndOfCentralDirLocator(src io.Reader) (zip64EndOfCentralDirectoryL
 	}, nil
 }
 
-func encodeZip64EndOfCentralDirectoryLocator(endOfCentralDirOffset uint64) []byte {
+func encodeZip64EndOfCentralDirLocator(endOfCentralDirOffset uint64) []byte {
 	// Fixed size: Signature(4) + Header(16) = 20 bytes
 	buf := make([]byte, 20)
 

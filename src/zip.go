@@ -13,62 +13,82 @@ import (
 	"time"
 )
 
-// ZipConfig holds configuration options for archive
+// ZipConfig defines global configuration parameters for creating or modifying ZIP archives.
+// These settings apply to the entire archive unless overridden at the file level.
 type ZipConfig struct {
-	// CompressionMethod specifies default compression method
+	// CompressionMethod specifies the default compression algorithm used for files
 	CompressionMethod CompressionMethod
 
-	// CompressionLevel specifies default compression level
+	// CompressionLevel controls the trade-off between compression ratio and speed.
+	// Range is typically 0-9, where 0 means no compression (fastest) and 9 means
+	// maximum compression (slowest). Specific meaning depends on the CompressionMethod.
 	CompressionLevel int
 
-	// EncryptionMethod specifies the encryption method
+	// Password provides the default encryption password for the entire archive.
+	// This password will be used for all encrypted files unless overridden per file.
+	Password string
+
+	// EncryptionMethod selects the encryption algorithm for the archive.
+	// Options include NotEncrypted, ZipCrypto (legacy), and AES256 (recommended).
 	EncryptionMethod EncryptionMethod
 
-	// FileSortStrategy specifies the strategy for file sorting before writing
+	// FileSortStrategy determines how files are ordered when writing the archive.
+	// Different strategies can optimize for read performance, streaming, or
+	// directory traversal efficiency.
 	FileSortStrategy FileSortStrategy
 
-	// Comment stores archive comment
+	// Comment stores an optional text comment for the entire ZIP archive.
+	// Maximum length is 65535 bytes due to ZIP format limitations.
 	Comment string
-
-	// Password stores password for encryption
-	Password string
 }
 
-// FileConfig holds configuration options for individual files in the archive
+// FileConfig defines per-file configuration options that override archive defaults.
+// These settings allow fine-grained control over individual archive entries.
 type FileConfig struct {
-	// CompressionMethod specifies the standard compression method to use
+	// Name specifies the file's path and filename within the ZIP archive.
+	// Directories shouldn't necessarily end with slashes, as they'll be added automatically.
+	Name string
+
+	// Password provides an encryption password specific to this file,
+	// overriding the archive-level password if set.
+	Password string
+
+	// CompressionMethod selects the compression algorithm for this specific file,
+	// overriding the archive default.
 	CompressionMethod CompressionMethod
 
-	// EncryptionMethod specifies the encryption method
+	// EncryptionMethod selects the encryption algorithm for this specific file,
+	// overriding the archive default.
 	EncryptionMethod EncryptionMethod
 
-	// CompressionLevel controls the compression strength (0-9).
-	// Higher values typically provide better compression at the cost of CPU time.
+	// CompressionLevel controls compression strength for this file (0-9),
+	// overriding the archive default. Higher values increase compression ratio
+	// at the cost of CPU time and memory.
 	CompressionLevel int
 
-	// Comment stores optional comment string
+	// Comment stores an optional text comment attached to this specific file.
+	// Maximum length is 65535 bytes due to ZIP format limitations.
 	Comment string
-
-	// Passwords stores a password for data encryption
-	Password string
-
-	// Name specifies the file's name and path within the archive
-	Name string
 }
 
-// AddOption defines a function type for configuring file options
-type AddOption func(f *file)
+// AddOption represents a functional option pattern for configuring File objects.
+// This pattern provides a clean, extensible API for setting file properties.
+type AddOption func(f *File)
 
-// WithConfig applies a complete FileConfig to a file
+// WithConfig applies a complete FileConfig to a File, overriding all configurable properties.
+// This is useful when you have a pre-configured FileConfig object or need to apply
+// multiple settings atomically.
 func WithConfig(c FileConfig) AddOption {
-	return func(f *file) {
+	return func(f *File) {
 		f.SetConfig(c)
 	}
 }
 
-// WithCompression sets a compression for file
+// WithCompression configures the compression method and level for a specific file.
+// This option only affects regular files (not directories) and overrides both
+// archive defaults and any previously set compression settings.
 func WithCompression(c CompressionMethod, lvl int) AddOption {
-	return func(f *file) {
+	return func(f *File) {
 		if !f.isDir {
 			f.config.CompressionMethod = c
 			f.config.CompressionLevel = lvl
@@ -76,9 +96,11 @@ func WithCompression(c CompressionMethod, lvl int) AddOption {
 	}
 }
 
-// WithEncryption sets an encryption for file
+// WithEncryption configures encryption settings for a specific file.
+// This option only affects regular files (not directories) and overrides both
+// archive defaults and any previously set encryption settings.
 func WithEncryption(e EncryptionMethod, pwd string) AddOption {
-	return func(f *file) {
+	return func(f *File) {
 		if !f.isDir {
 			f.config.EncryptionMethod = e
 			f.config.Password = pwd
@@ -86,48 +108,58 @@ func WithEncryption(e EncryptionMethod, pwd string) AddOption {
 	}
 }
 
-// WithName sets file's name and path within the archive
+// WithName sets or changes the filename and path within the ZIP archive.
+// The name is normalized to use forward slashes and cleaned to prevent directory
+// traversal issues. An empty name is ignored.
 func WithName(name string) AddOption {
-	return func(f *file) {
+	return func(f *File) {
 		if name != "" {
 			f.name = name
 		}
 	}
 }
 
-// WithPath prefixes file's path within the archive
+// WithPath prefixes the file's current name with the specified directory path.
+// This is useful for organizing files into subdirectories within the archive.
+// The path "." is treated as no path (current directory).
 func WithPath(p string) AddOption {
-	return func(f *file) {
+	return func(f *File) {
 		if p != "" && p != "." {
 			f.name = path.Join(p, f.name)
 		}
 	}
 }
 
-// WithMode sets file mode bits
+// WithMode sets the file's permission mode (Unix-style) and type bits.
+// This affects both the stored metadata and the extracted file's permissions.
+// Use fs.FileMode constants like fs.ModeDir, fs.ModePerm, etc.
+// The final values stored in zip archive are system dependent.
 func WithMode(mode fs.FileMode) AddOption {
-	return func(f *file) {
+	return func(f *File) {
 		f.mode = mode
 	}
 }
 
-// Zip represents an editable ZIP archive in memory
+// Zip represents an in-memory ZIP archive that can be created, modified, and written.
+// It provides thread-safe operations for concurrent access and supports both
+// sequential and parallel processing modes.
 type Zip struct {
-	mu            sync.RWMutex
-	config        ZipConfig
-	files         []*file
-	fileCache     map[string]bool
-	compressors   map[string]Compressor
-	decompressors map[CompressionMethod]Decompressor
-	bufferPool    sync.Pool
+	mu            sync.RWMutex          // Protects concurrent access to archive state
+	config        ZipConfig             // Global archive configuration
+	files         []*File               // List of files in the archive (including directories)
+	fileCache     map[string]bool       // Fast lookup for file existence and type detection
+	compressors   map[string]Compressor // Registry of custom compressors by "method::level"
+	decompressors map[CompressionMethod]Decompressor // Registry of custom decompressors
+	bufferPool    sync.Pool             // Reusable byte buffers for I/O operations
 }
 
-// NewZip creates a new empty ZIP archive object.
-// Note that only [Stored] and [Deflated] compression methods are supported by default.
-// You can add your implementation by using AddCompressor and AddDecompressor.
+// NewZip creates a new empty ZIP archive with default settings.
+// The returned archive supports Stored and Deflated compression methods by default.
+// Custom compression algorithms can be added using RegisterCompressor and RegisterDecompressor.
+// The archive uses a 64KB buffer pool for efficient I/O operations.
 func NewZip() *Zip {
 	return &Zip{
-		files:         make([]*file, 0),
+		files:         make([]*File, 0),
 		fileCache:     make(map[string]bool),
 		compressors:   make(map[string]Compressor),
 		decompressors: make(map[CompressionMethod]Decompressor),
@@ -140,33 +172,48 @@ func NewZip() *Zip {
 	}
 }
 
-// GetFiles returns files stored in the archive
-func (z *Zip) GetFiles() []*file {
+// GetFiles returns a slice of all files currently stored in the archive.
+// The returned slice includes both regular files and directory entries.
+// Note: The returned slice is a copy of internal references; modifications to
+// File objects may affect archive behavior.
+func (z *Zip) GetFiles() []*File {
 	return z.files
 }
 
-// SetConfig sets config for zip
+// SetConfig updates the global configuration for the ZIP archive.
+// This configuration applies to all subsequently added files unless overridden
+// by file-specific options. Thread-safe.
 func (z *Zip) SetConfig(c ZipConfig) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.config = c
 }
 
-// RegisterCompressor registers a custom compressor for a specific compression method
+// RegisterCompressor registers a custom compressor implementation for a specific
+// compression method and level combination. This is required when reading archives that
+// use compression methods not natively supported by the library.
+// The key format is "method::level" (e.g., "8::6" for method 8, level 6).
+// Thread-safe.
 func (z *Zip) RegisterCompressor(method CompressionMethod, level int, c Compressor) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.compressors[fmt.Sprintf("%d::%d", method, level)] = c
 }
 
-// RegisterDecompressor registers a custom decompressor for a specific compression method
+// RegisterDecompressor registers a custom decompressor implementation for a
+// specific compression method. This is required when reading archives that
+// use compression methods not natively supported by the library.
+// Thread-safe.
 func (z *Zip) RegisterDecompressor(method CompressionMethod, d Decompressor) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.decompressors[method] = d
 }
 
-// AddFile adds an existing open file to the archive
+// AddFile adds an existing opened file (os.File) to the archive.
+// The file's current position is used for reading; the caller is responsible
+// for opening and closing the file. File metadata (size, mod time, etc.) is
+// extracted from the os.File handle.
 func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	if f == nil {
 		return errors.New("file cannot be nil")
@@ -178,8 +225,9 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 	return z.addEntry(fileEntry, options)
 }
 
-// AddFromPath adds a file specified by fsPath.
-// This is the preferred method as it manages file descriptors efficiently.
+// AddFromPath adds a file from the local filesystem to the archive.
+// The file is opened, read, and closed automatically. The original filename
+// is used unless overridden by WithName or WithPath options.
 func (z *Zip) AddFromPath(path string, options ...AddOption) error {
 	fileEntry, err := newFileFromPath(path)
 	if err != nil {
@@ -188,9 +236,12 @@ func (z *Zip) AddFromPath(path string, options ...AddOption) error {
 	return z.addEntry(fileEntry, options)
 }
 
-// AddFromDir recursively adds files from a directory
+// AddFromDir recursively adds all files and directories from a filesystem directory
+// to the archive. The directory structure is preserved within the archive.
+// Symbolic links are followed. The root directory itself is not included;
+// only its contents are added.
 func (z *Zip) AddFromDir(path string, options ...AddOption) error {
-	return filepath.WalkDir(path, func(walkPath string, d fs.DirEntry, err error) error {
+	return filepath.WalkDir(path, func(walkPath string, _ fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -212,25 +263,21 @@ func (z *Zip) AddFromDir(path string, options ...AddOption) error {
 	})
 }
 
-// AddReader adds a file from an io.Reader
+// AddReader adds file content from an arbitrary io.Reader to the archive.
+// This is useful for adding dynamically generated content or reading from network streams.
 func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) error {
-	if r == nil {
-		return errors.New("reader cannot be nil")
+	fileEntry, err := newFileFromReader(r, filename)
+	if err != nil {
+		return err
 	}
-	if filename == "" {
-		return errors.New("filename cannot be empty")
-	}
-
-	fileEntry, _ := newFileFromReader(r, filename)
 	return z.addEntry(fileEntry, options)
 }
 
-// CreateDirectory adds a directory entry to the ZIP archive
+// CreateDirectory adds an explicit directory entry to the ZIP archive.
+// While directories are often created implicitly when files are added with
+// path components, this method allows creating empty directories or
+// directories with specific metadata (permissions, timestamps).
 func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
-	if name == "" {
-		return errors.New("directory name cannot be empty")
-	}
-
 	dirEntry, err := newDirectoryFile(name)
 	if err != nil {
 		return fmt.Errorf("create directory file: %w", err)
@@ -238,7 +285,11 @@ func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
 	return z.addEntry(dirEntry, options)
 }
 
-// Exists checks if file or directory with given name exists
+// Exists checks whether a file or directory with the given name exists in the archive.
+// The name should use forward slashes as directory separators and will be
+// normalized for comparison. Returns true for both exact matches and
+// directory matches (e.g., "dir/" matches when checking for "dir").
+// Thread-safe for concurrent reads.
 func (z *Zip) Exists(name string) bool {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
@@ -247,19 +298,18 @@ func (z *Zip) Exists(name string) bool {
 	return z.fileCache[key] || z.fileCache[key+"/"]
 }
 
-// Write writes the archive sequentially to dest.
-// It's more memory efficient compared to parallel version.
-// If dest implements [io.Seeker], file source will be written
-// to dest without creating temp file when possible.
+// Write serializes the entire ZIP archive to the destination writer.
+// This method processes files sequentially, making it more memory-efficient
+// than WriteParallel for most use cases. If dest implements io.Seeker,
+// the implementation can optimize by writing directly without temporary files.
+// Files are sorted according to the configured FileSortStrategy before writing.
 func (z *Zip) Write(dest io.Writer) error {
 	z.mu.RLock()
-	filesSnapshot := make([]*file, len(z.files))
-	copy(filesSnapshot, z.files)
+	files := SortFilesOptimized(z.files, z.config.FileSortStrategy)
 	z.mu.RUnlock()
 
 	writer := newZipWriter(z.config, z.compressors, dest)
-	sortedFiles := SortFilesOptimized(filesSnapshot, z.config.FileSortStrategy)
-	for _, file := range sortedFiles {
+	for _, file := range files {
 		if err := writer.WriteFile(file); err != nil {
 			return fmt.Errorf("write file %s: %w", file.name, err)
 		}
@@ -267,17 +317,18 @@ func (z *Zip) Write(dest io.Writer) error {
 	return writer.WriteCentralDirAndEndRecords()
 }
 
-// WriteParallel writes the archive using multiple workers.
-// Temp files and memory buffers are used to store compressed data before writing.
+// WriteParallel serializes the ZIP archive using concurrent workers for compression.
+// This method can significantly improve performance on multi-core systems when
+// compressing many files. Temporary files and memory buffers are used to store
+// compressed data before final sequential writing to maintain ZIP format correctness.
+// maxWorkers controls the maximum number of concurrent compression operations.
 func (z *Zip) WriteParallel(dest io.Writer, maxWorkers int) error {
 	z.mu.RLock()
-	filesSnapshot := make([]*file, len(z.files))
-	copy(filesSnapshot, z.files)
+	files := SortFilesOptimized(z.files, z.config.FileSortStrategy)
 	z.mu.RUnlock()
 
 	writer := newParallelZipWriter(z.config, z.compressors, dest, maxWorkers)
-	sortedFiles := SortFilesOptimized(filesSnapshot, z.config.FileSortStrategy)
-	errs := writer.WriteFiles(sortedFiles)
+	errs := writer.WriteFiles(files)
 
 	if err := writer.zw.WriteCentralDirAndEndRecords(); err != nil {
 		errs = append(errs, err)
@@ -288,7 +339,9 @@ func (z *Zip) WriteParallel(dest io.Writer, maxWorkers int) error {
 	return nil
 }
 
-// Read reads the archive and appends its files to struct files
+// Read parses an existing ZIP archive from the source and appends its contents
+// to the current archive. This allows merging archives or inspecting existing ones.
+// The source must be seekable (io.ReadSeeker) for random access to ZIP structures.
 func (z *Zip) Read(src io.ReadSeeker) error {
 	reader := newZipReader(src, z.decompressors)
 	files, err := reader.ReadFiles()
@@ -296,15 +349,22 @@ func (z *Zip) Read(src io.ReadSeeker) error {
 	return err
 }
 
-// Extract sequentially extracts all files stored in archive to the disk at the given path
+// Extract sequentially extracts all files from the archive to the specified directory.
+// Directory structure is preserved, and file permissions/timestamps are restored
+// when supported by the host filesystem. Path traversal attacks are prevented
+// by validating extracted paths. Returns combined errors if any extraction fails.
 func (z *Zip) Extract(path string) error {
-	// Alphabetical sort guarantees the right order of directories
-	files := sortAlphabetical(z.files)
 	path = filepath.Clean(path)
 	var errs []error
 
+	z.mu.RLock()
+	files := sortAlphabetical(z.files)
+	z.mu.RUnlock()
+
 	for _, f := range files {
-		f.config.Password = z.config.Password
+		if f.config.Password == "" {
+			f.config.Password = z.config.Password
+		}
 		fpath := filepath.Join(path, f.name)
 
 		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
@@ -317,9 +377,8 @@ func (z *Zip) Extract(path string) error {
 			}
 			continue
 		}
-
 		if err := z.extractFile(f, fpath); err != nil {
-			errs = append(errs, fmt.Errorf("failed to extract %s: %w", f.name, err))
+			errs = append(errs, fmt.Errorf("failed to extract %s: %w", fpath, err))
 		}
 	}
 
@@ -329,25 +388,32 @@ func (z *Zip) Extract(path string) error {
 	return nil
 }
 
-// Extract parallel extracts all files stored in archive using multiple workers
+// ExtractParallel extracts archive contents using multiple concurrent workers.
+// This can significantly improve extraction speed for archives with many files,
+// especially on SSDs or fast storage systems. Directory creation is performed
+// upfront, then file extraction is parallelized with controlled concurrency.
 func (z *Zip) ExtractParallel(path string, workers int) error {
 	path = filepath.Clean(path)
+	var errs []error
 
-	var filesToExtract []*file
+	var filesToExtract []*File
 	dirsToCreate := make(map[string]struct{})
 	dirsToCreate[path] = struct{}{}
 
-	var errs []error
+	z.mu.RLock()
+	files := sortAlphabetical(z.files)
+	z.mu.RUnlock()
 
-	for _, f := range z.files {
-		f.config.Password = z.config.Password
+	for _, f := range files {
+		if f.config.Password == "" {
+			f.config.Password = z.config.Password
+		}
 		fpath := filepath.Join(path, f.name)
 
 		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
 			errs = append(errs, fmt.Errorf("illegal file path: %s", fpath))
 			continue
 		}
-
 		if f.isDir {
 			dirsToCreate[fpath] = struct{}{}
 			continue
@@ -375,7 +441,7 @@ func (z *Zip) ExtractParallel(path string, workers int) error {
 		wg.Add(1)
 		sem <- struct{}{}
 
-		go func(f *file) {
+		go func(f *File) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
@@ -392,18 +458,19 @@ func (z *Zip) ExtractParallel(path string, workers int) error {
 	for err := range errChan {
 		errs = append(errs, err)
 	}
-
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
-
 	return nil
 }
 
 // Internal helpers
 
-// addEntry verifies validity and adds file to the archive
-func (z *Zip) addEntry(f *file, options []AddOption) error {
+// addEntry is an internal validator used to add files to archive.
+// It applies configuration defaults, processes AddOptions, normalizes the filename,
+// checks for duplicates and path collisions, creates implicit directories, and
+// updates internal data structures. Thread-safe.
+func (z *Zip) addEntry(f *File, options []AddOption) error {
 	if !f.isDir {
 		f.config.CompressionMethod = z.config.CompressionMethod
 		f.config.CompressionLevel = z.config.CompressionLevel
@@ -433,15 +500,15 @@ func (z *Zip) addEntry(f *file, options []AddOption) error {
 	}
 
 	z.files = append(z.files, f)
-	if f.isDir {
-		z.fileCache[f.name+"/"] = true
-	} else {
-		z.fileCache[f.name] = true
-	}
+	z.fileCache[f.getFilename()] = true
 	return nil
 }
 
-// createMissingDirs creates missing directories according to path
+// createMissingDirs ensures that all parent directories for a file path exist
+// in the archive by creating implicit directory entries when necessary.
+// It traverses the path from bottom to top, creating missing directories and
+// checking for file/directory conflicts. Returns an error if a path component
+// already exists as a regular file.
 func (z *Zip) createMissingDirs(filePath string) error {
 	dir := path.Dir(filePath)
 	if dir == "." || dir == "/" {
@@ -464,22 +531,22 @@ func (z *Zip) createMissingDirs(filePath string) error {
 	}
 
 	for i := len(missingDirs) - 1; i >= 0; i-- {
-		missingDir := missingDirs[i]
-
-		dirEntry, err := newDirectoryFile(missingDir)
+		dirEntry, err := newDirectoryFile(missingDirs[i])
 		if err != nil {
 			return err
 		}
-
 		z.files = append(z.files, dirEntry)
-		z.fileCache[missingDir+"/"] = true
+		z.fileCache[missingDirs[i]+"/"] = true
 	}
 
 	return nil
 }
 
-// extractFile extracts single file to disk
-func (z *Zip) extractFile(f *file, path string) error {
+// extractFile handles the extraction of a single file from the archive to disk.
+// It opens the file from the archive, creates the destination file, copies data
+// with buffered I/O, and sets permissions and timestamps. Uses the shared buffer
+// pool for efficient memory allocation.
+func (z *Zip) extractFile(f *File, path string) error {
 	src, err := f.Open()
 	if err != nil {
 		return err
@@ -490,10 +557,10 @@ func (z *Zip) extractFile(f *file, path string) error {
 	if err != nil {
 		return err
 	}
+	defer dst.Close()
 
 	if f.uncompressedSize > 0 {
 		if err := dst.Truncate(f.uncompressedSize); err != nil {
-			dst.Close()
 			return err
 		}
 	}
@@ -503,11 +570,6 @@ func (z *Zip) extractFile(f *file, path string) error {
 	z.bufferPool.Put(bufPtr)
 
 	if err != nil {
-		dst.Close()
-		return err
-	}
-
-	if err := dst.Close(); err != nil {
 		return err
 	}
 

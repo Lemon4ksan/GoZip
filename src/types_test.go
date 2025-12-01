@@ -118,10 +118,10 @@ func TestLocalFileHeader_Encode(t *testing.T) {
 // TestCentralDirectory_Encode tests the updated encode method with Filename, ExtraFields, and Comment
 func TestCentralDirectory_Encode(t *testing.T) {
 	extraData := []byte{0x01, 0x02, 0x03} // Fake extra data
-	
+
 	tests := []struct {
-		name     string
-		entry    centralDirectory
+		name             string
+		entry            centralDirectory
 		expectedFilename string
 		expectedComment  string
 	}{
@@ -221,7 +221,7 @@ func TestEndOfCentralDir_Encode(t *testing.T) {
 	}
 
 	buf := bytes.NewReader(encoded)
-	
+
 	// Check Signature
 	var signature uint32
 	binary.Read(buf, binary.LittleEndian, &signature)
@@ -250,22 +250,22 @@ func TestEndOfCentralDir_Encode(t *testing.T) {
 func TestIntegration_FileToHeaders(t *testing.T) {
 	tests := []struct {
 		name     string
-		file     *file
+		file     *File
 		expected string // Expected string in the encoded bytes
 	}{
 		{
-			name: "Normal File",
-			file: &file{name: "doc.txt", isDir: false},
+			name:     "Normal File",
+			file:     &File{name: "doc.txt", isDir: false},
 			expected: "doc.txt",
 		},
 		{
-			name: "Directory (Should have slash)",
-			file: &file{name: "images", isDir: true},
+			name:     "Directory (Should have slash)",
+			file:     &File{name: "images", isDir: true},
 			expected: "images/",
 		},
 		{
-			name: "Nested Directory",
-			file: &file{name: "src/main", isDir: true},
+			name:     "Nested Directory",
+			file:     &File{name: "src/main", isDir: true},
 			expected: "src/main/",
 		},
 	}
@@ -274,10 +274,10 @@ func TestIntegration_FileToHeaders(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// 1. Create headers using the logic in file.go
 			h := newZipHeaders(tt.file)
-			
+
 			// 2. Encode Local Header
 			localEncoded := h.LocalHeader().encode()
-			
+
 			// Verify Filename is present in bytes
 			if !bytes.Contains(localEncoded, []byte(tt.expected)) {
 				t.Errorf("Local Header bytes did not contain filename %q", tt.expected)
@@ -296,8 +296,8 @@ func TestIntegration_FileToHeaders(t *testing.T) {
 // TestZip64Records tests the structure of Zip64 specific records
 func TestZip64Records(t *testing.T) {
 	t.Run("Zip64 End Of Central Directory", func(t *testing.T) {
-		encoded := encodeZip64EndOfCentralDirectoryRecord(100, 5000, 10000)
-		
+		encoded := encodeZip64EndOfCentralDirRecord(100, 5000, 10000)
+
 		if len(encoded) != 56 {
 			t.Errorf("Zip64 EOCD size mismatch: got %d, want 56", len(encoded))
 		}
@@ -306,7 +306,7 @@ func TestZip64Records(t *testing.T) {
 		if sig != __ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE {
 			t.Errorf("Signature mismatch")
 		}
-		
+
 		sizeOfRest := binary.LittleEndian.Uint64(encoded[4:12])
 		if sizeOfRest != 44 {
 			t.Errorf("Size of rest mismatch: got %d, want 44", sizeOfRest)
@@ -314,8 +314,8 @@ func TestZip64Records(t *testing.T) {
 	})
 
 	t.Run("Zip64 Locator", func(t *testing.T) {
-		encoded := encodeZip64EndOfCentralDirectoryLocator(9999)
-		
+		encoded := encodeZip64EndOfCentralDirLocator(9999)
+
 		if len(encoded) != 20 {
 			t.Errorf("Zip64 Locator size mismatch: got %d, want 20", len(encoded))
 		}

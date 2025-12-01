@@ -6,10 +6,10 @@ import (
 )
 
 // Benchmark data generators
-func generateSmallFiles(count int) []*file {
-	files := make([]*file, count)
+func generateSmallFiles(count int) []*File {
+	files := make([]*File, count)
 	for i := range count {
-		files[i] = &file{
+		files[i] = &File{
 			name:             "small_file.txt",
 			uncompressedSize: int64(rand.Intn(10 * 1024 * 1024)), // 0-10MB
 		}
@@ -17,8 +17,8 @@ func generateSmallFiles(count int) []*file {
 	return files
 }
 
-func generateMixedFiles(count int) []*file {
-	files := make([]*file, count)
+func generateMixedFiles(count int) []*File {
+	files := make([]*File, count)
 	for i := range count {
 		var size int64
 		switch rand.Intn(100) {
@@ -29,7 +29,7 @@ func generateMixedFiles(count int) []*file {
 		default: // 95% small files (<100MB)
 			size = int64(rand.Intn(100 * 1024 * 1024))
 		}
-		files[i] = &file{
+		files[i] = &File{
 			name:             "mixed_file.txt",
 			uncompressedSize: size,
 		}
@@ -37,10 +37,10 @@ func generateMixedFiles(count int) []*file {
 	return files
 }
 
-func generateLargeFiles(count int) []*file {
-	files := make([]*file, count)
+func generateLargeFiles(count int) []*File {
+	files := make([]*File, count)
 	for i := range count {
-		files[i] = &file{
+		files[i] = &File{
 			name:             "large_file.bin",
 			uncompressedSize: 1<<32 + int64(rand.Intn(10*1024*1024*1024)), // 4GB+
 		}
@@ -138,14 +138,14 @@ func BenchmarkSortMemory_ZIP64Optimized(b *testing.B) {
 
 // Edge case benchmarks
 func BenchmarkSortEmpty(b *testing.B) {
-	files := []*file{}
+	files := []*File{}
 	for b.Loop() {
 		SortFilesOptimized(files, SortLargeFilesLast)
 	}
 }
 
 func BenchmarkSortSingleFile(b *testing.B) {
-	files := []*file{{name: "single.txt", uncompressedSize: 1024}}
+	files := []*File{{name: "single.txt", uncompressedSize: 1024}}
 	for b.Loop() {
 		SortFilesOptimized(files, SortLargeFilesLast)
 	}
@@ -161,7 +161,7 @@ func BenchmarkSortAllLargeFiles(b *testing.B) {
 func BenchmarkSortComparative(b *testing.B) {
 	testCases := []struct {
 		name     string
-		files    []*file
+		files    []*File
 		strategy FileSortStrategy
 	}{
 		{"SmallFiles_LargeLast", generateSmallFiles(10000), SortLargeFilesLast},

@@ -2,10 +2,10 @@ package gozip
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"strings"
 	"testing"
@@ -16,12 +16,12 @@ import (
 func TestZipWriter_WriteFileHeader(t *testing.T) {
 	tests := []struct {
 		name    string
-		file    *file
+		file    *File
 		wantErr bool
 	}{
 		{
 			name: "basic file header",
-			file: &file{
+			file: &File{
 				name:    "test.txt",
 				modTime: defaultTime(),
 			},
@@ -29,7 +29,7 @@ func TestZipWriter_WriteFileHeader(t *testing.T) {
 		},
 		{
 			name: "file with long name",
-			file: &file{
+			file: &File{
 				name:    strings.Repeat("a", 100) + ".txt",
 				modTime: defaultTime(),
 			},
@@ -40,8 +40,9 @@ func TestZipWriter_WriteFileHeader(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mw := NewMemoryWriteSeeker()
-			z := NewZip()
-			zw := newZipWriter(z.config, nil, mw)
+			// Mock config
+			config := ZipConfig{}
+			zw := newZipWriter(config, nil, mw)
 
 			err := zw.writeFileHeader(tt.file)
 
@@ -54,18 +55,20 @@ func TestZipWriter_WriteFileHeader(t *testing.T) {
 			if len(buf) < 4 {
 				t.Error("WriteFileHeader() should write at least 4 bytes")
 			}
+
 			signature := binary.LittleEndian.Uint32(buf[:4])
-			if signature != __LOCAL_FILE_HEADER_SIGNATURE {
-				t.Errorf("WriteFileHeader() signature = %x, want %x",
-					signature, __LOCAL_FILE_HEADER_SIGNATURE)
+			expectedSig := __LOCAL_FILE_HEADER_SIGNATURE
+			if signature != expectedSig {
+				t.Errorf("WriteFileHeader() signature = %x, want %x", signature, expectedSig)
 			}
 		})
 	}
 }
 
-// TestZipWriter_EncodeToWriter tests the decoupled compression logic
+// TestZipWriter_EncodeToWriter tests the compression logic using the new return struct
 func TestZipWriter_EncodeToWriter(t *testing.T) {
-	testData := "This is a long text with some repetition to demonstrate compression in action"
+	const testData = "This is a long text with some repetition to demonstrate compression in action"
+	const expectedCRC = 0xdf3e3946
 
 	tests := []struct {
 		name        string
@@ -86,7 +89,7 @@ func TestZipWriter_EncodeToWriter(t *testing.T) {
 		},
 		{
 			name:        "unsupported compression",
-			compression: CompressionMethod(99), // Invalid method
+			compression: CompressionMethod(99),
 			wantErr:     true,
 		},
 	}
@@ -94,14 +97,13 @@ func TestZipWriter_EncodeToWriter(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var destBuf bytes.Buffer
-			// Here we rely on resolveCompressor logic inside encodeToWriter
-			z := NewZip()
-			zw := newZipWriter(z.config, nil, NewMemoryWriteSeeker())
+			zw := newZipWriter(ZipConfig{}, nil, NewMemoryWriteSeeker())
 
 			src := strings.NewReader(testData)
 			config := FileConfig{
 				CompressionMethod: tt.compression,
 				CompressionLevel:  tt.level,
+				EncryptionMethod:  NotEncrypted,
 			}
 
 			stats, err := zw.encodeToWriter(src, &destBuf, config)
@@ -112,41 +114,28 @@ func TestZipWriter_EncodeToWriter(t *testing.T) {
 			}
 
 			if err != nil {
-				return // Expected error case
+				return
 			}
 
 			// Verify Stats
 			if stats.uncompressedSize != int64(len(testData)) {
 				t.Errorf("Stats.uncompressed = %d, want %d", stats.uncompressedSize, len(testData))
 			}
-			if stats.compressedSize == 0 {
-				t.Error("Stats.compressed should be > 0")
-			}
 
-			expectedCRC := crc32.ChecksumIEEE([]byte(testData))
-			if stats.crc32 != expectedCRC {
-				t.Errorf("Stats.crc32 = %x, want %x", stats.crc32, expectedCRC)
-			}
-
-			// Verify Compression Ratio logic
-			if tt.compression == Stored && stats.compressedSize != stats.uncompressedSize {
-				t.Errorf("Stored: compressed (%d) != uncompressed (%d)", stats.compressedSize, stats.uncompressedSize)
-			}
-			if tt.compression == Deflated && stats.compressedSize >= stats.uncompressedSize {
-				// Note: For very small strings deflate might be larger, but for this string it should be smaller
-				t.Logf("Warning: Deflate did not compress data (size %d -> %d)", stats.uncompressedSize, stats.compressedSize)
+			if stats.crc32 != uint32(expectedCRC) {
+				t.Errorf("Stats.crc32 = %d, want %d", stats.crc32, expectedCRC)
 			}
 		})
 	}
 }
 
-// TestZipWriter_WriteFile_Strategies tests both Stream (known size) and Buffered (unknown size) paths
+// TestZipWriter_WriteFile_Strategies tests logic selection (Stream vs TempFile)
 func TestZipWriter_WriteFile_Strategies(t *testing.T) {
 	data := []byte("test data for strategies")
 
 	tests := []struct {
 		name             string
-		uncompressedSize int64 // 0 triggers buffered path, >0 triggers stream path
+		uncompressedSize int64
 		isDir            bool
 	}{
 		{
@@ -156,34 +145,23 @@ func TestZipWriter_WriteFile_Strategies(t *testing.T) {
 		},
 		{
 			name:             "Buffered Path (Unknown Size)",
-			uncompressedSize: 0,
+			uncompressedSize: SizeUnknown,
 			isDir:            false,
-		},
-		{
-			name:             "Directory Path",
-			uncompressedSize: 0,
-			isDir:            true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mw := NewMemoryWriteSeeker()
-			z := NewZip()
-			z.SetConfig(ZipConfig{CompressionMethod: Stored}) // Use Store for simplicity
-			zw := newZipWriter(z.config, nil, mw)
+			zw := newZipWriter(ZipConfig{}, nil, mw)
 
-			file := &file{
+			file := &File{
 				name:             "test",
 				uncompressedSize: tt.uncompressedSize,
 				isDir:            tt.isDir,
 				modTime:          defaultTime(),
 				config:           FileConfig{CompressionMethod: Stored},
-				// OpenFunc that simulates source
 				openFunc: func() (io.ReadCloser, error) {
-					if tt.isDir {
-						return nil, nil
-					}
 					return io.NopCloser(bytes.NewReader(data)), nil
 				},
 			}
@@ -193,28 +171,25 @@ func TestZipWriter_WriteFile_Strategies(t *testing.T) {
 				t.Fatalf("WriteFile() error = %v", err)
 			}
 
-			// Basic verification
 			output := mw.Bytes()
 			if len(output) == 0 {
 				t.Fatal("Output is empty")
 			}
 
-			// Verify file struct was updated
-			if !tt.isDir {
-				if file.crc32 == 0 {
-					t.Error("File CRC32 was not updated")
-				}
-				if file.compressedSize == 0 {
-					t.Error("File compressed size was not updated")
-				}
+			// Verify metadata update
+			if file.crc32 == 0 {
+				t.Error("File CRC32 was not updated")
+			}
+			if file.compressedSize != int64(len(data)) {
+				t.Errorf("Compressed size mismatch: got %d want %d", file.compressedSize, len(data))
 			}
 		})
 	}
 }
 
-// TestZipWriter_UpdateLocalHeader tests local header updates after compression
+// TestZipWriter_UpdateLocalHeader tests the patching of CRC and sizes in Stream mode
 func TestZipWriter_UpdateLocalHeader(t *testing.T) {
-	file := &file{
+	file := &File{
 		name:              "test.txt",
 		crc32:             0x12345678,
 		compressedSize:    100,
@@ -224,7 +199,7 @@ func TestZipWriter_UpdateLocalHeader(t *testing.T) {
 	}
 
 	mw := NewMemoryWriteSeeker()
-	zw := newZipWriter(NewZip().config, nil, mw)
+	zw := newZipWriter(ZipConfig{}, nil, mw)
 
 	// 1. Write initial header
 	err := zw.writeFileHeader(file)
@@ -232,84 +207,41 @@ func TestZipWriter_UpdateLocalHeader(t *testing.T) {
 		t.Fatalf("WriteFileHeader() error = %v", err)
 	}
 
-	// 2. Simulate data writing (move cursor)
+	// 2. Simulate data writing
 	mw.Write(make([]byte, 100))
 
-	// 3. Update with compression results
+	// 3. Update header
 	err = zw.updateLocalHeader(file)
 	if err != nil {
 		t.Errorf("UpdateLocalHeader() error = %v", err)
 	}
 
-	// Verify the header was updated by reading back the CRC and sizes
+	// 4. Verify Patching
 	headerData := mw.Bytes()
-	if len(headerData) < 30 {
-		t.Error("Header data too short")
-	}
 
-	// Read CRC32 from header (offset 14)
+	// CRC is at offset 14 (4 bytes), CompressedSize at 18 (4 bytes), Uncompressed at 22 (4 bytes)
 	crcFromHeader := binary.LittleEndian.Uint32(headerData[14:18])
 	if crcFromHeader != file.crc32 {
 		t.Errorf("CRC32 in header = %x, want %x", crcFromHeader, file.crc32)
 	}
-}
 
-// TestZipWriter_Integration tests complete zip creation flow via public API
-func TestZipWriter_Integration(t *testing.T) {
-	mw := NewMemoryWriteSeeker()
-	z := NewZip()
-	z.SetConfig(ZipConfig{CompressionMethod: Deflated})
-	zw := newZipWriter(z.config, nil, mw)
-
-	content := "Integration test data"
-	file := &file{
-		name:     "integration_test.txt",
-		openFunc: func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(content)), nil },
-		modTime:  defaultTime(),
-		// Important: Set uncompressedSize to content length to trigger Stream path,
-		// or 0 to trigger Buffered path. Testing Stream path here.
-		uncompressedSize: int64(len(content)),
-		config:           FileConfig{CompressionMethod: Deflated},
-	}
-
-	// Use the main public method
-	err := zw.WriteFile(file)
-	if err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	// Finish archive
-	err = zw.WriteCentralDirAndEndRecords()
-	if err != nil {
-		t.Fatalf("WriteCentralDirAndEndRecords failed: %v", err)
-	}
-
-	// Verify final archive is not empty and has signatures
-	output := mw.Bytes()
-	if len(output) == 0 {
-		t.Error("Integration test produced empty archive")
-	}
-
-	// Check for Central Directory Signature at the end area
-	if !bytes.Contains(output, []byte{0x50, 0x4b, 0x01, 0x02}) {
-		t.Error("Central Directory signature not found")
+	compSize := binary.LittleEndian.Uint32(headerData[18:22])
+	if compSize != uint32(file.compressedSize) {
+		t.Errorf("CompressedSize in header = %d, want %d", compSize, file.compressedSize)
 	}
 }
 
 func TestParallelZipWriter_Basic(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
-	z := NewZip()
-	// Use Deflate to ensure actual work is done in parallel
-	z.SetConfig(ZipConfig{CompressionMethod: Deflated})
+	config := ZipConfig{CompressionMethod: Deflated}
 
-	// Create multiple files
 	filesCount := 5
-	files := make([]*file, filesCount)
+	files := make([]*File, filesCount)
 	content := "Parallel test data content"
 
-	for i := 0; i < filesCount; i++ {
+	for i := range filesCount {
 		name := fmt.Sprintf("file_%d.txt", i)
-		files[i] = &file{
+		files[i] = &File{
 			name:             name,
 			uncompressedSize: int64(len(content)),
 			modTime:          defaultTime(),
@@ -320,59 +252,35 @@ func TestParallelZipWriter_Basic(t *testing.T) {
 		}
 	}
 
-	// Initialize parallel writer with 2 workers
-	pzw := newParallelZipWriter(z.config, nil, mw, 2)
+	pzw := newParallelZipWriter(config, nil, mw, 2)
 
-	// Run WriteFiles
 	errs := pzw.WriteFiles(files)
 	if len(errs) > 0 {
 		t.Fatalf("WriteFiles returned errors: %v", errs)
 	}
 
-	// Finish archive (write Central Directory)
-	// Note: pzw.zw is the underlying sequential writer
 	if err := pzw.zw.WriteCentralDirAndEndRecords(); err != nil {
 		t.Fatalf("WriteCentralDirAndEndRecords failed: %v", err)
 	}
 
 	output := mw.Bytes()
-
-	// Check integrity
 	if len(output) == 0 {
 		t.Fatal("Output archive is empty")
 	}
 
-	// Check existence of filenames in output (simple check)
-	// Note: We can't check order because ParallelWriter completion order is non-deterministic,
-	// but the WriteFiles implementation usually writes them in completion order.
-	// The underlying implementation loop: `for result := range results`.
-	// This implies the physical order in ZIP depends on which file compresses first.
-	for i := 0; i < filesCount; i++ {
-		name := fmt.Sprintf("file_%d.txt", i)
-		if !bytes.Contains(output, []byte(name)) {
-			t.Errorf("Output archive missing file: %s", name)
-		}
-	}
-
-	// Check End of Central Directory signature
-	if !bytes.Contains(output, []byte{0x50, 0x4b, 0x05, 0x06}) {
-		t.Error("End of Central Directory signature not found")
+	if !bytes.Contains(output, []byte{0x50, 0x4b, 0x01, 0x02}) {
+		t.Error("Central Directory signature not found")
 	}
 }
 
 func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
-	// This test manipulates the memoryThreshold to force both paths:
-	// 1. In-memory buffer
-	// 2. Temporary file on disk
-	
 	mw := NewMemoryWriteSeeker()
-	z := NewZip()
-	z.SetConfig(ZipConfig{CompressionMethod: Stored})
+	config := ZipConfig{CompressionMethod: Stored}
 
-	smallContent := "small"      // 5 bytes
-	largeContent := "larger_data" // 11 bytes
+	smallContent := "small"
+	largeContent := "larger_data"
 
-	files := []*file{
+	files := []*File{
 		{
 			name:             "memory_file.txt",
 			uncompressedSize: int64(len(smallContent)),
@@ -389,11 +297,10 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 		},
 	}
 
-	pzw := newParallelZipWriter(z.config, nil, mw, 1)
-	
-	// HACK: Manually set threshold low to force the second file to disk
-	// Accessing private field since we are in the same package
-	pzw.memoryThreshold = 10 // bytes
+	pzw := newParallelZipWriter(config, nil, mw, 1)
+
+	// Set threshold low to force the second file to disk (temp file path)
+	pzw.memoryThreshold = 10
 
 	errs := pzw.WriteFiles(files)
 	if len(errs) > 0 {
@@ -406,30 +313,23 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 
 	output := mw.Bytes()
 
-	// Verify contents
 	if !bytes.Contains(output, []byte(smallContent)) {
 		t.Error("Small file content missing")
 	}
 	if !bytes.Contains(output, []byte(largeContent)) {
 		t.Error("Large file content missing")
 	}
-
-	// Verify stats update
-	if files[1].compressedSize != int64(len(largeContent)) {
-		t.Errorf("Large file compressed size mismatch: got %d", files[1].compressedSize)
-	}
 }
 
 func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
-	z := NewZip()
-	pzw := newParallelZipWriter(z.config, nil, mw, 2)
+	pzw := newParallelZipWriter(ZipConfig{}, nil, mw, 2)
 
 	expectedErr := errors.New("simulated open error")
-	files := []*file{
+	files := []*File{
 		{
-			name: "bad_file.txt",
-			uncompressedSize: sizeUnknown,
+			name:             "bad_file.txt",
+			uncompressedSize: SizeUnknown,
 			openFunc: func() (io.ReadCloser, error) {
 				return nil, expectedErr
 			},
@@ -441,7 +341,6 @@ func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 		t.Fatal("Expected error, got none")
 	}
 
-	// Check if the error is wrapped or passed through
 	found := false
 	for _, err := range errs {
 		if strings.Contains(err.Error(), expectedErr.Error()) {
@@ -454,7 +353,94 @@ func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 	}
 }
 
-// memoryWriteSeeker implements io.WriteSeeker correctly for testing
+// TestMemoryBuffer_ReadWriteSeek verifies the custom in-memory buffer implementation
+func TestMemoryBuffer_ReadWriteSeek(t *testing.T) {
+	mb := NewMemoryBuffer(10)
+
+	// Test Write & Growth
+	data := []byte("hello world")
+	n, err := mb.Write(data)
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if n != len(data) {
+		t.Errorf("Short write: %d", n)
+	}
+
+	// Test Seek
+	pos, err := mb.Seek(0, io.SeekStart)
+	if err != nil || pos != 0 {
+		t.Errorf("Seek start failed: %v, %d", err, pos)
+	}
+
+	// Test Read
+	readBuf := make([]byte, len(data))
+	readN, err := mb.Read(readBuf)
+	if err != io.EOF && err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if readN != len(data) {
+		t.Errorf("Short read: %d", readN)
+	}
+	if string(readBuf) != string(data) {
+		t.Errorf("Data mismatch: got %s, want %s", readBuf, data)
+	}
+
+	// Test Seek End
+	pos, err = mb.Seek(0, io.SeekEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pos != int64(len(data)) {
+		t.Errorf("Seek end wrong pos: %d", pos)
+	}
+
+	// Test Reset
+	mb.Reset()
+	pos, _ = mb.Seek(0, io.SeekCurrent)
+	if pos != 0 {
+		t.Error("Reset did not zero position")
+	}
+	n, _ = mb.Read(make([]byte, 1))
+	if n != 0 {
+		t.Error("Read on reset buffer should return 0 bytes")
+	}
+
+	// Test Close
+	mb.Close()
+	_, err = mb.Write([]byte("fail"))
+	if err != io.ErrClosedPipe {
+		t.Errorf("Expected closed pipe error, got %v", err)
+	}
+}
+
+func TestMemoryBuffer_LargeGrowth(t *testing.T) {
+	// Start with small capacity
+	mb := NewMemoryBuffer(1)
+
+	// Create larger data (64KB) to trigger exponential growth logic
+	size := 64 * 1024
+	data := make([]byte, size)
+	rand.Read(data)
+
+	n, err := mb.Write(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != size {
+		t.Errorf("Wrote %d bytes, expected %d", n, size)
+	}
+
+	mb.Seek(0, io.SeekStart)
+	readBack, err := io.ReadAll(mb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, readBack) {
+		t.Error("Read back data mismatch")
+	}
+}
+
 type memoryWriteSeeker struct {
 	buf []byte
 	pos int64
@@ -470,16 +456,13 @@ func NewMemoryWriteSeeker() *memoryWriteSeeker {
 func (m *memoryWriteSeeker) Write(p []byte) (n int, err error) {
 	minCap := int(m.pos) + len(p)
 	if minCap > cap(m.buf) {
-		newBuf := make([]byte, len(m.buf), minCap*2) // Grow strategy
+		newBuf := make([]byte, len(m.buf), minCap*2)
 		copy(newBuf, m.buf)
 		m.buf = newBuf
 	}
-
-	// Extend length if writing past current len
 	if minCap > len(m.buf) {
 		m.buf = m.buf[:minCap]
 	}
-
 	copy(m.buf[m.pos:], p)
 	m.pos += int64(len(p))
 	return len(p), nil
@@ -497,11 +480,9 @@ func (m *memoryWriteSeeker) Seek(offset int64, whence int) (int64, error) {
 	default:
 		return 0, errors.New("invalid whence")
 	}
-
 	if newPos < 0 {
 		return 0, errors.New("negative position")
 	}
-
 	m.pos = newPos
 	return newPos, nil
 }

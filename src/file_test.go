@@ -66,7 +66,7 @@ func TestNewDirectoryFile(t *testing.T) {
 }
 
 func TestFileSetters(t *testing.T) {
-	file := &file{}
+	file := &File{}
 
 	config := FileConfig{
 		CompressionMethod: Deflated,
@@ -81,7 +81,7 @@ func TestFileSetters(t *testing.T) {
 }
 
 func TestZipHeaders(t *testing.T) {
-	file := &file{
+	file := &File{
 		name:             "test.txt",
 		modTime:          time.Now(),
 		uncompressedSize: 1024,
@@ -104,7 +104,7 @@ func TestZipHeaders(t *testing.T) {
 }
 
 func TestZipHeaders_Directory(t *testing.T) {
-	file := &file{
+	file := &File{
 		name:  "archive/docs",
 		isDir: true,
 	}
@@ -122,12 +122,12 @@ func TestZipHeaders_Directory(t *testing.T) {
 func TestFile_RequiresZip64(t *testing.T) {
 	tests := []struct {
 		name     string
-		file     *file
+		file     *File
 		expected bool
 	}{
 		{
 			name: "Small file",
-			file: &file{
+			file: &File{
 				compressedSize:   100,
 				uncompressedSize: 100,
 			},
@@ -135,7 +135,7 @@ func TestFile_RequiresZip64(t *testing.T) {
 		},
 		{
 			name: "Large uncompressed size",
-			file: &file{
+			file: &File{
 				compressedSize:   100,
 				uncompressedSize: math.MaxUint32 + 1,
 			},
@@ -143,7 +143,7 @@ func TestFile_RequiresZip64(t *testing.T) {
 		},
 		{
 			name: "Large compressed size",
-			file: &file{
+			file: &File{
 				compressedSize:   math.MaxUint32 + 1,
 				uncompressedSize: 100,
 			},
@@ -164,26 +164,26 @@ func TestFile_RequiresZip64(t *testing.T) {
 func TestFile_GetFilenameLength(t *testing.T) {
 	tests := []struct {
 		name     string
-		file     *file
+		file     *File
 		expected uint16
 	}{
 		{
 			name: "Simple file",
-			file: &file{
+			file: &File{
 				name: "file.txt",
 			},
 			expected: 8,
 		},
 		{
 			name: "File with path",
-			file: &file{
+			file: &File{
 				name: "path/to/file.txt",
 			},
 			expected: 16,
 		},
 		{
 			name: "Directory",
-			file: &file{
+			file: &File{
 				name:  "archive/docs",
 				isDir: true,
 			},
