@@ -321,11 +321,19 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 			return nil, errors.New("file is encrypted but no password provided")
 		}
 
-		cryptoR, err := zr.createDecrypter(dataR, f.config, f.crc32)
+		var err error
+		switch f.config.EncryptionMethod {
+		case ZipCrypto:
+			_, dosTime := timeToMsDos(f.modTime)
+			dataR, err = NewZipCryptoReader(dataR, f.config.Password, bitFlag, f.crc32, dosTime)
+		case AES256:
+			dataR, err = NewAes256Reader(dataR, f.config.Password, f.compressedSize)
+		default:
+			return nil, fmt.Errorf("unknown encryption method: %d", f.config.EncryptionMethod)
+		}
 		if err != nil {
 			return nil, err
 		}
-		dataR = cryptoR
 	}
 
 	zr.mu.RLock()
@@ -346,19 +354,6 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 		want: f.crc32,
 		size: uint64(f.uncompressedSize),
 	}, nil
-}
-
-// createDecrypter instantiates the appropriate decryption reader based on encryption method.
-// ZipCrypto uses CRC32 MSB for password verification, AES uses salt-based verification.
-func (zr *zipReader) createDecrypter(src io.Reader, cfg FileConfig, CRC32 uint32) (io.Reader, error) {
-	switch cfg.EncryptionMethod {
-	case ZipCrypto:
-		return NewZipCryptoReader(src, cfg.Password, CRC32)
-	case AES256:
-		return NewAes256Reader(src, cfg.Password)
-	default:
-		return nil, fmt.Errorf("unknown encryption method: %d", cfg.EncryptionMethod)
-	}
 }
 
 // verifySignature checks whether the next 4 bytes in the source match the given signature

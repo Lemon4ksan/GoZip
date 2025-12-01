@@ -67,7 +67,7 @@ type zipCryptoReader struct {
 	cipher *zipCipher
 }
 
-func NewZipCryptoReader(src io.Reader, password string, fileCRC uint32) (io.Reader, error) {
+func NewZipCryptoReader(src io.Reader, password string, flags uint16, crc32Val uint32, modTime uint16) (io.Reader, error) {
 	cipher := newZipCipher(password)
 
 	header := make([]byte, 12)
@@ -76,7 +76,14 @@ func NewZipCryptoReader(src io.Reader, password string, fileCRC uint32) (io.Read
 	}
 	cipher.Decrypt(header)
 
-	if header[11] != byte(fileCRC >> 24) {
+	var expectedByte byte
+	if flags&0x8 != 0 {
+		expectedByte = byte(modTime >> 8)
+	} else {
+		expectedByte = byte(crc32Val >> 24)
+	}
+
+	if header[11] != expectedByte {
 		return nil, ErrPasswordMismatch
 	}
 
@@ -204,17 +211,15 @@ func (w *aesWriter) Close() error {
 }
 
 type aesReader struct {
-	src        io.Reader
+	limitR     io.Reader
+	macSrc     io.Reader
 	stream     *winZipCounter
 	mac        hash.Hash
-
-	// HMAC verification state
-	macBuf     []byte // Buffer to hold the trailing MAC bytes
-	eofReached bool
+	checkOnEOF bool
 }
 
 // NewAes256Reader wraps src which MUST contain [Salt][PVV][EncryptedData][MAC]
-func NewAes256Reader(src io.Reader, password string) (io.Reader, error) {
+func NewAes256Reader(src io.Reader, password string, compressedSize int64) (io.Reader, error) {
 	salt := make([]byte, aes256SaltSize)
 	if _, err := io.ReadFull(src, salt); err != nil {
 		return nil, fmt.Errorf("read salt: %w", err)
@@ -234,24 +239,41 @@ func NewAes256Reader(src io.Reader, password string) (io.Reader, error) {
 		return nil, err
 	}
 
+	overhead := int64(aes256SaltSize + aesPvvSize + aesMacSize)
+	if compressedSize < overhead {
+		return nil, errors.New("invalid aes file size")
+	}
+	dataSize := compressedSize - overhead
+
 	return &aesReader{
-		src:    src,
-		stream: newWinZipCounter(block),
-		mac:    hmac.New(sha1.New, keys.macKey),
-		macBuf: make([]byte, 0, aesMacSize),
+		limitR:     io.LimitReader(src, dataSize),
+		macSrc:     src,
+		stream:     newWinZipCounter(block),
+		mac:        hmac.New(sha1.New, keys.macKey),
+		checkOnEOF: true,
 	}, nil
 }
 
 func (r *aesReader) Read(p []byte) (int, error) {
-	if r.eofReached {
-		return 0, io.EOF
-	}
-
-	n, err := r.src.Read(p)
+	n, err := r.limitR.Read(p)
 	if n > 0 {
 		r.mac.Write(p[:n])
 		r.stream.XORKeyStream(p[:n], p[:n])
 	}
+	
+	if err == io.EOF && r.checkOnEOF {
+		expected := make([]byte, aesMacSize)
+		if _, macErr := io.ReadFull(r.macSrc, expected); macErr != nil {
+			return n, fmt.Errorf("read auth mac: %w", macErr)
+		}
+		
+		calculated := r.mac.Sum(nil)[:aesMacSize]
+		if !bytes.Equal(calculated, expected) {
+			return n, errors.New("aes authentication failed")
+		}
+		return n, io.EOF
+	}
+
 	return n, err
 }
 
@@ -287,10 +309,11 @@ func deriveAesKeys(password string, salt []byte) aesKeys {
 	// - 2 bytes for Password Verification Value
 	totalLen := 2*aes256KeySize + aesPvvSize
 	dk := key([]byte(password), salt, 1000, totalLen, sha1.New)
+
 	return aesKeys{
 		encKey: dk[:aes256KeySize],
 		macKey: dk[aes256KeySize : 2*aes256KeySize],
-		pvv:    dk[2*aes256KeySize:],
+		pvv:    dk[2*aes256KeySize : 2*aes256KeySize+aesPvvSize],
 	}
 }
 
