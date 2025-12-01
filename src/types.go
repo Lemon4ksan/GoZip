@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 )
 
 // Each record type must be identified using a header signature that identifies the record type.
@@ -50,6 +51,9 @@ func (h localFileHeader) encode() []byte {
 	binary.LittleEndian.PutUint16(buf[28:30], h.ExtraFieldLength)
 
 	copy(buf[30:], h.Filename)
+
+	// extraField is written externally
+	// since it doesn't match the central directory
 
 	return buf
 }
@@ -154,7 +158,7 @@ func (d centralDirectory) encode() []byte {
 	offset += copy(buf[offset:], d.Filename)
 
 	// Write Extra Fields
-	for _, entry := range d.ExtraField {
+	for _, entry := range getSortedExtraField(d.ExtraField) {
 		offset += copy(buf[offset:], entry)
 	}
 
@@ -293,4 +297,19 @@ func encodeZip64EndOfCentralDirLocator(endOfCentralDirOffset uint64) []byte {
 	binary.LittleEndian.PutUint32(buf[16:20], 1) // TotalNumberOfDisks
 
 	return buf
+}
+
+// getSortedExtraField returns a sorted slice of extra fields for deterministic writes.
+func getSortedExtraField(extraField map[uint16][]byte) [][]byte {
+	keys := make([]uint16, 0, len(extraField))
+	for key, _ := range extraField {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	fields := make([][]byte, len(extraField))
+	for i, key := range keys {
+		fields[i] = extraField[key]
+	}
+	return fields
 }
