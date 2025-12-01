@@ -32,6 +32,7 @@ type localFileHeader struct {
 	FilenameLength         uint16
 	ExtraFieldLength       uint16
 	Filename               string
+	ExtraField             []byte
 }
 
 func (h localFileHeader) encode() []byte {
@@ -51,9 +52,7 @@ func (h localFileHeader) encode() []byte {
 	binary.LittleEndian.PutUint16(buf[28:30], h.ExtraFieldLength)
 
 	copy(buf[30:], h.Filename)
-
-	// extraField is written externally
-	// since it doesn't match the central directory
+	copy(buf[30+h.FilenameLength:], h.ExtraField)
 
 	return buf
 }
@@ -257,8 +256,8 @@ func encodeZip64EndOfCentralDirRecord(entriesNum uint64, centralDirSize uint64, 
 
 	binary.LittleEndian.PutUint32(buf[0:4], __ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE)
 	binary.LittleEndian.PutUint64(buf[4:12], 44)          // Size of the rest of the record
-	binary.LittleEndian.PutUint16(buf[12:14], 1)          // VersionMadeBy
-	binary.LittleEndian.PutUint16(buf[14:16], 1)          // VersionNeededToExtract
+	binary.LittleEndian.PutUint16(buf[12:14], 45)         // VersionMadeBy
+	binary.LittleEndian.PutUint16(buf[14:16], 45)         // VersionNeededToExtract
 	binary.LittleEndian.PutUint32(buf[16:20], 0)          // ThisDiskNum
 	binary.LittleEndian.PutUint32(buf[20:24], 0)          // DiskNumWithTheStartOfCentralDir
 	binary.LittleEndian.PutUint64(buf[24:32], entriesNum) // TotalEntriesDisk

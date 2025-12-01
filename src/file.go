@@ -288,23 +288,7 @@ func newZipHeaders(f *File) *zipHeaders {
 func (zh *zipHeaders) LocalHeader() localFileHeader {
 	dosDate, dosTime := timeToMsDos(zh.file.modTime)
 	filename := zh.file.getFilename()
-	var extraFieldLength uint16
-
-	// Calculate space needed for ZIP64 extra field if required
-	if zh.file.uncompressedSize > math.MaxUint32 {
-		extraFieldLength += 8 // 64-bit uncompressed size
-	}
-	if zh.file.compressedSize > math.MaxUint32 {
-		extraFieldLength += 8 // 64-bit compressed size
-	}
-	if extraFieldLength > 0 {
-		extraFieldLength += 4 // Tag + Size
-	}
-
-	// Reserve space for AES encryption extra field
-	if zh.file.config.EncryptionMethod == AES256 {
-		extraFieldLength += 11
-	}
+	localExtra := zh.buildLocalExtraData()
 
 	return localFileHeader{
 		VersionNeededToExtract: zh.getVersionNeededToExtract(),
@@ -316,8 +300,9 @@ func (zh *zipHeaders) LocalHeader() localFileHeader {
 		CompressedSize:         uint32(min(math.MaxUint32, zh.file.compressedSize)),
 		UncompressedSize:       uint32(min(math.MaxUint32, zh.file.uncompressedSize)),
 		FilenameLength:         uint16(len(filename)),
-		ExtraFieldLength:       extraFieldLength,
+		ExtraFieldLength:       uint16(len(localExtra)),
 		Filename:               filename,
+		ExtraField:             localExtra,
 	}
 }
 
@@ -484,4 +469,20 @@ func (zh *zipHeaders) getCompressionLevelBits() uint16 {
 	default: // DeflateNormal
 		return 0x0000
 	}
+}
+
+// buildLocalExtraData constructs the Extra Field specifically for the Local File Header.
+func (zh *zipHeaders) buildLocalExtraData() []byte {
+	var buf []byte
+
+	if zh.file.uncompressedSize > math.MaxUint32 || zh.file.compressedSize > math.MaxUint32 {
+		buf = append(buf, encodeZip64LocalExtraField(zh.file)...)
+	}
+
+	// 2. AES Encryption
+	if zh.file.config.EncryptionMethod == AES256 {
+		buf = append(buf, encodeAESExtraField(zh.file)...)
+	}
+
+	return buf
 }

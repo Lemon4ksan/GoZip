@@ -138,10 +138,6 @@ func (zw *zipWriter) writeWithTempFile(file *File) error {
 		return fmt.Errorf("write header: %w", err)
 	}
 
-	if err := zw.writeFileExtraField(file); err != nil {
-		return fmt.Errorf("write file extra field: %w", err)
-	}
-
 	if tmpFile != nil {
 		if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("seek buffer: %w", err)
@@ -458,28 +454,6 @@ func (zw *zipWriter) resolveCompressor(method CompressionMethod, level int) (Com
 	}
 }
 
-// writeFileExtraField writes the local file header extra field
-// and updates the local header offset tracker
-func (zw *zipWriter) writeFileExtraField(file *File) error {
-	if file.compressedSize > math.MaxUint32 || file.uncompressedSize > math.MaxUint32 {
-		n, err := zw.dest.Write(encodeZip64ExtraField(file))
-		if err != nil {
-			return fmt.Errorf("write zip64 extra field: %w", err)
-		}
-		zw.headerOffset += int64(n)
-	}
-
-	if file.config.EncryptionMethod == AES256 {
-		n, err := zw.dest.Write(encodeAESExtraField(file))
-		if err != nil {
-			return fmt.Errorf("write aes encryption extra field: %w", err)
-		}
-		zw.headerOffset += int64(n)
-	}
-
-	return nil
-}
-
 // cleanupTempFile safely cleans up a temporary file
 func cleanupTempFile(tmpFile *os.File) {
 	if tmpFile != nil {
@@ -610,10 +584,6 @@ func (pzw *parallelZipWriter) writeCompressedFile(file *File, src io.Reader) err
 
 	if file.uncompressedSize == 0 {
 		return nil
-	}
-
-	if err := pzw.zw.writeFileExtraField(file); err != nil {
-		return fmt.Errorf("write file extra field: %w", err)
 	}
 
 	if err := pzw.writeFileData(src); err != nil {
@@ -867,6 +837,19 @@ func encodeAESExtraField(file *File) []byte {
 	data[8] = 0x03
 	// Actual Compression Method
 	binary.LittleEndian.PutUint16(data[9:11], uint16(file.config.CompressionMethod))
+
+	return data
+}
+
+// encodeZip64LocalExtraField generates Zip64 field specifically for Local Header.
+func encodeZip64LocalExtraField(f *File) []byte {
+	// Fixed size: Tag(2) + Size(2) + Uncompressed(8) + Compressed(8) = 20 bytes
+	data := make([]byte, 20)
+
+	binary.LittleEndian.PutUint16(data[0:2], Zip64ExtraFieldTag)
+	binary.LittleEndian.PutUint16(data[2:4], 16) // Size of payload
+	binary.LittleEndian.PutUint64(data[4:12], uint64(f.uncompressedSize))
+	binary.LittleEndian.PutUint64(data[12:20], uint64(f.compressedSize))
 
 	return data
 }
