@@ -3,7 +3,7 @@ package gozip
 import "sort"
 
 // SortFilesOptimized returns a sorted slice of files according to the strategy.
-// Returns copy of the original slice.
+// Returns a new slice, original slice is not modified.
 func SortFilesOptimized(files []*File, strategy FileSortStrategy) []*File {
 	if len(files) <= 1 {
 		result := make([]*File, len(files))
@@ -13,14 +13,19 @@ func SortFilesOptimized(files []*File, strategy FileSortStrategy) []*File {
 
 	switch strategy {
 	case SortLargeFilesLast:
-		return partitionSortLargeFilesLast(files)
+		return partitionStable(files, func(f *File) bool {
+			return f.uncompressedSize < 1<<32 // Condition for "First" group
+		})
 
 	case SortLargeFilesFirst:
-		return partitionSortLargeFilesFirst(files)
+		return partitionStable(files, func(f *File) bool {
+			return f.uncompressedSize >= 1<<32 // Condition for "First" group
+		})
 
 	case SortZIP64Optimized:
+		// Bucket sort is faster for large datasets, but standard sort is fine for smaller ones
 		if len(files) > 1000 {
-			return optimizedSortZIP64OptimizedWithBuckets(files)
+			return optimizedSortZIP64Buckets(files)
 		}
 		return sortZip64Optimized(files)
 
@@ -38,6 +43,36 @@ func SortFilesOptimized(files []*File, strategy FileSortStrategy) []*File {
 		copy(result, files)
 		return result
 	}
+}
+
+// partitionStable splits files into two groups based on the keepFirst condition.
+// It preserves the relative order of elements (Stable).
+// O(N) time, O(N) space, 2 passes (Count then Fill).
+func partitionStable(files []*File, keepFirst func(*File) bool) []*File {
+	countFirst := 0
+	for _, f := range files {
+		if keepFirst(f) {
+			countFirst++
+		}
+	}
+
+	result := make([]*File, len(files))
+	
+	// Pointers for where to write the next element
+	idxFirst := 0
+	idxSecond := countFirst
+
+	for _, f := range files {
+		if keepFirst(f) {
+			result[idxFirst] = f
+			idxFirst++
+		} else {
+			result[idxSecond] = f
+			idxSecond++
+		}
+	}
+
+	return result
 }
 
 func sortSizeAscending(files []*File) []*File {
@@ -58,45 +93,18 @@ func sortSizeDescending(files []*File) []*File {
 	return sorted
 }
 
-// partitionSortLargeFilesLast - O(n) time for specific strategy
-func partitionSortLargeFilesLast(files []*File) []*File {
-	if len(files) <= 1 {
-		return files
-	}
-
-	// Single pass partitioning - much faster than full sort for this case
-	result := make([]*File, len(files))
-	smallIdx, largeIdx := 0, len(files)-1
-
-	for _, f := range files {
-		if f.uncompressedSize < 1<<32 { // < 4GB
-			result[smallIdx] = f
-			smallIdx++
-		} else { // >= 4GB
-			result[largeIdx] = f
-			largeIdx--
-		}
-	}
-
-	return result
-}
-
-// optimizedSortZIP64OptimizedWithBuckets - bucket sort approach
-func optimizedSortZIP64OptimizedWithBuckets(files []*File) []*File {
-	var smallCount, mediumCount, largeCount int
-	for _, f := range files {
-		switch getSizePriority(f.uncompressedSize) {
-		case 0:
-			smallCount++
-		case 1:
-			mediumCount++
-		case 2:
-			largeCount++
-		}
-	}
-	small := make([]*File, 0, smallCount)
-	medium := make([]*File, 0, mediumCount)
-	large := make([]*File, 0, largeCount)
+// optimizedSortZIP64Buckets implements a bucket sort strategy.
+// Priority: Small (<10MB) -> Medium (<4GB) -> Large (>=4GB).
+// Inside buckets: Sorted by size ASC.
+func optimizedSortZIP64Buckets(files []*File) []*File {
+	var small, medium, large []*File
+	
+	// Pre-allocate to avoid resizing if possible, assuming roughly equal distribution
+	// or just let append handle it. For >1000 files, append overhead is negligible compared to sort.
+	capEst := len(files) / 3
+	small = make([]*File, 0, capEst)
+	medium = make([]*File, 0, capEst)
+	large = make([]*File, 0, capEst)
 
 	for _, f := range files {
 		switch getSizePriority(f.uncompressedSize) {
@@ -109,38 +117,25 @@ func optimizedSortZIP64OptimizedWithBuckets(files []*File) []*File {
 		}
 	}
 
-	if len(small) > 1 {
-		sort.Slice(small, func(i, j int) bool {
-			return small[i].uncompressedSize < small[j].uncompressedSize
-		})
-	}
-	if len(medium) > 1 {
-		sort.Slice(medium, func(i, j int) bool {
-			return medium[i].uncompressedSize < medium[j].uncompressedSize
-		})
-	}
-
-	result := make([]*File, len(files))
-	pos := 0
-	pos += copy(result[pos:], small)
-	pos += copy(result[pos:], medium)
-	pos += copy(result[pos:], large)
-	return result
-}
-
-func partitionSortLargeFilesFirst(files []*File) []*File {
-	result := make([]*File, len(files))
-	smallIdx, largeIdx := len(files)-1, 0
-
-	for _, f := range files {
-		if f.uncompressedSize < 1<<32 {
-			result[smallIdx] = f
-			smallIdx--
-		} else {
-			result[largeIdx] = f
-			largeIdx++
+	// Helper to sort a bucket
+	sortBucket := func(bucket []*File) {
+		if len(bucket) > 1 {
+			sort.Slice(bucket, func(i, j int) bool {
+				return bucket[i].uncompressedSize < bucket[j].uncompressedSize
+			})
 		}
 	}
+
+	sortBucket(small)
+	sortBucket(medium)
+	sortBucket(large)
+
+	// Merge results
+	result := make([]*File, 0, len(files))
+	result = append(result, small...)
+	result = append(result, medium...)
+	result = append(result, large...)
+	
 	return result
 }
 
@@ -163,13 +158,17 @@ func sortZip64Optimized(files []*File) []*File {
 }
 
 func getSizePriority(size int64) int {
+	// Priority 0: Small files (good for headers packing)
+	// Priority 1: Standard files
+	// Priority 2: Zip64 files or Unknown size (Stream)
+	
 	if size < 0 {
-		return 2
+		return 2 // Unknown size -> treat as Large/Complex
 	}
-	if size < 10485760 {
+	if size < 10*1024*1024 { // 10 MB
 		return 0
 	}
-	if size < 1<<32 {
+	if size < 1<<32 { // 4 GB
 		return 1
 	}
 	return 2
@@ -179,10 +178,8 @@ func getSizePriority(size int64) int {
 func sortAlphabetical(files []*File) []*File {
 	sorted := make([]*File, len(files))
 	copy(sorted, files)
-
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].name < sorted[j].name
 	})
-
 	return sorted
 }
