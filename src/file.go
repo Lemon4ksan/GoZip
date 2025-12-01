@@ -84,10 +84,7 @@ func newFileFromOS(f *os.File) (*File, error) {
 		extraField:       make(map[uint16][]byte),
 		// Create a closure that attempts to seek to start before reading
 		openFunc: func() (io.ReadCloser, error) {
-			if _, err := f.Seek(0, io.SeekStart); err != nil {
-				return nil, fmt.Errorf("seek failed (stream?): %w", err)
-			}
-			return io.NopCloser(f), nil
+			return io.NopCloser(io.NewSectionReader(f, 0, stat.Size())), nil
 		},
 	}, nil
 }
