@@ -445,8 +445,14 @@ func (zw *zipWriter) resolveCompressor(method CompressionMethod, level int) (Com
 		zw.mu.Lock()
 		defer zw.mu.Unlock()
 		key := compressorKey{method: Deflated, level: level}
+
+		// Double check if the key was just inserted
+		if val, ok := zw.compressors[key]; ok {
+			return val, nil
+		}
+
 		zw.compressors[key] = NewDeflateCompressor(level)
-		return zw.compressors[key], nil
+    	return zw.compressors[key], nil
 	default:
 		return nil, fmt.Errorf("unsupported compression method: %d", method)
 	}
@@ -697,6 +703,13 @@ func (mb *memoryBuffer) Write(p []byte) (n int, err error) {
 	if mb.closed {
 		return 0, io.ErrClosedPipe
 	}
+
+	// If at the end of the file
+	if mb.pos == int64(len(mb.data)) {
+        mb.data = append(mb.data, p...)
+        mb.pos += int64(len(p))
+        return len(p), nil
+    }
 
 	// Calculate required capacity
 	required := mb.pos + int64(len(p))
