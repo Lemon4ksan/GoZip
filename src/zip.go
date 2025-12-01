@@ -365,6 +365,7 @@ func (z *Zip) WriteParallel(dest io.Writer, maxWorkers int) error {
 // Read parses an existing ZIP archive from the source and appends its contents
 // to the current archive. This allows merging archives or inspecting existing ones.
 // The source must be seekable (io.ReadSeeker) for random access to ZIP structures.
+// NOTE: This function is thread safe only if source implements [io.ReaderAt].
 func (z *Zip) Read(src io.ReadSeeker) error {
 	reader := newZipReader(src, z.decompressors)
 	files, err := reader.ReadFiles()
