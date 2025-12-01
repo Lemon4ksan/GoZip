@@ -409,6 +409,12 @@ func (zh *zipHeaders) getFileBitFlag() uint16 {
 		flag |= zh.getCompressionLevelBits()
 	}
 
+	// Always set Bit 11 (Language encoding flag / EFS)
+    // This indicates that Filename and Comment are encoded in UTF-8.
+    // Go strings are always UTF-8, so this is technically always correct
+    // and ensures compatibility with modern archivers (WinRAR, 7-Zip, macOS).
+	flag |= 0x800
+
 	return flag
 }
 

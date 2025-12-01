@@ -177,7 +177,11 @@ func (zr *zipReader) findAndReadZip64EndOfCentralDir(commentLength uint16) (zip6
 // readCentralDir reads the central directory entries starting at the specified offset.
 // Each entry contains metadata about a file in the archive.
 func (zr *zipReader) readCentralDir(entries int64) ([]*File, error) {
-	files := make([]*File, 0, entries)
+	safeCap := entries
+	if safeCap > 1024*1024 {
+		safeCap = 1024 
+	}
+	files := make([]*File, 0, safeCap)
 
 	for i := range entries {
 		if !zr.verifySignature(__CENTRAL_DIRECTORY_SIGNATURE) {
@@ -198,7 +202,9 @@ func (zr *zipReader) readCentralDir(entries int64) ([]*File, error) {
 // newFileFromCentralDir creates a File struct from a central directory entry
 func (zr *zipReader) newFileFromCentralDir(entry centralDirectory) *File {
 	var isDir bool
-	filename := entry.Filename
+
+	filename := decodeText(entry.Filename, entry.GeneralPurposeBitFlag)
+	comment := decodeText(entry.Comment, entry.GeneralPurposeBitFlag)
 
 	if strings.HasSuffix(filename, "/") {
 		isDir = true
@@ -257,7 +263,7 @@ func (zr *zipReader) newFileFromCentralDir(entry centralDirectory) *File {
 		config: FileConfig{
 			CompressionMethod: CompressionMethod(compressionMethod),
 			Name:              filename,
-			Comment:           entry.Comment,
+			Comment:           comment,
 			EncryptionMethod:  encryptionMethod,
 		},
 	}
