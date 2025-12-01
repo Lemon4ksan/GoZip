@@ -245,29 +245,45 @@ func (z *Zip) AddFromPath(path string, options ...AddOption) error {
 
 // AddFromDir recursively adds all files and directories from a filesystem directory
 // to the archive. The directory structure is preserved within the archive.
-// Symbolic links are followed. The root directory itself is not included;
-// only its contents are added.
+// The root directory itself is not included; only its contents are added.
+// Returns a combined error if any operations failed (Best Effort strategy).
 func (z *Zip) AddFromDir(path string, options ...AddOption) error {
-	return filepath.WalkDir(path, func(walkPath string, _ fs.DirEntry, err error) error {
+	var errs []error
+
+	err := filepath.WalkDir(path, func(walkPath string, _ fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("access error %s: %w", walkPath, err))
+			return nil 
 		}
+
 		if walkPath == path {
 			return nil
 		}
 
 		relPath, err := filepath.Rel(path, walkPath)
 		if err != nil {
-			return fmt.Errorf("get relative path: %w", err)
+			return err
 		}
 
 		pathOpt := WithPath(filepath.ToSlash(filepath.Dir(relPath)))
 		fileOpts := append([]AddOption{pathOpt}, options...)
+
 		if err := z.AddFromPath(walkPath, fileOpts...); err != nil {
-			return fmt.Errorf("add file %s: %w", walkPath, err)
+			errs = append(errs, fmt.Errorf("failed to add %s: %w", walkPath, err))
+			return nil
 		}
+		
 		return nil
 	})
+
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }
 
 // AddReader adds file content from an arbitrary io.Reader to the archive.
