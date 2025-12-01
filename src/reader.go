@@ -24,11 +24,12 @@ type zipReader struct {
 	mu            sync.RWMutex
 	src           io.ReadSeeker                      // Source stream for reading archive data
 	decompressors map[CompressionMethod]Decompressor // Registry of available compressors
+	textEncoder   func(string) string
 }
 
 // newZipReader creates and initializes a new zipReader instance.
 // decompressors map can be nil - built-in Stored and Deflated decompressors are registered automatically.
-func newZipReader(src io.ReadSeeker, decompressors map[CompressionMethod]Decompressor) *zipReader {
+func newZipReader(src io.ReadSeeker, decompressors map[CompressionMethod]Decompressor, config ZipConfig) *zipReader {
 	if decompressors == nil {
 		decompressors = make(map[CompressionMethod]Decompressor)
 	}
@@ -38,6 +39,7 @@ func newZipReader(src io.ReadSeeker, decompressors map[CompressionMethod]Decompr
 	return &zipReader{
 		src:           src,
 		decompressors: decompressors,
+		textEncoder:   config.TextEncoding,
 	}
 }
 
@@ -203,8 +205,8 @@ func (zr *zipReader) readCentralDir(entries int64) ([]*File, error) {
 func (zr *zipReader) newFileFromCentralDir(entry centralDirectory) *File {
 	var isDir bool
 
-	filename := decodeText(entry.Filename, entry.GeneralPurposeBitFlag)
-	comment := decodeText(entry.Comment, entry.GeneralPurposeBitFlag)
+	filename := decodeText(entry.Filename, entry.GeneralPurposeBitFlag, zr.textEncoder)
+	comment := decodeText(entry.Comment, entry.GeneralPurposeBitFlag, zr.textEncoder)
 
 	if strings.HasSuffix(filename, "/") {
 		isDir = true

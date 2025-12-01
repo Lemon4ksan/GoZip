@@ -297,7 +297,7 @@ func TestZipReader_OpenFile_Integration(t *testing.T) {
 	// but to test openFile properly, we just need the ReaderAt logic to hit the right offset.
 	
 	reader := bytes.NewReader(buf.Bytes())
-	zr := newZipReader(reader, nil) // Default decompressors
+	zr := newZipReader(reader, nil, ZipConfig{}) // Default decompressors
 
 	f := &File{
 		name:             "test",
@@ -330,7 +330,7 @@ func TestZipReader_OpenFile_Integration(t *testing.T) {
 
 func TestReaderAtRequirement(t *testing.T) {
 	r := &readSeekerOnly{bytes.NewReader([]byte("dummy"))}
-	zr := newZipReader(r, nil)
+	zr := newZipReader(r, nil, ZipConfig{})
 	
 	f := &File{localHeaderOffset: 0}
 	

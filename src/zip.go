@@ -40,6 +40,12 @@ type ZipConfig struct {
 	// Comment stores an optional text comment for the entire ZIP archive.
 	// Maximum length is 65535 bytes due to ZIP format limitations.
 	Comment string
+
+	// TextEncoding specifies a fallback decoder for filenames/comments
+    // when UTF-8 flag is not set.
+    // Example: gozip.DecodeIBM866 for Russian DOS archives.
+    // Default: CP437 (US DOS).
+    TextEncoding TextDecoder
 }
 
 // FileConfig defines per-file configuration options that override archive defaults.
@@ -367,7 +373,7 @@ func (z *Zip) WriteParallel(dest io.Writer, maxWorkers int) error {
 // The source must be seekable (io.ReadSeeker) for random access to ZIP structures.
 // NOTE: This function is thread safe only if source implements [io.ReaderAt].
 func (z *Zip) Read(src io.ReadSeeker) error {
-	reader := newZipReader(src, z.decompressors)
+	reader := newZipReader(src, z.decompressors, z.config)
 	files, err := reader.ReadFiles()
 	z.files = append(z.files, files...)
 	return err
