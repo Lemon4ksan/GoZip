@@ -4,7 +4,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package gozip
+package sys
 
 import (
 	"os"
@@ -17,7 +17,7 @@ var (
 	procGetVolumeInfoByHandle = kernel32.NewProc("GetVolumeInformationByHandleW")
 )
 
-func getFileMetadata(stat os.FileInfo) map[string]interface{} {
+func GetFileMetadata(stat os.FileInfo) map[string]interface{} {
 	metadata := make(map[string]interface{})
 	if s, ok := stat.Sys().(*syscall.Win32FileAttributeData); ok {
 		metadata["LastWriteTime"] = uint64(s.LastWriteTime.Nanoseconds()/100) + 116444736000000000
@@ -28,7 +28,7 @@ func getFileMetadata(stat os.FileInfo) map[string]interface{} {
 	return metadata
 }
 
-func getHostSystem(fd uintptr) HostSystem {
+func GetHostSystem(fd uintptr) HostSystem {
 	fsType := getWindowsFileSystem(fd)
 	switch fsType {
 	case FileSystemNTFS:
@@ -39,7 +39,7 @@ func getHostSystem(fd uintptr) HostSystem {
 	return HostSystemNTFS // Default for Windows usually
 }
 
-func getHostSystemByOS() HostSystem {
+func GetHostSystemByOS() HostSystem {
 	return HostSystemNTFS
 }
 

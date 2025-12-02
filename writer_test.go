@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lemon4ksan/gozip/internal"
 )
 
 // TestZipWriter_WriteFileHeader tests local file header writing
@@ -61,7 +63,7 @@ func TestZipWriter_WriteFileHeader(t *testing.T) {
 			}
 
 			signature := binary.LittleEndian.Uint32(buf[:4])
-			expectedSig := __LOCAL_FILE_HEADER_SIGNATURE
+			expectedSig := internal.LocalFileHeaderSignature
 			if signature != expectedSig {
 				t.Errorf("WriteFileHeader() signature = %x, want %x", signature, expectedSig)
 			}

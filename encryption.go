@@ -18,6 +18,16 @@ import (
 	"io"
 )
 
+// EncryptionMethod represents the encryption algorithm used for file protection
+type EncryptionMethod uint16
+
+// Supported encryption methods
+const (
+	NotEncrypted EncryptionMethod = 0 // No encryption - file stored in plaintext
+	ZipCrypto    EncryptionMethod = 1 // Legacy encryption. Vulnerable to brute force attacks
+	AES256       EncryptionMethod = 2 // Modern AES256 encryption
+)
+
 var ErrPasswordMismatch = errors.New("invalid password")
 
 type zipCryptoWriter struct {

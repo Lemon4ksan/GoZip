@@ -13,11 +13,14 @@ import (
 	"math"
 	"strings"
 	"testing"
+
+	"github.com/lemon4ksan/gozip/internal"
+	"github.com/lemon4ksan/gozip/internal/sys"
 )
 
 func makeEOCD(entries uint16, cdSize, cdOffset uint32, comment string) []byte {
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, __END_OF_CENTRAL_DIRECTORY_SIGNATURE)
+	binary.Write(buf, binary.LittleEndian, internal.EndOfCentralDirSignature)
 	binary.Write(buf, binary.LittleEndian, uint16(0))            // Disk number
 	binary.Write(buf, binary.LittleEndian, uint16(0))            // Disk number with start
 	binary.Write(buf, binary.LittleEndian, entries)              // Entries on disk
@@ -112,7 +115,7 @@ func TestFindEOCD_BufferBoundary(t *testing.T) {
 }
 
 func TestNewFileFromCentralDir_Zip64(t *testing.T) {
-	cd := centralDirectory{
+	cd := internal.CentralDirectory{
 		UncompressedSize:  math.MaxUint32,
 		CompressedSize:    math.MaxUint32,
 		LocalHeaderOffset: math.MaxUint32,
@@ -148,29 +151,29 @@ func TestNewFileFromCentralDir_Zip64(t *testing.T) {
 func TestParseFileExternalAttributes(t *testing.T) {
 	tests := []struct {
 		name     string
-		entry    centralDirectory
+		entry    internal.CentralDirectory
 		wantMode fs.FileMode
 	}{
 		{
 			name: "Unix Regular File (0644)",
-			entry: centralDirectory{
-				VersionMadeBy:          uint16(HostSystemUNIX) << 8,
+			entry: internal.CentralDirectory{
+				VersionMadeBy:          uint16(sys.HostSystemUNIX) << 8,
 				ExternalFileAttributes: uint32(0644) << 16,
 			},
 			wantMode: 0644,
 		},
 		{
 			name: "Unix Directory (0755)",
-			entry: centralDirectory{
-				VersionMadeBy:          uint16(HostSystemUNIX) << 8,
+			entry: internal.CentralDirectory{
+				VersionMadeBy:          uint16(sys.HostSystemUNIX) << 8,
 				ExternalFileAttributes: uint32(0040755) << 16, // IFDIR + 0755
 			},
 			wantMode: 0755 | fs.ModeDir,
 		},
 		{
 			name: "Windows/DOS ReadOnly",
-			entry: centralDirectory{
-				VersionMadeBy:          uint16(HostSystemFAT) << 8,
+			entry: internal.CentralDirectory{
+				VersionMadeBy:          uint16(sys.HostSystemFAT) << 8,
 				ExternalFileAttributes: 0x01, // ReadOnly bit
 				Filename:               "file.txt",
 			},
@@ -179,8 +182,8 @@ func TestParseFileExternalAttributes(t *testing.T) {
 		},
 		{
 			name: "Windows Directory",
-			entry: centralDirectory{
-				VersionMadeBy:          uint16(HostSystemFAT) << 8,
+			entry: internal.CentralDirectory{
+				VersionMadeBy:          uint16(sys.HostSystemFAT) << 8,
 				ExternalFileAttributes: 0x10, // Directory bit
 				Filename:               "folder/",
 			},
@@ -273,7 +276,6 @@ func TestChecksumReader(t *testing.T) {
 }
 
 func TestZipReader_OpenFile_Integration(t *testing.T) {
-	// Создаем валидный ZIP в памяти вручную
 	buf := new(bytes.Buffer)
 
 	content := []byte("test content")
@@ -281,7 +283,7 @@ func TestZipReader_OpenFile_Integration(t *testing.T) {
 
 	// 1. Local Header
 	lhOffset := buf.Len()
-	binary.Write(buf, binary.LittleEndian, __LOCAL_FILE_HEADER_SIGNATURE)
+	binary.Write(buf, binary.LittleEndian, internal.LocalFileHeaderSignature)
 	binary.Write(buf, binary.LittleEndian, uint16(20))     // Version
 	binary.Write(buf, binary.LittleEndian, uint16(0))      // Flags
 	binary.Write(buf, binary.LittleEndian, uint16(Stored)) // Method

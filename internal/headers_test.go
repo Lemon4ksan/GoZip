@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package gozip
+package internal
 
 import (
 	"bytes"
@@ -51,14 +51,14 @@ type rawCentralDirectory struct {
 func TestLocalFileHeader_Encode(t *testing.T) {
 	tests := []struct {
 		name     string
-		header   localFileHeader
+		header   LocalFileHeader
 		expected string // Expected filename in output
 	}{
 		{
 			name: "Standard file",
-			header: localFileHeader{
+			header: LocalFileHeader{
 				VersionNeededToExtract: 20,
-				CompressionMethod:      uint16(Deflated),
+				CompressionMethod:      8,
 				CRC32:                  0x12345678,
 				CompressedSize:         100,
 				UncompressedSize:       200,
@@ -69,9 +69,9 @@ func TestLocalFileHeader_Encode(t *testing.T) {
 		},
 		{
 			name: "File inside directory",
-			header: localFileHeader{
+			header: LocalFileHeader{
 				VersionNeededToExtract: 20,
-				CompressionMethod:      uint16(Stored),
+				CompressionMethod:      0,
 				FilenameLength:         14,
 				Filename:               "folder/doc.txt",
 			},
@@ -82,7 +82,7 @@ func TestLocalFileHeader_Encode(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Action
-			encoded := tt.header.encode()
+			encoded := tt.header.Encode()
 
 			// Verification
 			buf := bytes.NewReader(encoded)
@@ -93,8 +93,8 @@ func TestLocalFileHeader_Encode(t *testing.T) {
 				t.Fatalf("Failed to read raw header: %v", err)
 			}
 
-			if raw.Signature != __LOCAL_FILE_HEADER_SIGNATURE {
-				t.Errorf("Signature mismatch: got %x, want %x", raw.Signature, __LOCAL_FILE_HEADER_SIGNATURE)
+			if raw.Signature != LocalFileHeaderSignature {
+				t.Errorf("Signature mismatch: got %x, want %x", raw.Signature, LocalFileHeaderSignature)
 			}
 			if raw.FilenameLength != tt.header.FilenameLength {
 				t.Errorf("FilenameLength mismatch: got %d, want %d", raw.FilenameLength, tt.header.FilenameLength)
@@ -125,13 +125,13 @@ func TestCentralDirectory_Encode(t *testing.T) {
 
 	tests := []struct {
 		name             string
-		entry            centralDirectory
+		entry            CentralDirectory
 		expectedFilename string
 		expectedComment  string
 	}{
 		{
 			name: "Simple Entry",
-			entry: centralDirectory{
+			entry: CentralDirectory{
 				VersionMadeBy:     63,
 				CRC32:             0xAABBCCDD,
 				FilenameLength:    8,
@@ -143,7 +143,7 @@ func TestCentralDirectory_Encode(t *testing.T) {
 		},
 		{
 			name: "Entry with Extra Field and Comment",
-			entry: centralDirectory{
+			entry: CentralDirectory{
 				VersionMadeBy:     63,
 				FilenameLength:    9,
 				ExtraFieldLength:  3,
@@ -160,7 +160,7 @@ func TestCentralDirectory_Encode(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Action
-			encoded := tt.entry.encode()
+			encoded := tt.entry.Encode()
 
 			// Verification
 			buf := bytes.NewReader(encoded)
@@ -171,8 +171,8 @@ func TestCentralDirectory_Encode(t *testing.T) {
 				t.Fatalf("Failed to read raw central dir: %v", err)
 			}
 
-			if raw.Signature != __CENTRAL_DIRECTORY_SIGNATURE {
-				t.Errorf("Signature mismatch: got %x, want %x", raw.Signature, __CENTRAL_DIRECTORY_SIGNATURE)
+			if raw.Signature != CentralDirectorySignature {
+				t.Errorf("Signature mismatch: got %x, want %x", raw.Signature, CentralDirectorySignature)
 			}
 
 			// 2. Verify Filename
@@ -217,7 +217,7 @@ func TestEndOfCentralDir_Encode(t *testing.T) {
 	comment := "End of Archive"
 
 	// Action
-	encoded := encodeEndOfCentralDirRecord(entries, size, offset, comment)
+	encoded := EncodeEndOfCentralDirRecord(entries, size, offset, comment)
 
 	// Verification
 	if len(encoded) != 22+len(comment) {
@@ -229,7 +229,7 @@ func TestEndOfCentralDir_Encode(t *testing.T) {
 	// Check Signature
 	var signature uint32
 	binary.Read(buf, binary.LittleEndian, &signature)
-	if signature != __END_OF_CENTRAL_DIRECTORY_SIGNATURE {
+	if signature != EndOfCentralDirSignature {
 		t.Errorf("Signature mismatch")
 	}
 
@@ -250,64 +250,17 @@ func TestEndOfCentralDir_Encode(t *testing.T) {
 	}
 }
 
-// TestIntegration_FileToHeaders verifies that file.go logic (getFilename) correctly propagates to types.go structures
-func TestIntegration_FileToHeaders(t *testing.T) {
-	tests := []struct {
-		name     string
-		file     *File
-		expected string // Expected string in the encoded bytes
-	}{
-		{
-			name:     "Normal File",
-			file:     &File{name: "doc.txt", isDir: false},
-			expected: "doc.txt",
-		},
-		{
-			name:     "Directory (Should have slash)",
-			file:     &File{name: "images", isDir: true},
-			expected: "images/",
-		},
-		{
-			name:     "Nested Directory",
-			file:     &File{name: "src/main", isDir: true},
-			expected: "src/main/",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// 1. Create headers using the logic in file.go
-			h := newZipHeaders(tt.file)
-
-			// 2. Encode Local Header
-			localEncoded := h.LocalHeader().encode()
-
-			// Verify Filename is present in bytes
-			if !bytes.Contains(localEncoded, []byte(tt.expected)) {
-				t.Errorf("Local Header bytes did not contain filename %q", tt.expected)
-			}
-
-			// Verify Filename Length field in bytes matches expected length
-			// Length is at offset 26 in Local Header
-			nameLen := binary.LittleEndian.Uint16(localEncoded[26:28])
-			if int(nameLen) != len(tt.expected) {
-				t.Errorf("Local Header name length: got %d, want %d", nameLen, len(tt.expected))
-			}
-		})
-	}
-}
-
 // TestZip64Records tests the structure of Zip64 specific records
 func TestZip64Records(t *testing.T) {
 	t.Run("Zip64 End Of Central Directory", func(t *testing.T) {
-		encoded := encodeZip64EndOfCentralDirRecord(100, 5000, 10000)
+		encoded := EncodeZip64EndOfCentralDirRecord(100, 5000, 10000)
 
 		if len(encoded) != 56 {
 			t.Errorf("Zip64 EOCD size mismatch: got %d, want 56", len(encoded))
 		}
 
 		sig := binary.LittleEndian.Uint32(encoded[0:4])
-		if sig != __ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE {
+		if sig != Zip64EndOfCentralDirSignature {
 			t.Errorf("Signature mismatch")
 		}
 
@@ -318,14 +271,14 @@ func TestZip64Records(t *testing.T) {
 	})
 
 	t.Run("Zip64 Locator", func(t *testing.T) {
-		encoded := encodeZip64EndOfCentralDirLocator(9999)
+		encoded := EncodeZip64EndOfCentralDirLocator(9999)
 
 		if len(encoded) != 20 {
 			t.Errorf("Zip64 Locator size mismatch: got %d, want 20", len(encoded))
 		}
 
 		sig := binary.LittleEndian.Uint32(encoded[0:4])
-		if sig != __ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE {
+		if sig != Zip64EndOfCentralDirLocatorSignature {
 			t.Errorf("Signature mismatch")
 		}
 	})

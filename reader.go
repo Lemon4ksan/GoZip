@@ -15,6 +15,9 @@ import (
 	"math"
 	"strings"
 	"sync"
+
+	"github.com/lemon4ksan/gozip/internal"
+	"github.com/lemon4ksan/gozip/internal/sys"
 )
 
 const (
@@ -26,16 +29,16 @@ const (
 // zipReader handles low-level reading of ZIP archive structure.
 type zipReader struct {
 	mu            sync.RWMutex
-	src           io.ReadSeeker                      // Source stream for reading archive data
-	decompressors map[CompressionMethod]Decompressor // Registry of available compressors
-	textEncoder   func(string) string
+	src           io.ReadSeeker       // Source stream for reading archive data
+	decompressors decompressorsMap    // Registry of available compressors
+	textEncoder   func(string) string // Filename and comment encoder
 }
 
 // newZipReader creates and initializes a new zipReader instance.
 // decompressors map can be nil - built-in Stored and Deflated decompressors are registered automatically.
-func newZipReader(src io.ReadSeeker, decompressors map[CompressionMethod]Decompressor, config ZipConfig) *zipReader {
+func newZipReader(src io.ReadSeeker, decompressors decompressorsMap, config ZipConfig) *zipReader {
 	if decompressors == nil {
-		decompressors = make(map[CompressionMethod]Decompressor)
+		decompressors = make(decompressorsMap)
 	}
 	decompressors[Stored] = new(StoredDecompressor)
 	decompressors[Deflated] = new(DeflateDecompressor)
@@ -75,14 +78,14 @@ func (zr *zipReader) ReadFiles() ([]*File, error) {
 // findAndReadEndOfCentralDir scans for the End of Central Directory record and reads it.
 // This record is located at the end of the ZIP file and contains metadata
 // about the archive structure and central directory location.
-func (zr *zipReader) findAndReadEndOfCentralDir() (endOfCentralDirectory, error) {
+func (zr *zipReader) findAndReadEndOfCentralDir() (internal.EndOfCentralDirectory, error) {
 	fileSize, err := zr.src.Seek(0, io.SeekEnd)
 	if err != nil {
-		return endOfCentralDirectory{}, fmt.Errorf("get file size: %w", err)
+		return internal.EndOfCentralDirectory{}, fmt.Errorf("get file size: %w", err)
 	}
 
 	if fileSize < directoryEndLen {
-		return endOfCentralDirectory{}, errors.New("file too small to be a valid ZIP archive")
+		return internal.EndOfCentralDirectory{}, errors.New("file too small to be a valid ZIP archive")
 	}
 
 	const bufSize = 1024
@@ -106,13 +109,13 @@ func (zr *zipReader) findAndReadEndOfCentralDir() (endOfCentralDirectory, error)
 
 		// Seek to read position
 		if _, err := zr.src.Seek(readPos, io.SeekStart); err != nil {
-			return endOfCentralDirectory{}, fmt.Errorf("seek to position %d: %w", readPos, err)
+			return internal.EndOfCentralDirectory{}, fmt.Errorf("seek to position %d: %w", readPos, err)
 		}
 
 		// Read data into buffer
 		n, err := io.ReadFull(zr.src, buf[:readSize])
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			return endOfCentralDirectory{}, fmt.Errorf("read buffer: %w", err)
+			return internal.EndOfCentralDirectory{}, fmt.Errorf("read buffer: %w", err)
 		}
 
 		if n == 0 {
@@ -122,7 +125,7 @@ func (zr *zipReader) findAndReadEndOfCentralDir() (endOfCentralDirectory, error)
 		// Scan buffer backwards for the signature
 		// Start from the end of the buffer minus 3 (to check 4-byte signature)
 		for p := n - 4; p >= 0; p-- {
-			if binary.LittleEndian.Uint32(buf[p:p+4]) == __END_OF_CENTRAL_DIRECTORY_SIGNATURE {
+			if binary.LittleEndian.Uint32(buf[p:p+4]) == internal.EndOfCentralDirSignature {
 				eocdStart := readPos + int64(p)
 
 				// Ensure we can read the full 22-byte EOCD header
@@ -131,9 +134,9 @@ func (zr *zipReader) findAndReadEndOfCentralDir() (endOfCentralDirectory, error)
 				}
 				recordStart := readPos + int64(p) + 4
 				if _, err := zr.src.Seek(recordStart, io.SeekStart); err != nil {
-					return endOfCentralDirectory{}, fmt.Errorf("seek to record at %d: %w", recordStart, err)
+					return internal.EndOfCentralDirectory{}, fmt.Errorf("seek to record at %d: %w", recordStart, err)
 				}
-				return readEndOfCentralDir(zr.src)
+				return internal.ReadEndOfCentralDir(zr.src)
 			}
 		}
 
@@ -145,14 +148,14 @@ func (zr *zipReader) findAndReadEndOfCentralDir() (endOfCentralDirectory, error)
 		}
 	}
 
-	return endOfCentralDirectory{}, errors.New("couldn't locate end of central directory signature")
+	return internal.EndOfCentralDirectory{}, errors.New("couldn't locate end of central directory signature")
 }
 
 // findAndReadZip64EndOfCentralDir scans for the Zip64 End of Central Directory record.
 // This record is located before End of Central Directory and its locator.
 // It contains 64 bit values for Central Directory size and total number of entries.
-func (zr *zipReader) findAndReadZip64EndOfCentralDir(commentLength uint16) (zip64EndOfCentralDirectory, error) {
-	var zip64End zip64EndOfCentralDirectory
+func (zr *zipReader) findAndReadZip64EndOfCentralDir(commentLength uint16) (internal.Zip64EndOfCentralDirectory, error) {
+	var zip64End internal.Zip64EndOfCentralDirectory
 	fileSize, _ := zr.src.Seek(0, io.SeekEnd)
 
 	zip64locatorOffset := fileSize - int64(directoryEndLen+commentLength) - zip64LocatorLen
@@ -160,11 +163,11 @@ func (zr *zipReader) findAndReadZip64EndOfCentralDir(commentLength uint16) (zip6
 		return zip64End, fmt.Errorf("seek to zip64 locator: %w", err)
 	}
 
-	if !zr.verifySignature(__ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE) {
+	if !zr.verifySignature(internal.Zip64EndOfCentralDirLocatorSignature) {
 		return zip64End, errors.New("expected zip64 end of central directory locator signature")
 	}
 
-	zip64Locator, err := readZip64EndOfCentralDirLocator(zr.src)
+	zip64Locator, err := internal.ReadZip64EndOfCentralDirLocator(zr.src)
 	if err != nil {
 		return zip64End, fmt.Errorf("read zip64 end of central dir locator: %w", err)
 	}
@@ -173,11 +176,11 @@ func (zr *zipReader) findAndReadZip64EndOfCentralDir(commentLength uint16) (zip6
 		return zip64End, fmt.Errorf("seek to zip64 eocd: %w", err)
 	}
 
-	if !zr.verifySignature(__ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE) {
+	if !zr.verifySignature(internal.Zip64EndOfCentralDirSignature) {
 		return zip64End, errors.New("expected zip64 end of central directory signature")
 	}
 
-	return readZip64EndOfCentralDir(zr.src)
+	return internal.ReadZip64EndOfCentralDir(zr.src)
 }
 
 // readCentralDir reads the central directory entries starting at the specified offset.
@@ -190,11 +193,11 @@ func (zr *zipReader) readCentralDir(entries int64) ([]*File, error) {
 	files := make([]*File, 0, safeCap)
 
 	for i := range entries {
-		if !zr.verifySignature(__CENTRAL_DIRECTORY_SIGNATURE) {
+		if !zr.verifySignature(internal.CentralDirectorySignature) {
 			return nil, fmt.Errorf("expected central directory signature at entry %d", i)
 		}
 
-		entry, err := readCentralDirEntry(zr.src)
+		entry, err := internal.ReadCentralDirEntry(zr.src)
 		if err != nil {
 			return nil, fmt.Errorf("decode central dir entry: %w", err)
 		}
@@ -206,7 +209,7 @@ func (zr *zipReader) readCentralDir(entries int64) ([]*File, error) {
 }
 
 // newFileFromCentralDir creates a File struct from a central directory entry
-func (zr *zipReader) newFileFromCentralDir(entry centralDirectory) *File {
+func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *File {
 	var isDir bool
 
 	filename := decodeText(entry.Filename, entry.GeneralPurposeBitFlag, zr.textEncoder)
@@ -263,7 +266,7 @@ func (zr *zipReader) newFileFromCentralDir(entry centralDirectory) *File {
 		compressedSize:    int64(compressedSize),
 		crc32:             entry.CRC32,
 		localHeaderOffset: int64(localHeaderOffset),
-		hostSystem:        HostSystem(entry.VersionMadeBy >> 8),
+		hostSystem:        sys.HostSystem(entry.VersionMadeBy >> 8),
 		modTime:           msDosToTime(entry.LastModFileDate, entry.LastModFileTime),
 		extraField:        entry.ExtraField,
 		config: FileConfig{
@@ -300,7 +303,7 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("read local header: %w", err)
 	}
 
-	if binary.LittleEndian.Uint32(buf[0:4]) != __LOCAL_FILE_HEADER_SIGNATURE {
+	if binary.LittleEndian.Uint32(buf[0:4]) != internal.LocalFileHeaderSignature {
 		return nil, errors.New("invalid local file header signature")
 	}
 
@@ -371,46 +374,19 @@ func (zr *zipReader) verifySignature(s uint32) bool {
 	return binary.LittleEndian.Uint32(buf) == s
 }
 
-// parseExtraField converts raw extra field bytes into a map keyed by tag IDs.
-// Extra fields contain additional metadata like ZIP64 extensions, NTFS timestamps, etc.
-func parseExtraField(extraField []byte) map[uint16][]byte {
-	m := make(map[uint16][]byte)
-
-	for offset := 0; offset < len(extraField); {
-		// Need at least 4 bytes for tag and size
-		if offset+4 > len(extraField) {
-			break
-		}
-
-		tag := binary.LittleEndian.Uint16(extraField[offset : offset+2])
-		size := int(binary.LittleEndian.Uint16(extraField[offset+2 : offset+4]))
-
-		offset += 4
-
-		if offset+size > len(extraField) {
-			break
-		}
-
-		// Store the entire extra field block (header + data)
-		m[tag] = extraField[offset-4 : offset+size]
-		offset += size
-	}
-	return m
-}
-
 // parseFileExternalAttributes converts file attributes from central directory to fs.FileMode
-func parseFileExternalAttributes(entry centralDirectory) fs.FileMode {
+func parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {
 	var mode fs.FileMode
-	hostSystem := HostSystem(entry.VersionMadeBy >> 8)
+	hostSystem := sys.HostSystem(entry.VersionMadeBy >> 8)
 
-	if hostSystem == HostSystemUNIX {
+	if hostSystem == sys.HostSystemUNIX {
 		unixMode := uint32(entry.ExternalFileAttributes >> 16)
 		mode = fs.FileMode(unixMode & 0777)
 
 		switch {
-		case unixMode&s_IFDIR != 0:
+		case unixMode&sys.S_IFDIR != 0:
 			mode |= fs.ModeDir
-		case unixMode&s_IFLNK != 0:
+		case unixMode&sys.S_IFLNK != 0:
 			mode |= fs.ModeSymlink
 		}
 	} else {

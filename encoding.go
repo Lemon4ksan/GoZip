@@ -48,7 +48,7 @@ func cp437ToUtf8(s string) string {
 	return string(res)
 }
 
-// Таблица CP866 (Cyrillic DOS)
+// CP866 table (Cyrillic DOS)
 var ibm866 = [256]rune{
 	// 0x00 - 0x7F (ASCII - same as Unicode)
 	0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007,

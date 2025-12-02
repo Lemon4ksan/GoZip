@@ -4,14 +4,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package gozip
+package sys
 
 import (
 	"os"
 	"syscall"
 )
 
-func getFileMetadata(stat os.FileInfo) map[string]interface{} {
+func GetFileMetadata(stat os.FileInfo) map[string]interface{} {
 	s, ok := stat.Sys().(*syscall.Stat_t)
 	if !ok {
 		return nil

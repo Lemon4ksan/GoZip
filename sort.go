@@ -6,6 +6,44 @@ package gozip
 
 import "sort"
 
+// Sequential Saving (Write()):
+//   ┌──────────────────┬────────────────────────┬───────────────────────┬──────────────────┐
+//   │ Strategy         │ ZIP64 Overhead         │ Speed                 │ Recommendation   │
+//   ├──────────────────┼────────────────────────┼───────────────────────┼──────────────────┤
+//   │ Default          │ Depends on file order  │ No sorting            │ Small files only │
+//   │ LargeFilesLast   │ Minimal (optimal)      │ Very Fast             │ Large files ≥4GB │
+//   │ LargeFilesFirst  │ High (avoid)           │ Very Fast             │ Parallel only    │
+//   │ ZIP64Optimized   │ Low (good balance)     │ Fast                  │ General purpose  │
+//   │ SizeAscending    │ Medium                 │ Fast                  │ Specific needs   │
+//   │ SizeDescending   │ Medium                 │ Fast                  │ Specific needs   │
+//   │ Alphabetical     │ Depends on file order  │ Slow                  │ Avoid            │
+//   └──────────────────┴────────────────────────┴───────────────────────┴──────────────────┘
+//
+// Parallel Saving (WriteParallel()):
+//   ┌──────────────────┬────────────────────────┬───────────────────────┬──────────────────┐
+//   │ Strategy         │ Parallel Efficiency    │ ZIP64 Overhead        │ Speed            │
+//   ├──────────────────┼────────────────────────┼───────────────────────┼──────────────────┤
+//   │ Default          │ Good                   │ Depends on file order │ No sorting       │
+//   │ LargeFilesFirst  │ High (optimal)         │ Medium if Stored      │ Very Fast        │
+//   │                  │                        │ Minimal/Low otherwise │                  │
+//   │ LargeFilesLast   │ Low (suboptimal)       │ Minimal               │ Very Fast        │
+//   │ ZIP64Optimized   │ Medium (good balance)  │ Low                   │ Fast             │
+//   │ SizeAscending    │ Medium                 │ Medium                │ Fast             │
+//   │ SizeDescending   │ Medium                 │ Medium                │ Fast             │
+//   │ Alphabetical     │ No Effect              │ Depends on file order │ Slow             │
+//   └──────────────────┴────────────────────────┴───────────────────────┴──────────────────┘
+type FileSortStrategy int
+
+const (
+	SortDefault         FileSortStrategy = iota
+	SortLargeFilesLast                   // Large files (>=4GB) at end
+	SortLargeFilesFirst                  // Large filles (>=4GB) at start
+	SortSizeAscending                    // Smallest first (slower)
+	SortSizeDescending                   // Largest first (slower)
+	SortZIP64Optimized                   // Smart ZIP64 optimization
+	SortAlphabetical                     // A-Z by filename (folders first naturally)
+)
+
 // SortFilesOptimized returns a sorted slice of files according to the strategy.
 // Returns a new slice, original slice is not modified.
 func SortFilesOptimized(files []*File, strategy FileSortStrategy) []*File {

@@ -4,7 +4,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package gozip
+package sys
 
 import (
 	"runtime"
@@ -13,11 +13,11 @@ import (
 // getHostSystem returns the HostSystem type.
 // On Unix we usually don't inspect the FD for filesystem type (like NTFS),
 // we just report the OS type.
-func getHostSystem(_ uintptr) HostSystem {
-	return getHostSystemByOS()
+func GetHostSystem(_ uintptr) HostSystem {
+	return GetHostSystemByOS()
 }
 
-func getHostSystemByOS() HostSystem {
+func GetHostSystemByOS() HostSystem {
 	if runtime.GOOS == "darwin" {
 		return HostSystemDarwin
 	}

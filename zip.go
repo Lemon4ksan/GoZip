@@ -150,6 +150,22 @@ func WithMode(mode fs.FileMode) AddOption {
 	}
 }
 
+// Compressor defines a strategy for compressing data.
+// See [DeflateCompressor] as an example.
+type Compressor interface {
+	// Compress reads from src, compresses the data, and writes to dest.
+	// Returns the number of uncompressed bytes read from src.
+	Compress(src io.Reader, dest io.Writer) (int64, error)
+}
+
+// Decompressor defines a strategy for decompressing data.
+// See [DeflateDecompressor] as an example.
+type Decompressor interface {
+	// Decompress returns a ReadCloser that reads uncompressed data from src.
+	// src is the stream of compressed data.
+	Decompress(src io.Reader) (io.ReadCloser, error)
+}
+
 // compressorKey defines a key for compressors map
 type compressorKey struct {
 	method CompressionMethod

@@ -13,12 +13,19 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/lemon4ksan/gozip/internal"
+	"github.com/lemon4ksan/gozip/internal/sys"
 )
 
 // SizeUnknown is a sentinel value indicating that the uncompressed size of a file
 // cannot be determined in advance. This typically occurs when creating files from
 // io.Reader sources where the total data length is unknown until fully read.
 const SizeUnknown int64 = -1
+
+// Compression method indicates AES256 encryption.
+// The actual compression method is stored in extra field.
+const winZipAESMarker = 99
 
 // Constants defining ZIP format structure and special tag values
 const (
@@ -55,8 +62,8 @@ type File struct {
 	// Per-file configuration overriding archive defaults
 	config FileConfig
 
-	localHeaderOffset int64      // Byte offset of this file's local header within archive
-	hostSystem        HostSystem // Operating system that created the file (for attribute mapping)
+	localHeaderOffset int64          // Byte offset of this file's local header within archive
+	hostSystem        sys.HostSystem // Operating system that created the file (for attribute mapping)
 
 	modTime    time.Time              // File modification time (best available precision)
 	metadata   map[string]interface{} // Platform-specific metadata (NTFS timestamps, etc.)
@@ -83,8 +90,8 @@ func newFileFromOS(f *os.File) (*File, error) {
 		modTime:          stat.ModTime(),
 		isDir:            stat.IsDir(),
 		mode:             stat.Mode(),
-		metadata:         getFileMetadata(stat),
-		hostSystem:       getHostSystem(f.Fd()),
+		metadata:         sys.GetFileMetadata(stat),
+		hostSystem:       sys.GetHostSystem(f.Fd()),
 		extraField:       make(map[uint16][]byte),
 		// Create a closure that attempts to seek to start before reading
 		openFunc: func() (io.ReadCloser, error) {
@@ -119,8 +126,8 @@ func newFileFromPath(filePath string) (*File, error) {
 		modTime:          stat.ModTime(),
 		isDir:            stat.IsDir(),
 		mode:             stat.Mode(),
-		metadata:         getFileMetadata(stat),
-		hostSystem:       getHostSystem(f.Fd()),
+		metadata:         sys.GetFileMetadata(stat),
+		hostSystem:       sys.GetHostSystem(f.Fd()),
 		extraField:       make(map[uint16][]byte),
 		openFunc: func() (io.ReadCloser, error) {
 			return os.Open(filePath)
@@ -142,7 +149,7 @@ func newFileFromReader(src io.Reader, name string) (*File, error) {
 		name:             name,
 		uncompressedSize: SizeUnknown,
 		modTime:          time.Now(),
-		hostSystem:       getHostSystemByOS(),
+		hostSystem:       sys.GetHostSystemByOS(),
 		extraField:       make(map[uint16][]byte),
 		openFunc: func() (io.ReadCloser, error) {
 			return io.NopCloser(src), nil
@@ -161,7 +168,7 @@ func newDirectoryFile(name string) (*File, error) {
 		name:       name,
 		isDir:      true,
 		mode:       0755 | fs.ModeDir,
-		hostSystem: getHostSystemByOS(),
+		hostSystem: sys.GetHostSystemByOS(),
 		modTime:    time.Now(),
 		extraField: make(map[uint16][]byte),
 	}, nil
@@ -288,12 +295,12 @@ func newZipHeaders(f *File) *zipHeaders {
 // LocalHeader generates the local file header that precedes the file data
 // in the ZIP archive. This header contains information needed to extract
 // the file, including compression method, sizes, and timestamps.
-func (zh *zipHeaders) LocalHeader() localFileHeader {
+func (zh *zipHeaders) LocalHeader() internal.LocalFileHeader {
 	dosDate, dosTime := timeToMsDos(zh.file.modTime)
 	filename := zh.file.getFilename()
 	localExtra := zh.buildLocalExtraData()
 
-	return localFileHeader{
+	return internal.LocalFileHeader{
 		VersionNeededToExtract: zh.getVersionNeededToExtract(),
 		GeneralPurposeBitFlag:  zh.getFileBitFlag(),
 		CompressionMethod:      zh.getCompressionMethod(),
@@ -312,11 +319,11 @@ func (zh *zipHeaders) LocalHeader() localFileHeader {
 // CentralDirEntry generates the central directory entry for this file.
 // This entry appears in the archive's central directory and contains
 // comprehensive metadata, including file comment and external attributes.
-func (zh *zipHeaders) CentralDirEntry() centralDirectory {
+func (zh *zipHeaders) CentralDirEntry() internal.CentralDirectory {
 	dosDate, dosTime := timeToMsDos(zh.file.modTime)
 	filename := zh.file.getFilename()
 
-	return centralDirectory{
+	return internal.CentralDirectory{
 		VersionMadeBy:          zh.getVersionMadeBy(),
 		VersionNeededToExtract: zh.getVersionNeededToExtract(),
 		GeneralPurposeBitFlag:  zh.getFileBitFlag(),
@@ -376,8 +383,8 @@ func (zh *zipHeaders) getVersionNeededToExtract() uint16 {
 func (zh *zipHeaders) getVersionMadeBy() uint16 {
 	fs := zh.file.hostSystem
 	// Normalize NTFS to FAT for broader compatibility
-	if fs == HostSystemNTFS {
-		fs = HostSystemFAT
+	if fs == sys.HostSystemNTFS {
+		fs = sys.HostSystemFAT
 	}
 	return uint16(fs)<<8 | LatestZipVersion
 }
@@ -424,22 +431,22 @@ func (zh *zipHeaders) getExternalFileAttributes() uint32 {
 	var externalAttrs uint32
 
 	switch zh.file.hostSystem {
-	case HostSystemUNIX, HostSystemDarwin:
+	case sys.HostSystemUNIX, sys.HostSystemDarwin:
 		// Unix systems: store mode in high 16 bits
 		mode := uint32(zh.file.mode & fs.ModePerm)
 
 		switch {
 		case zh.file.isDir:
-			mode |= s_IFDIR
+			mode |= sys.S_IFDIR
 		case zh.file.mode&fs.ModeSymlink != 0:
-			mode |= s_IFLNK
+			mode |= sys.S_IFLNK
 		default:
-			mode |= s_IFREG
+			mode |= sys.S_IFREG
 		}
 
 		externalAttrs = mode << 16
 
-	case HostSystemFAT, HostSystemNTFS:
+	case sys.HostSystemFAT, sys.HostSystemNTFS:
 		// DOS/Windows systems: use attribute bits
 		if zh.file.isDir {
 			externalAttrs |= 0x10 // DOS Directory

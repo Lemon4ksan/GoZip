@@ -5,6 +5,8 @@
 package gozip
 
 import (
+	"bytes"
+	"encoding/binary"
 	"math"
 	"os"
 	"path"
@@ -200,6 +202,53 @@ func TestFile_GetFilenameLength(t *testing.T) {
 			length := uint16(len(tt.file.getFilename()))
 			if length != tt.expected {
 				t.Errorf("getFilenameLength() = %d, expected %d", length, tt.expected)
+			}
+		})
+	}
+}
+
+// TestIntegration_FileToHeaders verifies that file.go logic (getFilename) correctly propagates to types.go structures
+func TestIntegration_FileToHeaders(t *testing.T) {
+	tests := []struct {
+		name     string
+		file     *File
+		expected string // Expected string in the encoded bytes
+	}{
+		{
+			name:     "Normal File",
+			file:     &File{name: "doc.txt", isDir: false},
+			expected: "doc.txt",
+		},
+		{
+			name:     "Directory (Should have slash)",
+			file:     &File{name: "images", isDir: true},
+			expected: "images/",
+		},
+		{
+			name:     "Nested Directory",
+			file:     &File{name: "src/main", isDir: true},
+			expected: "src/main/",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 1. Create headers using the logic in file.go
+			h := newZipHeaders(tt.file)
+
+			// 2. Encode Local Header
+			localEncoded := h.LocalHeader().Encode()
+
+			// Verify Filename is present in bytes
+			if !bytes.Contains(localEncoded, []byte(tt.expected)) {
+				t.Errorf("Local Header bytes did not contain filename %q", tt.expected)
+			}
+
+			// Verify Filename Length field in bytes matches expected length
+			// Length is at offset 26 in Local Header
+			nameLen := binary.LittleEndian.Uint16(localEncoded[26:28])
+			if int(nameLen) != len(tt.expected) {
+				t.Errorf("Local Header name length: got %d, want %d", nameLen, len(tt.expected))
 			}
 		})
 	}

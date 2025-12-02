@@ -14,6 +14,9 @@ import (
 	"math"
 	"os"
 	"sync"
+
+	"github.com/lemon4ksan/gozip/internal"
+	"github.com/lemon4ksan/gozip/internal/sys"
 )
 
 // zipWriter handles the low-level writing of ZIP archive structure
@@ -79,7 +82,7 @@ func (zw *zipWriter) WriteCentralDirAndEndRecords() error {
 		}
 	}
 
-	endOfCentralDir := encodeEndOfCentralDirRecord(
+	endOfCentralDir := internal.EncodeEndOfCentralDirRecord(
 		zw.entriesNum,
 		uint64(zw.sizeOfCentralDir),
 		uint64(zw.headerOffset),
@@ -347,7 +350,7 @@ func (zw *zipWriter) createEncryptor(dest io.Writer, cfg FileConfig, crc32Val ui
 func (zw *zipWriter) writeFileHeader(file *File) error {
 	file.localHeaderOffset = zw.headerOffset
 	header := newZipHeaders(file).LocalHeader()
-	n, err := zw.dest.Write(header.encode())
+	n, err := zw.dest.Write(header.Encode())
 	if err != nil {
 		return err
 	}
@@ -368,7 +371,7 @@ func (zw *zipWriter) addCentralDirEntry(file *File) error {
 	addFilesystemExtraField(file)
 
 	cdData := newZipHeaders(file).CentralDirEntry()
-	n, err := zw.centralDir.Write(cdData.encode())
+	n, err := zw.centralDir.Write(cdData.Encode())
 	if err != nil {
 		return fmt.Errorf("write central directory entry: %w", err)
 	}
@@ -409,7 +412,7 @@ func (zw *zipWriter) updateLocalHeader(file *File) error {
 // writeZip64EndHeaders writes ZIP64 end of central directory record and locator.
 // Used when archive exceeds 4GB in total size or contains too many files.
 func (zw *zipWriter) writeZip64EndHeaders() error {
-	zip64EndOfCentralDir := encodeZip64EndOfCentralDirRecord(
+	zip64EndOfCentralDir := internal.EncodeZip64EndOfCentralDirRecord(
 		uint64(zw.entriesNum),
 		uint64(zw.sizeOfCentralDir),
 		uint64(zw.headerOffset),
@@ -418,7 +421,7 @@ func (zw *zipWriter) writeZip64EndHeaders() error {
 		return fmt.Errorf("write zip64 end of central directory: %w", err)
 	}
 
-	zip64EndOfCentralDirLocator := encodeZip64EndOfCentralDirLocator(
+	zip64EndOfCentralDirLocator := internal.EncodeZip64EndOfCentralDirLocator(
 		uint64(zw.headerOffset + zw.sizeOfCentralDir),
 	)
 	if _, err := zw.dest.Write(zip64EndOfCentralDirLocator); err != nil {
@@ -762,7 +765,7 @@ func addFilesystemExtraField(f *File) {
 		return
 	}
 
-	if f.hostSystem == HostSystemNTFS && !f.HasExtraField(NTFSFieldTag) && hasPreciseTimestamps(f.metadata) {
+	if f.hostSystem == sys.HostSystemNTFS && !f.HasExtraField(NTFSFieldTag) && hasPreciseTimestamps(f.metadata) {
 		f.AddExtraField(NTFSFieldTag, encodeNTFSExtraField(f.metadata))
 	}
 }
