@@ -1,3 +1,7 @@
+// Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gozip
 
 // CompressionMethod represents the compression algorithm used for a file in the ZIP archive
@@ -65,12 +69,12 @@ type FileSortStrategy int
 
 const (
 	SortDefault         FileSortStrategy = iota
-	SortLargeFilesLast  // Large files (>=4GB) at end
-	SortLargeFilesFirst // Large filles (>=4GB) at start
-	SortSizeAscending   // Smallest first (slower)
-	SortSizeDescending  // Largest first (slower)
-	SortZIP64Optimized  // Smart ZIP64 optimization
-	SortAlphabetical    // A-Z by filename (folders first naturally)
+	SortLargeFilesLast                   // Large files (>=4GB) at end
+	SortLargeFilesFirst                  // Large filles (>=4GB) at start
+	SortSizeAscending                    // Smallest first (slower)
+	SortSizeDescending                   // Largest first (slower)
+	SortZIP64Optimized                   // Smart ZIP64 optimization
+	SortAlphabetical                     // A-Z by filename (folders first naturally)
 )
 
 // FileSystemType represents the type of file system on which the ZIP file was created

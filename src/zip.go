@@ -1,3 +1,7 @@
+// Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gozip
 
 import (
@@ -42,10 +46,10 @@ type ZipConfig struct {
 	Comment string
 
 	// TextEncoding specifies a fallback decoder for filenames/comments
-    // when UTF-8 flag is not set.
-    // Example: gozip.DecodeIBM866 for Russian DOS archives.
-    // Default: CP437 (US DOS).
-    TextEncoding TextDecoder
+	// when UTF-8 flag is not set.
+	// Example: gozip.DecodeIBM866 for Russian DOS archives.
+	// Default: CP437 (US DOS).
+	TextEncoding TextDecoder
 }
 
 // FileConfig defines per-file configuration options that override archive defaults.
@@ -148,8 +152,8 @@ func WithMode(mode fs.FileMode) AddOption {
 
 // compressorKey defines a key for compressors map
 type compressorKey struct {
-    method CompressionMethod
-    level  int
+	method CompressionMethod
+	level  int
 }
 
 type compressorsMap map[compressorKey]Compressor
@@ -259,7 +263,7 @@ func (z *Zip) AddFromDir(path string, options ...AddOption) error {
 	err := filepath.WalkDir(path, func(walkPath string, _ fs.DirEntry, err error) error {
 		if err != nil {
 			errs = append(errs, fmt.Errorf("access error %s: %w", walkPath, err))
-			return nil 
+			return nil
 		}
 
 		if walkPath == path {
@@ -278,7 +282,7 @@ func (z *Zip) AddFromDir(path string, options ...AddOption) error {
 			errs = append(errs, fmt.Errorf("failed to add %s: %w", walkPath, err))
 			return nil
 		}
-		
+
 		return nil
 	})
 

@@ -1,3 +1,7 @@
+// Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gozip
 
 import (
@@ -90,16 +94,16 @@ func (zr *zipReader) findAndReadEndOfCentralDir() (endOfCentralDirectory, error)
 	for searchStart := int64(0); searchStart < searchLimit; {
 		// Calculate how much we need to read in this iteration
 		readSize := min(bufSize, searchLimit-searchStart)
-		
+
 		// Calculate read position: start reading from (fileSize - searchLimit + searchStart)
 		readPos := fileSize - searchLimit + searchStart
-		
+
 		// Ensure we don't read past file boundaries
 		if readPos < 0 {
 			readPos = 0
 			readSize = min(bufSize, fileSize)
 		}
-		
+
 		// Seek to read position
 		if _, err := zr.src.Seek(readPos, io.SeekStart); err != nil {
 			return endOfCentralDirectory{}, fmt.Errorf("seek to position %d: %w", readPos, err)
@@ -110,7 +114,7 @@ func (zr *zipReader) findAndReadEndOfCentralDir() (endOfCentralDirectory, error)
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			return endOfCentralDirectory{}, fmt.Errorf("read buffer: %w", err)
 		}
-		
+
 		if n == 0 {
 			break
 		}
@@ -181,7 +185,7 @@ func (zr *zipReader) findAndReadZip64EndOfCentralDir(commentLength uint16) (zip6
 func (zr *zipReader) readCentralDir(entries int64) ([]*File, error) {
 	safeCap := entries
 	if safeCap > 1024*1024 {
-		safeCap = 1024 
+		safeCap = 1024
 	}
 	files := make([]*File, 0, safeCap)
 

@@ -1,3 +1,7 @@
+// Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gozip
 
 import (
@@ -260,13 +264,13 @@ func (r *aesReader) Read(p []byte) (int, error) {
 		r.mac.Write(p[:n])
 		r.stream.XORKeyStream(p[:n], p[:n])
 	}
-	
+
 	if err == io.EOF && r.checkOnEOF {
 		expected := make([]byte, aesMacSize)
 		if _, macErr := io.ReadFull(r.macSrc, expected); macErr != nil {
 			return n, fmt.Errorf("read auth mac: %w", macErr)
 		}
-		
+
 		calculated := r.mac.Sum(nil)[:aesMacSize]
 		if !bytes.Equal(calculated, expected) {
 			return n, errors.New("aes authentication failed")
@@ -329,7 +333,7 @@ type winZipCounter struct {
 func newWinZipCounter(block cipher.Block) *winZipCounter {
 	// Counter starts at 1
 	c := &winZipCounter{
-		block: block,
+		block:  block,
 		buffer: make([]byte, aes.BlockSize),
 	}
 	c.counter[0] = 1

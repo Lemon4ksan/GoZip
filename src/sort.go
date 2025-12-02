@@ -1,3 +1,7 @@
+// Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gozip
 
 import "sort"
@@ -57,7 +61,7 @@ func partitionStable(files []*File, keepFirst func(*File) bool) []*File {
 	}
 
 	result := make([]*File, len(files))
-	
+
 	// Pointers for where to write the next element
 	idxFirst := 0
 	idxSecond := countFirst
@@ -98,7 +102,7 @@ func sortSizeDescending(files []*File) []*File {
 // Inside buckets: Sorted by size ASC.
 func optimizedSortZIP64Buckets(files []*File) []*File {
 	var small, medium, large []*File
-	
+
 	// Pre-allocate to avoid resizing if possible, assuming roughly equal distribution
 	// or just let append handle it. For >1000 files, append overhead is negligible compared to sort.
 	capEst := len(files) / 3
@@ -135,7 +139,7 @@ func optimizedSortZIP64Buckets(files []*File) []*File {
 	result = append(result, small...)
 	result = append(result, medium...)
 	result = append(result, large...)
-	
+
 	return result
 }
 
@@ -161,7 +165,7 @@ func getSizePriority(size int64) int {
 	// Priority 0: Small files (good for headers packing)
 	// Priority 1: Standard files
 	// Priority 2: Zip64 files or Unknown size (Stream)
-	
+
 	if size < 0 {
 		return 2 // Unknown size -> treat as Large/Complex
 	}

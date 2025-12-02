@@ -1,5 +1,9 @@
 //go:build darwin || freebsd || netbsd || openbsd
 
+// Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gozip
 
 import (

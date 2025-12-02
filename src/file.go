@@ -1,3 +1,7 @@
+// Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gozip
 
 import (
@@ -180,11 +184,10 @@ func (f *File) CompressedSize() int64 { return f.compressedSize }
 
 // CRC32 returns the CRC-32 checksum of the uncompressed file data.
 // This value is used for data integrity verification during extraction.
-func (f *File) CRC32() uint32         { return f.crc32 }
-
+func (f *File) CRC32() uint32 { return f.crc32 }
 
 // ModTime returns the file's last modification timestamp
-func (f *File) ModTime() time.Time    { return f.modTime }
+func (f *File) ModTime() time.Time { return f.modTime }
 
 // SetConfig applies a FileConfig to this file, overriding individual properties.
 // If config.Name is non-empty, it replaces the current filename. Compression
@@ -395,9 +398,9 @@ func (zh *zipHeaders) getFileBitFlag() uint16 {
 	}
 
 	// Always set Bit 11 (Language encoding flag / EFS)
-    // This indicates that Filename and Comment are encoded in UTF-8.
-    // Go strings are always UTF-8, so this is technically always correct
-    // and ensures compatibility with modern archivers (WinRAR, 7-Zip, macOS).
+	// This indicates that Filename and Comment are encoded in UTF-8.
+	// Go strings are always UTF-8, so this is technically always correct
+	// and ensures compatibility with modern archivers (WinRAR, 7-Zip, macOS).
 	flag |= 0x800
 
 	return flag

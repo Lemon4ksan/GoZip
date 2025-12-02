@@ -1,3 +1,7 @@
+// Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gozip
 
 import (
@@ -448,7 +452,7 @@ func (zw *zipWriter) resolveCompressor(method CompressionMethod, level int) (Com
 		}
 
 		zw.compressors[key] = NewDeflateCompressor(level)
-    	return zw.compressors[key], nil
+		return zw.compressors[key], nil
 	default:
 		return nil, fmt.Errorf("unsupported compression method: %d", method)
 	}
@@ -676,10 +680,10 @@ func (mb *memoryBuffer) Write(p []byte) (n int, err error) {
 
 	// If at the end of the file
 	if mb.pos == int64(len(mb.data)) {
-        mb.data = append(mb.data, p...)
-        mb.pos += int64(len(p))
-        return len(p), nil
-    }
+		mb.data = append(mb.data, p...)
+		mb.pos += int64(len(p))
+		return len(p), nil
+	}
 
 	// Calculate required capacity
 	required := mb.pos + int64(len(p))
