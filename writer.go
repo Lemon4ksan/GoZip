@@ -175,7 +175,12 @@ func (zw *zipWriter) encodeAndUpdateFile(file *File, writer io.Writer) error {
 	}
 	file.uncompressedSize = stats.uncompressedSize
 	file.compressedSize = stats.compressedSize
-	file.crc32 = stats.crc32
+
+	if file.config.EncryptionMethod == AES256 {
+		file.crc32 = 0
+	} else {
+		file.crc32 = stats.crc32
+	}
 
 	return nil
 }

@@ -42,7 +42,7 @@ type LocalFileHeader struct {
 func (h LocalFileHeader) Encode() []byte {
 	// Fixed size (30 bytes) + variable filename length
 	// Signature(4) + Header(26) = 30 bytes
-	buf := make([]byte, 30+h.FilenameLength)
+	buf := make([]byte, 30+h.FilenameLength+h.ExtraFieldLength)
 	binary.LittleEndian.PutUint32(buf[0:4], LocalFileHeaderSignature)
 	binary.LittleEndian.PutUint16(buf[4:6], h.VersionNeededToExtract)
 	binary.LittleEndian.PutUint16(buf[6:8], h.GeneralPurposeBitFlag)

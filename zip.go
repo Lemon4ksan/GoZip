@@ -230,7 +230,7 @@ func (z *Zip) SetConfig(c ZipConfig) {
 func (z *Zip) RegisterCompressor(method CompressionMethod, level int, c Compressor) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	z.compressors[compressorKey{method: method, level: level}] = c
+	z.compressors[compressorKey{method, level}] = c
 }
 
 // RegisterDecompressor registers a custom decompressor implementation for a
