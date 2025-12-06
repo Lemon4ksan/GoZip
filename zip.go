@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -16,6 +17,11 @@ import (
 	"sync"
 	"time"
 )
+
+// SizeUnknown is a sentinel value indicating that the uncompressed size of a file
+// cannot be determined in advance. This typically occurs when creating files from
+// io.Reader sources where the total data length is unknown until fully read.
+const SizeUnknown int64 = -1
 
 // ZipConfig defines global configuration parameters for creating or modifying ZIP archives.
 // These settings apply to the entire archive unless overridden at the file level.
@@ -47,7 +53,7 @@ type ZipConfig struct {
 
 	// TextEncoding specifies a fallback decoder for filenames/comments
 	// when UTF-8 flag is not set.
-	// Example: gozip.DecodeIBM866 for Russian DOS archives.
+	// Example: [DecodeIBM866] for Russian DOS archives.
 	// Default: CP437 (US DOS).
 	TextEncoding TextDecoder
 }
@@ -235,8 +241,7 @@ func (z *Zip) RegisterCompressor(method CompressionMethod, level int, c Compress
 
 // RegisterDecompressor registers a custom decompressor implementation for a
 // specific compression method. This is required when reading archives that
-// use compression methods not natively supported by the library.
-// Thread-safe.
+// use compression methods not natively supported by the library. Thread-safe.
 func (z *Zip) RegisterDecompressor(method CompressionMethod, d Decompressor) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
@@ -248,9 +253,6 @@ func (z *Zip) RegisterDecompressor(method CompressionMethod, d Decompressor) {
 // for opening and closing the file. File metadata (size, mod time, etc.) is
 // extracted from the os.File handle.
 func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
-	if f == nil {
-		return errors.New("file cannot be nil")
-	}
 	fileEntry, err := newFileFromOS(f)
 	if err != nil {
 		return err
@@ -314,8 +316,9 @@ func (z *Zip) AddFromDir(path string, options ...AddOption) error {
 
 // AddReader adds file content from an arbitrary io.Reader to the archive.
 // This is useful for adding dynamically generated content or reading from network streams.
-func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) error {
-	fileEntry, err := newFileFromReader(r, filename)
+// If size is [SizeUnknown] it will be calculated during archive writing.
+func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...AddOption) error {
+	fileEntry, err := newFileFromReader(r, filename, size)
 	if err != nil {
 		return err
 	}
@@ -329,7 +332,7 @@ func (z *Zip) AddReader(r io.Reader, filename string, options ...AddOption) erro
 func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
 	dirEntry, err := newDirectoryFile(name)
 	if err != nil {
-		return fmt.Errorf("create directory file: %w", err)
+		return err
 	}
 	return z.addEntry(dirEntry, options)
 }
@@ -343,8 +346,25 @@ func (z *Zip) Exists(name string) bool {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
 
-	key := path.Clean(strings.ReplaceAll(name, "\\", "/"))
+	key := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
 	return z.fileCache[key] || z.fileCache[key+"/"]
+}
+
+// Open returns a ReadCloser for the file with the given name inside the archive.
+// Returns ErrFileNotFound if the file does not exist. Thread-safe for concurrent reads.
+func (z *Zip) OpenFile(name string) (io.ReadCloser, error) {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+
+	searchName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
+
+	for _, f := range z.files {
+		if f.name == searchName && !f.isDir {
+			return f.Open()
+		}
+	}
+
+	return nil, fmt.Errorf("%w: %s", ErrFileNotFound, name)
 }
 
 // Write serializes the entire ZIP archive to the destination writer.
@@ -360,10 +380,15 @@ func (z *Zip) Write(dest io.Writer) error {
 	writer := newZipWriter(z.config, z.compressors, dest)
 	for _, file := range files {
 		if err := writer.WriteFile(file); err != nil {
-			return fmt.Errorf("write file %s: %w", file.name, err)
+			return fmt.Errorf("zip: write file %s: %w", file.name, err)
 		}
 	}
-	return writer.WriteCentralDirAndEndRecords()
+
+	if err := writer.WriteCentralDirAndEndRecords(); err != nil {
+		return fmt.Errorf("zip: %w", err)
+	}
+
+	return nil
 }
 
 // WriteParallel serializes the ZIP archive using concurrent workers for compression.
@@ -382,10 +407,8 @@ func (z *Zip) WriteParallel(dest io.Writer, maxWorkers int) error {
 	if err := writer.zw.WriteCentralDirAndEndRecords(); err != nil {
 		errs = append(errs, err)
 	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
-	return nil
+
+	return errors.Join(errs...)
 }
 
 // Read parses an existing ZIP archive from the source and appends its contents
@@ -403,6 +426,7 @@ func (z *Zip) Read(src io.ReadSeeker) error {
 // Directory structure is preserved, and file permissions/timestamps are restored
 // when supported by the host filesystem. Path traversal attacks are prevented
 // by validating extracted paths. Returns combined errors if any extraction fails.
+// It expects that given path already exists.
 func (z *Zip) Extract(path string) error {
 	path = filepath.Clean(path)
 	var errs []error
@@ -418,9 +442,10 @@ func (z *Zip) Extract(path string) error {
 		fpath := filepath.Join(path, f.name)
 
 		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
-			errs = append(errs, fmt.Errorf("illegal file path: %s", fpath))
+			errs = append(errs, fmt.Errorf("%w: %s", ErrInsecurePath, fpath))
 			continue
 		}
+
 		if f.isDir {
 			if err := os.Mkdir(fpath, 0755); err != nil {
 				errs = append(errs, err)
@@ -432,23 +457,19 @@ func (z *Zip) Extract(path string) error {
 		}
 	}
 
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // ExtractParallel extracts archive contents using multiple concurrent workers.
 // This can significantly improve extraction speed for archives with many files,
 // especially on SSDs or fast storage systems. Directory creation is performed
 // upfront, then file extraction is parallelized with controlled concurrency.
+// Any missing folders in given path will be created automatically.
 func (z *Zip) ExtractParallel(path string, workers int) error {
-	path = filepath.Clean(path)
 	var errs []error
-
 	var filesToExtract []*File
 	dirsToCreate := make(map[string]struct{})
-	dirsToCreate[path] = struct{}{}
+	path = filepath.Clean(path)
 
 	z.mu.RLock()
 	files := sortAlphabetical(z.files)
@@ -461,9 +482,10 @@ func (z *Zip) ExtractParallel(path string, workers int) error {
 		fpath := filepath.Join(path, f.name)
 
 		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
-			errs = append(errs, fmt.Errorf("illegal file path: %s", fpath))
+			errs = append(errs, fmt.Errorf("%w: %s", ErrInsecurePath, fpath))
 			continue
 		}
+
 		if f.isDir {
 			dirsToCreate[fpath] = struct{}{}
 			continue
@@ -531,21 +553,27 @@ func (z *Zip) addEntry(f *File, options []AddOption) error {
 	}
 	f.name = strings.TrimPrefix(path.Clean(strings.ReplaceAll(f.name, "\\", "/")), "/")
 
+	if len(f.name)+1 > math.MaxUint16 {
+		return fmt.Errorf("%w (%d bytes)", ErrFilenameTooLong, len(f.name))
+	}
+
+	if len(f.config.Comment) > math.MaxUint16 {
+		return fmt.Errorf("%w (%d bytes)", ErrCommentTooLong, len(f.config.Comment))
+	}
+
 	z.mu.Lock()
 	defer z.mu.Unlock()
 
 	if z.fileCache[f.name] {
-		return fmt.Errorf("duplicate entry: %s", f.name)
+		return fmt.Errorf("%w: '%s' already exists", ErrDuplicateEntry, f.name)
 	}
+
 	if !f.isDir && z.fileCache[f.name+"/"] {
-		return fmt.Errorf("collision: %s is already a directory", f.name)
-	}
-	if f.isDir && z.fileCache[strings.TrimSuffix(f.name, "/")] {
-		return fmt.Errorf("collision: directory %s conflicts with existing file", f.name)
+		return fmt.Errorf("%w: '%s' is already a directory", ErrDuplicateEntry, f.name)
 	}
 
 	if err := z.createMissingDirs(f.name); err != nil {
-		return fmt.Errorf("create missing dirs: %w", err)
+		return err
 	}
 
 	z.files = append(z.files, f)
@@ -573,7 +601,7 @@ func (z *Zip) createMissingDirs(filePath string) error {
 			break
 		}
 		if z.fileCache[dir] {
-			return fmt.Errorf("path collision: '%s' is a file, cannot create directory", dir)
+			return fmt.Errorf("%w: '%s' is already a file", ErrDuplicateEntry, dir)
 		}
 		missingDirs = append(missingDirs, dir)
 		dir = path.Dir(dir)

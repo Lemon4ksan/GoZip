@@ -28,8 +28,6 @@ const (
 	AES256       EncryptionMethod = 2 // Modern AES256 encryption
 )
 
-var ErrPasswordMismatch = errors.New("invalid password")
-
 type zipCryptoWriter struct {
 	dest   io.Writer
 	cipher *zipCipher

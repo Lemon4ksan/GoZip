@@ -48,7 +48,7 @@ func TestNewFileFromReader(t *testing.T) {
 	reader := strings.NewReader("test content")
 	name := "test.txt"
 
-	file, err := newFileFromReader(reader, name)
+	file, err := newFileFromReader(reader, name, SizeUnknown)
 	if err != nil {
 		t.Fatalf("NewFileFromReader failed: %v", err)
 	}

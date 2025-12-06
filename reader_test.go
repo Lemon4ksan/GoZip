@@ -7,11 +7,11 @@ package gozip
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
 	"io"
 	"io/fs"
 	"math"
-	"strings"
 	"testing"
 
 	"github.com/lemon4ksan/gozip/internal"
@@ -233,10 +233,8 @@ func TestChecksumReader(t *testing.T) {
 
 		io.Copy(io.Discard, cr)
 		err := cr.Close()
-		if err == nil {
-			t.Error("Expected checksum error, got nil")
-		} else if !strings.Contains(err.Error(), "checksum mismatch") {
-			t.Errorf("Expected checksum mismatch error, got: %v", err)
+		if !errors.Is(err, ErrChecksum) {
+			t.Errorf("Expected ErrCheckSum, got: %v", err)
 		}
 	})
 
@@ -251,10 +249,8 @@ func TestChecksumReader(t *testing.T) {
 
 		io.Copy(io.Discard, cr)
 		err := cr.Close()
-		if err == nil {
-			t.Error("Expected size error, got nil")
-		} else if !strings.Contains(err.Error(), "size mismatch") {
-			t.Errorf("Expected size mismatch error, got: %v", err)
+		if !errors.Is(err, ErrSizeMismatch) {
+			t.Errorf("Expected ErrSizeMismatch, got: %v", err)
 		}
 	})
 

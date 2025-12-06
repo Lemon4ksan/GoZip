@@ -6,7 +6,6 @@ package gozip
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash"
 	"hash/crc32"
@@ -79,13 +78,14 @@ func (zr *zipReader) ReadFiles() ([]*File, error) {
 // This record is located at the end of the ZIP file and contains metadata
 // about the archive structure and central directory location.
 func (zr *zipReader) findAndReadEndOfCentralDir() (internal.EndOfCentralDirectory, error) {
+	var end internal.EndOfCentralDirectory
+
 	fileSize, err := zr.src.Seek(0, io.SeekEnd)
 	if err != nil {
-		return internal.EndOfCentralDirectory{}, fmt.Errorf("get file size: %w", err)
+		return end, fmt.Errorf("seek source: %w", err)
 	}
-
 	if fileSize < directoryEndLen {
-		return internal.EndOfCentralDirectory{}, errors.New("file too small to be a valid ZIP archive")
+		return end, fmt.Errorf("%w: file too small", ErrFormat)
 	}
 
 	const bufSize = 1024
@@ -109,13 +109,13 @@ func (zr *zipReader) findAndReadEndOfCentralDir() (internal.EndOfCentralDirector
 
 		// Seek to read position
 		if _, err := zr.src.Seek(readPos, io.SeekStart); err != nil {
-			return internal.EndOfCentralDirectory{}, fmt.Errorf("seek to position %d: %w", readPos, err)
+			return end, fmt.Errorf("seek to position %d: %w", readPos, err)
 		}
 
 		// Read data into buffer
 		n, err := io.ReadFull(zr.src, buf[:readSize])
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			return internal.EndOfCentralDirectory{}, fmt.Errorf("read buffer: %w", err)
+			return end, fmt.Errorf("read buffer: %w", err)
 		}
 
 		if n == 0 {
@@ -134,7 +134,7 @@ func (zr *zipReader) findAndReadEndOfCentralDir() (internal.EndOfCentralDirector
 				}
 				recordStart := readPos + int64(p) + 4
 				if _, err := zr.src.Seek(recordStart, io.SeekStart); err != nil {
-					return internal.EndOfCentralDirectory{}, fmt.Errorf("seek to record at %d: %w", recordStart, err)
+					return end, fmt.Errorf("seek to record at %d: %w", recordStart, err)
 				}
 				return internal.ReadEndOfCentralDir(zr.src)
 			}
@@ -148,7 +148,7 @@ func (zr *zipReader) findAndReadEndOfCentralDir() (internal.EndOfCentralDirector
 		}
 	}
 
-	return internal.EndOfCentralDirectory{}, errors.New("couldn't locate end of central directory signature")
+	return end, fmt.Errorf("%w: no end of central directory signature found", ErrFormat)
 }
 
 // findAndReadZip64EndOfCentralDir scans for the Zip64 End of Central Directory record.
@@ -164,7 +164,7 @@ func (zr *zipReader) findAndReadZip64EndOfCentralDir(commentLength uint16) (inte
 	}
 
 	if !zr.verifySignature(internal.Zip64EndOfCentralDirLocatorSignature) {
-		return zip64End, errors.New("expected zip64 end of central directory locator signature")
+		return zip64End, fmt.Errorf("%w: expected zip64 end of central directory locator signature", ErrFormat)
 	}
 
 	zip64Locator, err := internal.ReadZip64EndOfCentralDirLocator(zr.src)
@@ -177,7 +177,7 @@ func (zr *zipReader) findAndReadZip64EndOfCentralDir(commentLength uint16) (inte
 	}
 
 	if !zr.verifySignature(internal.Zip64EndOfCentralDirSignature) {
-		return zip64End, errors.New("expected zip64 end of central directory signature")
+		return zip64End, fmt.Errorf("%w: expected zip64 end of central directory signature", ErrFormat)
 	}
 
 	return internal.ReadZip64EndOfCentralDir(zr.src)
@@ -194,7 +194,7 @@ func (zr *zipReader) readCentralDir(entries int64) ([]*File, error) {
 
 	for i := range entries {
 		if !zr.verifySignature(internal.CentralDirectorySignature) {
-			return nil, fmt.Errorf("expected central directory signature at entry %d", i)
+			return nil, fmt.Errorf("%w: expected central directory signature at entry %d", ErrFormat, i)
 		}
 
 		entry, err := internal.ReadCentralDirEntry(zr.src)
@@ -304,7 +304,7 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 	}
 
 	if binary.LittleEndian.Uint32(buf[0:4]) != internal.LocalFileHeaderSignature {
-		return nil, errors.New("invalid local file header signature")
+		return nil, fmt.Errorf("%w: expected local file header signature", ErrFormat)
 	}
 
 	bitFlag := binary.LittleEndian.Uint16(buf[6:8])
@@ -327,7 +327,7 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 
 	if isEncrypted {
 		if f.config.Password == "" {
-			return nil, errors.New("file is encrypted but no password provided")
+			return nil, fmt.Errorf("%w: file is encrypted but no password provided", ErrPasswordMismatch)
 		}
 
 		var err error
@@ -338,7 +338,7 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 		case AES256:
 			dataR, err = NewAes256Reader(dataR, f.config.Password, f.compressedSize)
 		default:
-			return nil, fmt.Errorf("unknown encryption method: %d", f.config.EncryptionMethod)
+			return nil, fmt.Errorf("%w: %d", ErrEncryption, f.config.EncryptionMethod)
 		}
 		if err != nil {
 			return nil, err
@@ -349,7 +349,7 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 	defer zr.mu.RUnlock()
 	decompressor, ok := zr.decompressors[f.config.CompressionMethod]
 	if !ok {
-		return nil, fmt.Errorf("unsupported compression method: %d", f.config.CompressionMethod)
+		return nil, fmt.Errorf("%w: %d", ErrAlgorithm, f.config.CompressionMethod)
 	}
 
 	rc, err := decompressor.Decompress(dataR)
@@ -418,7 +418,7 @@ func (cr *checksumReader) Read(p []byte) (int, error) {
 	if n > 0 {
 		cr.read += uint64(n)
 		if cr.read > cr.size {
-			return n, errors.New("file is larger than declared in header")
+			return n, ErrSizeMismatch
 		}
 		cr.hash.Write(p[:n])
 	}
@@ -430,11 +430,11 @@ func (cr *checksumReader) Close() error {
 	defer cr.rc.Close()
 
 	if cr.read != cr.size {
-		return fmt.Errorf("size mismatch: read %d, want %d", cr.read, cr.size)
+		return fmt.Errorf("%w: read %d, want %d", ErrSizeMismatch, cr.read, cr.size)
 	}
 
 	if got := cr.hash.Sum32(); got != cr.want {
-		return fmt.Errorf("checksum mismatch: got %x, want %x", got, cr.want)
+		return fmt.Errorf("%w: got %x, want %x", ErrChecksum, got, cr.want)
 	}
 	return nil
 }

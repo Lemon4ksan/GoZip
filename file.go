@@ -5,7 +5,6 @@
 package gozip
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -17,11 +16,6 @@ import (
 	"github.com/lemon4ksan/gozip/internal"
 	"github.com/lemon4ksan/gozip/internal/sys"
 )
-
-// SizeUnknown is a sentinel value indicating that the uncompressed size of a file
-// cannot be determined in advance. This typically occurs when creating files from
-// io.Reader sources where the total data length is unknown until fully read.
-const SizeUnknown int64 = -1
 
 // Compression method indicates AES256 encryption.
 // The actual compression method is stored in extra field.
@@ -56,7 +50,7 @@ type File struct {
 
 	openFunc         func() (io.ReadCloser, error) // Factory function for reading original content
 	uncompressedSize int64                         // Size of original content before compression in bytes
-	compressedSize   int64                         // Size of compressed data within archive bytes
+	compressedSize   int64                         // Size of compressed data within archive in bytes
 	crc32            uint32                        // CRC-32 checksum of uncompressed data
 
 	// Per-file configuration overriding archive defaults
@@ -75,13 +69,18 @@ type File struct {
 // reader that seeks to the beginning on each Open() call. The caller remains
 // responsible for closing the original file.
 func newFileFromOS(f *os.File) (*File, error) {
+	if f == nil {
+		return nil, fmt.Errorf("%w: file cannot be nil", ErrFileEntry)
+	}
+
 	stat, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat file: %w", err)
+		return nil, err
 	}
-	uncompressedSize := stat.Size()
-	if stat.IsDir() {
-		uncompressedSize = 0
+
+	var uncompressedSize int64
+	if !stat.IsDir() {
+		uncompressedSize = stat.Size()
 	}
 
 	return &File{
@@ -107,17 +106,18 @@ func newFileFromOS(f *os.File) (*File, error) {
 func newFileFromPath(filePath string) (*File, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("open file for metadata: %w", err)
+		return nil, err
 	}
 	defer f.Close()
 
 	stat, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("get file stats: %w", err)
+		return nil, err
 	}
-	uncompressedSize := stat.Size()
-	if stat.IsDir() {
-		uncompressedSize = 0
+
+	var uncompressedSize int64
+	if !stat.IsDir() {
+		uncompressedSize = stat.Size()
 	}
 
 	return &File{
@@ -136,18 +136,20 @@ func newFileFromPath(filePath string) (*File, error) {
 }
 
 // newFileFromReader creates a File object from an arbitrary [io.Reader] source.
-// Since the total size is unknown upfront, uncompressedSize is set to sizeUnknown,
-// which may limit certain optimization strategies during archive creation.
-func newFileFromReader(src io.Reader, name string) (*File, error) {
+func newFileFromReader(src io.Reader, name string, size int64) (*File, error) {
 	if src == nil {
-		return nil, errors.New("reader cannot be nil")
+		return nil, fmt.Errorf("%w: reader cannot be nil", ErrFileEntry)
 	}
 	if name == "" {
-		return nil, errors.New("filename cannot be empty")
+		return nil, fmt.Errorf("%w: filename cannot be empty", ErrFileEntry)
 	}
+	if size < 0 && size != SizeUnknown {
+		return nil, fmt.Errorf("%w: size cannot be negative", ErrFileEntry)
+	}
+
 	return &File{
 		name:             name,
-		uncompressedSize: SizeUnknown,
+		uncompressedSize: size,
 		modTime:          time.Now(),
 		hostSystem:       sys.GetHostSystemByOS(),
 		extraField:       make(map[uint16][]byte),
@@ -162,8 +164,9 @@ func newFileFromReader(src io.Reader, name string) (*File, error) {
 // timestamps, and hierarchical structure within the archive.
 func newDirectoryFile(name string) (*File, error) {
 	if name == "" {
-		return nil, errors.New("directory name cannot be empty")
+		return nil, fmt.Errorf("%w: directory name cannot be empty", ErrFileEntry)
 	}
+
 	return &File{
 		name:       name,
 		isDir:      true,
@@ -178,7 +181,7 @@ func newDirectoryFile(name string) (*File, error) {
 // For directories, this does not include the trailing slash.
 func (f *File) Name() string { return f.name }
 
-// IsDir returns true if the file represents a directory entry
+// IsDir returns true if the file represents a directory entry.
 func (f *File) IsDir() bool { return f.isDir }
 
 // UncompressedSize returns the size of the original file content before compression.
@@ -193,8 +196,21 @@ func (f *File) CompressedSize() int64 { return f.compressedSize }
 // This value is used for data integrity verification during extraction.
 func (f *File) CRC32() uint32 { return f.crc32 }
 
-// ModTime returns the file's last modification timestamp
+// ModTime returns the file's last modification timestamp.
 func (f *File) ModTime() time.Time { return f.modTime }
+
+// Open returns a ReadCloser for reading the original, uncompressed file content.
+// The returned reader should be closed after use to release any held resources.
+// For files created from os.File or file paths, this opens a fresh file handle.
+func (f *File) Open() (io.ReadCloser, error) { return f.openFunc() }
+
+// HasExtraField checks whether an extra field with the specified tag exists.
+func (f *File) HasExtraField(tag uint16) bool { _, ok := f.extraField[tag]; return ok }
+
+// GetExtraField retrieves the raw bytes of an extra field by its tag ID.
+// Returns nil if no extra field with the given tag exists. The returned slice
+// includes the 4-byte header (tag + size) followed by the field data.
+func (f *File) GetExtraField(tag uint16) []byte { return f.extraField[tag] }
 
 // SetConfig applies a FileConfig to this file, overriding individual properties.
 // If config.Name is non-empty, it replaces the current filename. Compression
@@ -217,11 +233,16 @@ func (f *File) SetConfig(config FileConfig) {
 // scenarios like streaming from network sources or applying transformations.
 func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) { f.openFunc = openFunc }
 
-// Open returns a ReadCloser for reading the original, uncompressed file content.
-// The returned reader should be closed after use to release any held resources.
-// For files created from os.File or file paths, this opens a fresh file handle.
-func (f *File) Open() (io.ReadCloser, error) {
-	return f.openFunc()
+// SetExtraField adds or replaces an extra field entry for this file.
+// The data parameter must include the 4-byte header (tag + size) followed by
+// the field content. Returns an error if the tag already exists or if adding
+// the field would exceed the maximum extra field length (65535 bytes).
+func (f *File) SetExtraField(tag uint16, data []byte) error {
+	if !f.HasExtraField(tag) && f.getExtraFieldLength()+len(data) > math.MaxUint16 {
+		return ErrExtraFieldTooLong
+	}
+	f.extraField[tag] = data
+	return nil
 }
 
 // RequiresZip64 determines whether this file requires ZIP64 format extensions.
@@ -231,34 +252,6 @@ func (f *File) RequiresZip64() bool {
 	return f.compressedSize > math.MaxUint32 ||
 		f.uncompressedSize > math.MaxUint32 ||
 		f.localHeaderOffset > math.MaxUint32
-}
-
-// GetExtraField retrieves the raw bytes of an extra field by its tag ID.
-// Returns nil if no extra field with the given tag exists. The returned slice
-// includes the 4-byte header (tag + size) followed by the field data.
-func (f *File) GetExtraField(tag uint16) []byte {
-	return f.extraField[tag]
-}
-
-// HasExtraField checks whether an extra field with the specified tag exists
-func (f *File) HasExtraField(tag uint16) bool {
-	_, ok := f.extraField[tag]
-	return ok
-}
-
-// AddExtraField adds or replaces an extra field entry for this file.
-// The data parameter must include the 4-byte header (tag + size) followed by
-// the field content. Returns an error if the tag already exists or if adding
-// the field would exceed the maximum extra field length (65535 bytes).
-func (f *File) AddExtraField(tag uint16, data []byte) error {
-	if f.HasExtraField(tag) {
-		return errors.New("entry with the same tag already exists")
-	}
-	if f.getExtraFieldLength()+len(data) > math.MaxUint16 {
-		return errors.New("extra field length limit exceeded")
-	}
-	f.extraField[tag] = data
-	return nil
 }
 
 // getExtraFieldLength calculates the total size of all extra field entries.

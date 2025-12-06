@@ -187,6 +187,7 @@ func EncodeEndOfCentralDirRecord(entriesNum int, centralDirSize uint64, centralD
 	// Signature(4) + Header(18) = 22 bytes
 	buf := make([]byte, 22+len(comment))
 
+	commentLen := min(len(comment), math.MaxUint16)
 	binary.LittleEndian.PutUint32(buf[0:4], EndOfCentralDirSignature)
 	binary.LittleEndian.PutUint16(buf[4:6], 0)                                         // ThisDiskNum
 	binary.LittleEndian.PutUint16(buf[6:8], 0)                                         // DiskNumWithTheStartOfCentralDir
@@ -194,9 +195,9 @@ func EncodeEndOfCentralDirRecord(entriesNum int, centralDirSize uint64, centralD
 	binary.LittleEndian.PutUint16(buf[10:12], uint16(min(math.MaxUint16, entriesNum))) // TotalNumberOfEntries
 	binary.LittleEndian.PutUint32(buf[12:16], uint32(min(math.MaxUint32, centralDirSize)))
 	binary.LittleEndian.PutUint32(buf[16:20], uint32(min(math.MaxUint32, centralDirOffset)))
-	binary.LittleEndian.PutUint16(buf[20:22], uint16(len(comment)))
+	binary.LittleEndian.PutUint16(buf[20:22], uint16(commentLen))
 
-	copy(buf[22:], comment)
+	copy(buf[22:], comment[:commentLen])
 
 	return buf
 }
