@@ -29,14 +29,14 @@ func GetFileMetadata(stat os.FileInfo) map[string]interface{} {
 }
 
 func GetHostSystem(fd uintptr) HostSystem {
-	fsType := getWindowsFileSystem(fd)
-	switch fsType {
+	switch getWindowsFileSystem(fd) {
 	case FileSystemNTFS:
 		return HostSystemNTFS
 	case FileSystemFAT:
 		return HostSystemFAT
+	default:
+		return HostSystemNTFS
 	}
-	return HostSystemNTFS // Default for Windows usually
 }
 
 func GetHostSystemByOS() HostSystem {
