@@ -5,6 +5,7 @@
 package gozip
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -325,6 +326,16 @@ func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...Add
 	return z.addEntry(fileEntry, options)
 }
 
+// AddBytes adds a file created from a byte slice.
+func (z *Zip) AddBytes(data []byte, filename string, options ...AddOption) error {
+	return z.AddReader(bytes.NewReader(data), filename, int64(len(data)), options...)
+}
+
+// AddString adds a file created from a string.
+func (z *Zip) AddString(content string, filename string, options ...AddOption) error {
+	return z.AddReader(strings.NewReader(content), filename, int64(len(content)), options...)
+}
+
 // CreateDirectory adds an explicit directory entry to the ZIP archive.
 // While directories are often created implicitly when files are added with
 // path components, this method allows creating empty directories or
@@ -358,6 +369,10 @@ func (z *Zip) OpenFile(name string) (io.ReadCloser, error) {
 
 	searchName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
 
+	if !z.fileCache[searchName] {
+		return nil, fmt.Errorf("%w: %s", ErrFileNotFound, name)
+	}
+
 	for _, f := range z.files {
 		if f.name == searchName && !f.isDir {
 			return f.Open()
@@ -365,6 +380,104 @@ func (z *Zip) OpenFile(name string) (io.ReadCloser, error) {
 	}
 
 	return nil, fmt.Errorf("%w: %s", ErrFileNotFound, name)
+}
+
+// RemoveFile deletes a file or directory entry from the archive by name.
+// If the entry is a directory, this ONLY removes the directory entry itself,
+// not its contents (files inside it). To remove a directory and its contents,
+// you would need to iterate and remove them individually or use RemoveDir.
+// Returns ErrFileNotFound if the entry does not exist.
+func (z *Zip) RemoveFile(name string) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+
+	searchName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
+
+	isDir := z.fileCache[searchName+"/"]
+	if !z.fileCache[searchName] && !isDir {
+		return fmt.Errorf("%w: %s", ErrFileNotFound, name)
+	}
+
+	idx := -1
+	for i, f := range z.files {
+		target := searchName
+		if f.isDir {
+			target += "/"
+		}
+
+		if f.getFilename() == target {
+			idx = i
+			break
+		}
+	}
+
+	if idx == -1 {
+		// Should not happen if cache check passed, but safety first
+		return fmt.Errorf("%w: %s", ErrFileNotFound, name)
+	}
+
+	z.files = append(z.files[:idx], z.files[idx+1:]...)
+	if isDir {
+		delete(z.fileCache, searchName+"/")
+	} else {
+		delete(z.fileCache, searchName)
+	}
+
+	return nil
+}
+
+func (z *Zip) RemoveDir(name string) error {
+	searchName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
+	if !strings.HasSuffix(searchName, "/") {
+		searchName += "/"
+	}
+
+	newFiles := make([]*File, 0, len(z.files))
+	deletedCount := 0
+
+	for _, f := range z.files {
+		fileName := f.getFilename()
+
+		// Check if file belongs to the directory (Prefix Match)
+		// Since searchName ends with "/", this covers:
+		// - The directory entry itself ("foo/bar/")
+		// - Files inside ("foo/bar/file.txt")
+		// - Subdirectories ("foo/bar/sub/")
+		if strings.HasPrefix(fileName, searchName) {
+			delete(z.fileCache, fileName)
+			deletedCount++
+			continue
+		}
+
+		newFiles = append(newFiles, f)
+	}
+
+	if deletedCount == 0 {
+		// Remove the trailing slash for the error message to look natural
+		return fmt.Errorf("%w: %s", ErrFileNotFound, strings.TrimSuffix(searchName, "/"))
+	}
+
+	z.files = newFiles
+	return nil
+}
+
+// FindFiles returns a list of files matching the glob pattern.
+// The pattern syntax is the same as [path.Match].
+func (z *Zip) FindFiles(pattern string) ([]*File, error) {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+
+	var matches []*File
+	for _, f := range z.files {
+		matched, err := path.Match(pattern, f.name)
+		if err != nil {
+			return nil, fmt.Errorf("invalid pattern: %w", err)
+		}
+		if matched {
+			matches = append(matches, f)
+		}
+	}
+	return matches, nil
 }
 
 // Write serializes the entire ZIP archive to the destination writer.
@@ -532,6 +645,23 @@ func (z *Zip) ExtractParallel(path string, workers int) error {
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
+	return nil
+}
+
+// ExtractToWriter extracts a specific file directly to an io.Writer.
+// This is useful for streaming extracted content (e.g. to HTTP response)
+// without creating temporary files on disk.
+func (z *Zip) ExtractToWriter(name string, dest io.Writer) error {
+	rc, err := z.OpenFile(name)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	if _, err := io.Copy(dest, rc); err != nil {
+		return fmt.Errorf("extract to writer: %w", err)
+	}
+
 	return nil
 }
 
