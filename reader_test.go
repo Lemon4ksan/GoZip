@@ -76,7 +76,7 @@ func TestFindAndReadEndOfCentralDir(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := bytes.NewReader(tt.data)
-			zr := &zipReader{src: r}
+			zr := newZipReader(r, r.Size(), nil, ZipConfig{})
 
 			got, err := zr.findAndReadEndOfCentralDir()
 
@@ -103,7 +103,7 @@ func TestFindEOCD_BufferBoundary(t *testing.T) {
 	data = append(data, eocd...)
 
 	r := bytes.NewReader(data)
-	zr := &zipReader{src: r}
+	zr := newZipReader(r, r.Size(), nil, ZipConfig{})
 
 	res, err := zr.findAndReadEndOfCentralDir()
 	if err != nil {
@@ -299,7 +299,7 @@ func TestZipReader_OpenFile_Integration(t *testing.T) {
 	// but to test openFile properly, we just need the ReaderAt logic to hit the right offset.
 
 	reader := bytes.NewReader(buf.Bytes())
-	zr := newZipReader(reader, nil, ZipConfig{}) // Default decompressors
+	zr := newZipReader(reader, reader.Size(), nil, ZipConfig{}) // Default decompressors
 
 	f := &File{
 		name:              "test",
@@ -328,20 +328,4 @@ func TestZipReader_OpenFile_Integration(t *testing.T) {
 	if err := rc.Close(); err != nil {
 		t.Errorf("Close (checksum verification) failed: %v", err)
 	}
-}
-
-func TestReaderAtRequirement(t *testing.T) {
-	r := &readSeekerOnly{bytes.NewReader([]byte("dummy"))}
-	zr := newZipReader(r, nil, ZipConfig{})
-
-	f := &File{localHeaderOffset: 0}
-
-	_, err := zr.openFile(f)
-	if err == nil {
-		t.Error("Expected error because source is not ReaderAt, got nil")
-	}
-}
-
-type readSeekerOnly struct {
-	*bytes.Reader
 }

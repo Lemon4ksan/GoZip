@@ -28,14 +28,15 @@ const (
 // zipReader handles low-level reading of ZIP archive structure.
 type zipReader struct {
 	mu            sync.RWMutex
-	src           io.ReadSeeker       // Source stream for reading archive data
+	src           io.ReaderAt         // Source stream for reading archive data
+	fileSize      int64               // Total size of the archive
 	decompressors decompressorsMap    // Registry of available compressors
 	textEncoder   func(string) string // Filename and comment encoder
 }
 
 // newZipReader creates and initializes a new zipReader instance.
 // decompressors map can be nil - built-in Stored and Deflated decompressors are registered automatically.
-func newZipReader(src io.ReadSeeker, decompressors decompressorsMap, config ZipConfig) *zipReader {
+func newZipReader(src io.ReaderAt, size int64, decompressors decompressorsMap, config ZipConfig) *zipReader {
 	if decompressors == nil {
 		decompressors = make(decompressorsMap)
 	}
@@ -44,6 +45,7 @@ func newZipReader(src io.ReadSeeker, decompressors decompressorsMap, config ZipC
 
 	return &zipReader{
 		src:           src,
+		fileSize:      size,
 		decompressors: decompressors,
 		textEncoder:   config.TextEncoding,
 	}
@@ -67,11 +69,7 @@ func (zr *zipReader) ReadFiles() ([]*File, error) {
 		centralDirOffset, entriesNum = int64(zip64EndDir.CentralDirOffset), int64(zip64EndDir.TotalNumberOfEntries)
 	}
 
-	if _, err := zr.src.Seek(centralDirOffset, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek to central dir offset: %w", err)
-	}
-
-	return zr.readCentralDir(entriesNum)
+	return zr.readCentralDir(centralDirOffset, entriesNum)
 }
 
 // findAndReadEndOfCentralDir scans for the End of Central Directory record and reads it.
@@ -80,11 +78,7 @@ func (zr *zipReader) ReadFiles() ([]*File, error) {
 func (zr *zipReader) findAndReadEndOfCentralDir() (internal.EndOfCentralDirectory, error) {
 	var end internal.EndOfCentralDirectory
 
-	fileSize, err := zr.src.Seek(0, io.SeekEnd)
-	if err != nil {
-		return end, fmt.Errorf("seek source: %w", err)
-	}
-	if fileSize < directoryEndLen {
+	if zr.fileSize < directoryEndLen {
 		return end, fmt.Errorf("%w: file too small", ErrFormat)
 	}
 
@@ -92,58 +86,49 @@ func (zr *zipReader) findAndReadEndOfCentralDir() (internal.EndOfCentralDirector
 	buf := make([]byte, bufSize)
 
 	maxCommentLength := int64(math.MaxUint16)
-	searchLimit := min(maxCommentLength+directoryEndLen, fileSize)
+	searchLimit := min(maxCommentLength+directoryEndLen, zr.fileSize)
 
+	// Scan backwards
 	for searchStart := int64(0); searchStart < searchLimit; {
-		// Calculate how much we need to read in this iteration
 		readSize := min(bufSize, searchLimit-searchStart)
+		readPos := zr.fileSize - searchLimit + searchStart
 
-		// Calculate read position: start reading from (fileSize - searchLimit + searchStart)
-		readPos := fileSize - searchLimit + searchStart
-
-		// Ensure we don't read past file boundaries
 		if readPos < 0 {
 			readPos = 0
-			readSize = min(bufSize, fileSize)
+			readSize = min(bufSize, zr.fileSize)
 		}
 
-		// Seek to read position
-		if _, err := zr.src.Seek(readPos, io.SeekStart); err != nil {
-			return end, fmt.Errorf("seek to position %d: %w", readPos, err)
-		}
-
-		// Read data into buffer
-		n, err := io.ReadFull(zr.src, buf[:readSize])
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			return end, fmt.Errorf("read buffer: %w", err)
+		n, err := zr.src.ReadAt(buf[:readSize], readPos)
+		if err != nil && err != io.EOF {
+			return end, fmt.Errorf("read at %d: %w", readPos, err)
 		}
 
 		if n == 0 {
 			break
 		}
 
-		// Scan buffer backwards for the signature
-		// Start from the end of the buffer minus 3 (to check 4-byte signature)
+		// The active buffer is valid up to n bytes
+		chunk := buf[:n]
+
 		for p := n - 4; p >= 0; p-- {
-			if binary.LittleEndian.Uint32(buf[p:p+4]) == internal.EndOfCentralDirSignature {
-				eocdStart := readPos + int64(p)
+			if binary.LittleEndian.Uint32(chunk[p:p+4]) == internal.EndOfCentralDirSignature {
+				recordOffset := readPos + int64(p)
 
 				// Ensure we can read the full 22-byte EOCD header
-				if eocdStart+directoryEndLen > fileSize {
+				if recordOffset+directoryEndLen > zr.fileSize {
 					continue
 				}
-				recordStart := readPos + int64(p) + 4
-				if _, err := zr.src.Seek(recordStart, io.SeekStart); err != nil {
-					return end, fmt.Errorf("seek to record at %d: %w", recordStart, err)
-				}
-				return internal.ReadEndOfCentralDir(zr.src)
+
+				// Calculate start of the record (skip signature 4 bytes)
+				sr := io.NewSectionReader(zr.src, recordOffset+4, zr.fileSize-(recordOffset+4))
+				return internal.ReadEndOfCentralDir(sr)
 			}
 		}
 
 		// Move search window backwards
 		// We subtract 3 to allow overlap for signatures that cross buffer boundaries
-		searchStart += readSize - 3
-		if readSize < 4 { // If we read less than signature size, we're done
+		searchStart += int64(n) - 3
+		if int64(n) < 4 { // If we read less than signature size, we're done
 			break
 		}
 	}
@@ -156,48 +141,51 @@ func (zr *zipReader) findAndReadEndOfCentralDir() (internal.EndOfCentralDirector
 // It contains 64 bit values for Central Directory size and total number of entries.
 func (zr *zipReader) findAndReadZip64EndOfCentralDir(commentLength uint16) (internal.Zip64EndOfCentralDirectory, error) {
 	var zip64End internal.Zip64EndOfCentralDirectory
-	fileSize, _ := zr.src.Seek(0, io.SeekEnd)
-
-	zip64locatorOffset := fileSize - int64(directoryEndLen+commentLength) - zip64LocatorLen
-	if _, err := zr.src.Seek(zip64locatorOffset, io.SeekStart); err != nil {
-		return zip64End, fmt.Errorf("seek to zip64 locator: %w", err)
+	
+	zip64locatorOffset := zr.fileSize - int64(directoryEndLen+commentLength) - zip64LocatorLen
+	if zip64locatorOffset < 0 {
+		return zip64End, fmt.Errorf("%w: invalid zip64 locator offset", ErrFormat)
 	}
 
-	if !zr.verifySignature(internal.Zip64EndOfCentralDirLocatorSignature) {
+	locReader := io.NewSectionReader(zr.src, zip64locatorOffset, zip64LocatorLen)
+	if !zr.verifySignature(locReader, internal.Zip64EndOfCentralDirLocatorSignature) {
 		return zip64End, fmt.Errorf("%w: expected zip64 end of central directory locator signature", ErrFormat)
 	}
 
-	zip64Locator, err := internal.ReadZip64EndOfCentralDirLocator(zr.src)
+	zip64Locator, err := internal.ReadZip64EndOfCentralDirLocator(locReader)
 	if err != nil {
 		return zip64End, fmt.Errorf("read zip64 end of central dir locator: %w", err)
 	}
 
-	if _, err := zr.src.Seek(int64(zip64Locator.Zip64EndOfCentralDirOffset), io.SeekStart); err != nil {
-		return zip64End, fmt.Errorf("seek to zip64 eocd: %w", err)
+	zip64EocdSize := zr.fileSize-int64(zip64Locator.Zip64EndOfCentralDirOffset)
+	if zip64EocdSize < 0 {
+		return zip64End, fmt.Errorf("%w: invalid zip64 end of central directory offset", ErrFormat)
 	}
 
-	if !zr.verifySignature(internal.Zip64EndOfCentralDirSignature) {
+	zip64EocdReader := io.NewSectionReader(zr.src, int64(zip64Locator.Zip64EndOfCentralDirOffset), zip64EocdSize)
+	if !zr.verifySignature(zip64EocdReader, internal.Zip64EndOfCentralDirSignature) {
 		return zip64End, fmt.Errorf("%w: expected zip64 end of central directory signature", ErrFormat)
 	}
 
-	return internal.ReadZip64EndOfCentralDir(zr.src)
+	return internal.ReadZip64EndOfCentralDir(zip64EocdReader)
 }
 
 // readCentralDir reads the central directory entries starting at the specified offset.
-// Each entry contains metadata about a file in the archive.
-func (zr *zipReader) readCentralDir(entries int64) ([]*File, error) {
+func (zr *zipReader) readCentralDir(offset int64, entries int64) ([]*File, error) {
 	safeCap := entries
 	if safeCap > 1024*1024 {
 		safeCap = 1024
 	}
 	files := make([]*File, 0, safeCap)
 
+	cdReader := io.NewSectionReader(zr.src, offset, zr.fileSize-offset)
+
 	for i := range entries {
-		if !zr.verifySignature(internal.CentralDirectorySignature) {
+		if !zr.verifySignature(cdReader, internal.CentralDirectorySignature) {
 			return nil, fmt.Errorf("%w: expected central directory signature at entry %d", ErrFormat, i)
 		}
 
-		entry, err := internal.ReadCentralDirEntry(zr.src)
+		entry, err := internal.ReadCentralDirEntry(cdReader)
 		if err != nil {
 			return nil, fmt.Errorf("decode central dir entry: %w", err)
 		}
@@ -286,19 +274,9 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 // It reads the local file header, handles decryption if needed, and sets up
 // decompression with CRC32 verification
 func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
+	headerReader := io.NewSectionReader(zr.src, f.localHeaderOffset, localHeaderLen)
+
 	buf := make([]byte, localHeaderLen)
-
-	var headerReader io.Reader
-	// Use ReaderAt interface for efficient random access if available
-	if ra, ok := zr.src.(io.ReaderAt); ok {
-		headerReader = io.NewSectionReader(ra, f.localHeaderOffset, localHeaderLen)
-	} else {
-		if _, err := zr.src.Seek(f.localHeaderOffset, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("seek to local header: %w", err)
-		}
-		headerReader = zr.src
-	}
-
 	if _, err := io.ReadFull(headerReader, buf); err != nil {
 		return nil, fmt.Errorf("read local header: %w", err)
 	}
@@ -314,17 +292,9 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 	extraLen := int64(binary.LittleEndian.Uint16(buf[28:30]))
 	dataOffset := f.localHeaderOffset + localHeaderLen + filenameLen + extraLen
 
-	var dataR io.Reader
-	// Create reader for the compressed/encrypted file data
-	if ra, ok := zr.src.(io.ReaderAt); ok {
-		dataR = io.NewSectionReader(ra, dataOffset, f.compressedSize)
-	} else {
-		if _, err := zr.src.Seek(dataOffset, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("seek to file data: %w", err)
-		}
-		dataR = io.LimitReader(zr.src, f.compressedSize)
-	}
+	dataR := io.NewSectionReader(zr.src, dataOffset, f.compressedSize)
 
+	var wrappedR io.Reader = dataR
 	if isEncrypted {
 		if f.config.Password == "" {
 			return nil, fmt.Errorf("%w: file is encrypted but no password provided", ErrPasswordMismatch)
@@ -334,9 +304,9 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 		switch f.config.EncryptionMethod {
 		case ZipCrypto:
 			_, dosTime := timeToMsDos(f.modTime)
-			dataR, err = NewZipCryptoReader(dataR, f.config.Password, bitFlag, f.crc32, dosTime)
+			wrappedR, err = NewZipCryptoReader(dataR, f.config.Password, bitFlag, f.crc32, dosTime)
 		case AES256:
-			dataR, err = NewAes256Reader(dataR, f.config.Password, f.compressedSize)
+			wrappedR, err = NewAes256Reader(dataR, f.config.Password, f.compressedSize)
 		default:
 			return nil, fmt.Errorf("%w: %d", ErrEncryption, f.config.EncryptionMethod)
 		}
@@ -346,13 +316,14 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 	}
 
 	zr.mu.RLock()
-	defer zr.mu.RUnlock()
 	decompressor, ok := zr.decompressors[f.config.CompressionMethod]
+	zr.mu.RUnlock()
+
 	if !ok {
 		return nil, fmt.Errorf("%w: %d", ErrAlgorithm, f.config.CompressionMethod)
 	}
 
-	rc, err := decompressor.Decompress(dataR)
+	rc, err := decompressor.Decompress(wrappedR)
 	if err != nil {
 		return nil, fmt.Errorf("decompress data: %w", err)
 	}
@@ -365,16 +336,16 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 	}, nil
 }
 
-// verifySignature checks whether the next 4 bytes in the source match the given signature
-func (zr *zipReader) verifySignature(s uint32) bool {
+// verifySignature checks whether the next 4 bytes match the given signature.
+func (zr *zipReader) verifySignature(r io.Reader, s uint32) bool {
 	buf := make([]byte, 4)
-	if _, err := io.ReadFull(zr.src, buf); err != nil {
+	if _, err := io.ReadFull(r, buf); err != nil {
 		return false
 	}
 	return binary.LittleEndian.Uint32(buf) == s
 }
 
-// parseFileExternalAttributes converts file attributes from central directory to fs.FileMode
+// parseFileExternalAttributes converts file attributes from central directory to fs.FileMode.
 func parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {
 	var mode fs.FileMode
 	hostSystem := sys.HostSystem(entry.VersionMadeBy >> 8)
