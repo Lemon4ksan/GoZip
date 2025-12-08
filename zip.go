@@ -57,6 +57,10 @@ type ZipConfig struct {
 	// Example: [DecodeIBM866] for Russian DOS archives.
 	// Default: CP437 (US DOS).
 	TextEncoding TextDecoder
+
+	// OnExtract is called immediately after a file is successfully extracted to disk.
+	// NOTE: In ExtractParallel, this callback is called concurrently.
+	OnExtract func(f *File)
 }
 
 // FileConfig defines per-file configuration options that override archive defaults.
@@ -89,7 +93,6 @@ type FileConfig struct {
 }
 
 // AddOption represents a functional option pattern for configuring File objects.
-// This pattern provides a clean, extensible API for setting file properties.
 type AddOption func(f *File)
 
 // WithConfig applies a complete FileConfig to a File, overriding all configurable properties.
@@ -154,6 +157,60 @@ func WithPath(p string) AddOption {
 func WithMode(mode fs.FileMode) AddOption {
 	return func(f *File) {
 		f.mode = mode
+	}
+}
+
+// ExtractOption represents a function option for configuring extraction.
+type ExtractOption func(files []*File) []*File
+
+// WithFiles allows to extract specific files from archive.
+// Empty slice results in no files being extracted.
+func WithFiles(files []*File) ExtractOption {
+	return func(_ []*File) []*File { return files }
+}
+
+// FromDir allows to extract files from specific directory. Empty path is ignored.
+func FromDir(path string) ExtractOption {
+	return func(files []*File) []*File {
+		if path == "" || path == "." {
+			return files
+		}
+
+		dirPath := path
+		if !strings.HasSuffix(dirPath, "/") {
+			dirPath += "/"
+		}
+
+		result := make([]*File, 0, len(files))
+		for _, file := range files {
+			if strings.HasPrefix(file.name, path) {
+				result = append(result, file)
+			}
+		}
+		return result
+	}
+}
+
+// WithoutDir allows to exclude directory and its contents from extraction.
+// Empty path results in all files being excluded.
+func WithoutDir(path string) ExtractOption {
+	return func(files []*File) []*File {
+		if path == "" || path == "." {
+			return nil
+		}
+
+		dirPath := path
+		if !strings.HasSuffix(dirPath, "/") {
+			dirPath += "/"
+		}
+
+		result := make([]*File, 0, len(files))
+		for _, file := range files {
+			if !strings.HasPrefix(file.name, dirPath) {
+				result = append(result, file)
+			}
+		}
+		return result
 	}
 }
 
@@ -426,7 +483,16 @@ func (z *Zip) RemoveFile(name string) error {
 	return nil
 }
 
+// RemoveDir deletes a directory by name with its files and subdirectories.
+// If name is an empty strings, all files inside archive are deleted.
+// Returns ErrFileNotFound if no deletions were performed.
 func (z *Zip) RemoveDir(name string) error {
+	if name == "" || name == "." {
+		z.files = make([]*File, 0)
+		z.fileCache = make(map[string]bool)
+		return nil
+	}
+
 	searchName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
 	if !strings.HasSuffix(searchName, "/") {
 		searchName += "/"
@@ -549,12 +615,16 @@ func (z *Zip) ReadFile(f *os.File) error {
 // when supported by the host filesystem. Path traversal attacks are prevented
 // by validating extracted paths. Returns combined errors if any extraction fails.
 // It expects that given path already exists.
-func (z *Zip) Extract(path string) error {
+func (z *Zip) Extract(path string, options ...ExtractOption) error {
 	path = filepath.Clean(path)
 	var errs []error
 
 	z.mu.RLock()
-	files := sortAlphabetical(z.files)
+	files := z.GetFiles()
+	for _, opt := range options {
+		files = opt(files)
+	}
+	files = sortAlphabetical(z.files)
 	z.mu.RUnlock()
 
 	for _, f := range files {
@@ -576,6 +646,8 @@ func (z *Zip) Extract(path string) error {
 		}
 		if err := z.extractFile(f, fpath); err != nil {
 			errs = append(errs, fmt.Errorf("failed to extract %s: %w", fpath, err))
+		} else if z.config.OnExtract != nil {
+			z.config.OnExtract(f)
 		}
 	}
 
@@ -587,14 +659,18 @@ func (z *Zip) Extract(path string) error {
 // especially on SSDs or fast storage systems. Directory creation is performed
 // upfront, then file extraction is parallelized with controlled concurrency.
 // Any missing folders in given path will be created automatically.
-func (z *Zip) ExtractParallel(path string, workers int) error {
+func (z *Zip) ExtractParallel(path string, workers int, options ...ExtractOption) error {
 	var errs []error
 	var filesToExtract []*File
 	dirsToCreate := make(map[string]struct{})
 	path = filepath.Clean(path)
 
 	z.mu.RLock()
-	files := sortAlphabetical(z.files)
+	files := z.GetFiles()
+	for _, opt := range options {
+		files = opt(files)
+	}
+	files = sortAlphabetical(z.files)
 	z.mu.RUnlock()
 
 	for _, f := range files {
@@ -641,6 +717,8 @@ func (z *Zip) ExtractParallel(path string, workers int) error {
 			fpath := filepath.Join(path, f.name)
 			if err := z.extractFile(f, fpath); err != nil {
 				errChan <- fmt.Errorf("failed to extract %s: %w", f.name, err)
+			} else if z.config.OnExtract != nil {
+				z.config.OnExtract(f)
 			}
 		}(f)
 	}
