@@ -6,6 +6,7 @@ package gozip
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -552,12 +553,20 @@ func (z *Zip) FindFiles(pattern string) ([]*File, error) {
 // the implementation can optimize by writing directly without temporary files.
 // Files are sorted according to the configured FileSortStrategy before writing.
 func (z *Zip) Write(dest io.Writer) error {
+	return z.WriteWithContext(context.Background(), dest)
+}
+
+// WriteWithContext serializes the ZIP archive with context support.
+func (z *Zip) WriteWithContext(ctx context.Context, dest io.Writer) error {
 	z.mu.RLock()
 	files := SortFilesOptimized(z.files, z.config.FileSortStrategy)
 	z.mu.RUnlock()
 
 	writer := newZipWriter(z.config, z.compressors, dest)
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := writer.WriteFile(file); err != nil {
 			return fmt.Errorf("zip: write file %s: %w", file.name, err)
 		}
@@ -576,12 +585,21 @@ func (z *Zip) Write(dest io.Writer) error {
 // compressed data before final sequential writing to maintain ZIP format correctness.
 // maxWorkers controls the maximum number of concurrent compression operations.
 func (z *Zip) WriteParallel(dest io.Writer, maxWorkers int) error {
+	return z.WriteParallelWithContext(context.Background(), dest, maxWorkers)
+}
+
+// WriteParallelWithContext serializes the ZIP archive using concurrent workers with context support.
+func (z *Zip) WriteParallelWithContext(ctx context.Context, dest io.Writer, maxWorkers int) error {
 	z.mu.RLock()
 	files := SortFilesOptimized(z.files, z.config.FileSortStrategy)
 	z.mu.RUnlock()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	writer := newParallelZipWriter(z.config, z.compressors, dest, maxWorkers)
-	errs := writer.WriteFiles(files)
+	errs := writer.WriteFiles(ctx, files)
 
 	if err := writer.zw.WriteCentralDirAndEndRecords(); err != nil {
 		errs = append(errs, err)
@@ -592,8 +610,17 @@ func (z *Zip) WriteParallel(dest io.Writer, maxWorkers int) error {
 
 // Read parses a ZIP archive from the source and appends its files to this archive.
 func (z *Zip) Read(src io.ReaderAt, size int64) error {
+	return z.ReadWithContext(context.Background(), src, size)
+}
+
+// ReadWithContext parses a ZIP archive with context cancellation support.
+func (z *Zip) ReadWithContext(ctx context.Context, src io.ReaderAt, size int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	
 	reader := newZipReader(src, size, z.decompressors, z.config)
-	files, err := reader.ReadFiles()
+	files, err := reader.ReadFiles(ctx)
 	if err != nil {
 		return err
 	}
@@ -616,6 +643,12 @@ func (z *Zip) ReadFile(f *os.File) error {
 // by validating extracted paths. Returns combined errors if any extraction fails.
 // It expects that given path already exists.
 func (z *Zip) Extract(path string, options ...ExtractOption) error {
+	return z.ExtractWithContext(context.Background(), path, options...)
+}
+
+// ExtractWithContext sequentially extracts files with context support.
+// Extraction stops immediately if context is cancelled.
+func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...ExtractOption) error {
 	path = filepath.Clean(path)
 	var errs []error
 
@@ -628,6 +661,10 @@ func (z *Zip) Extract(path string, options ...ExtractOption) error {
 	z.mu.RUnlock()
 
 	for _, f := range files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		if f.config.Password == "" {
 			f.config.Password = z.config.Password
 		}
@@ -644,7 +681,11 @@ func (z *Zip) Extract(path string, options ...ExtractOption) error {
 			}
 			continue
 		}
-		if err := z.extractFile(f, fpath); err != nil {
+
+		if err := z.extractFile(ctx, f, fpath); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
 			errs = append(errs, fmt.Errorf("failed to extract %s: %w", fpath, err))
 		} else if z.config.OnExtract != nil {
 			z.config.OnExtract(f)
@@ -660,6 +701,11 @@ func (z *Zip) Extract(path string, options ...ExtractOption) error {
 // upfront, then file extraction is parallelized with controlled concurrency.
 // Any missing folders in given path will be created automatically.
 func (z *Zip) ExtractParallel(path string, workers int, options ...ExtractOption) error {
+	return z.ExtractParallelWithContext(context.Background(), path, workers, options...)
+}
+
+// ExtractParallelWithContext extracts files concurrently with context cancellation.
+func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, workers int, options ...ExtractOption) error {
 	var errs []error
 	var filesToExtract []*File
 	dirsToCreate := make(map[string]struct{})
@@ -697,6 +743,9 @@ func (z *Zip) ExtractParallel(path string, workers int, options ...ExtractOption
 		return errors.Join(errs...)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for dir := range dirsToCreate {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
@@ -708,23 +757,37 @@ func (z *Zip) ExtractParallel(path string, workers int, options ...ExtractOption
 	var wg sync.WaitGroup
 
 	for _, f := range filesToExtract {
-		wg.Add(1)
-		sem <- struct{}{}
+		select {
+		case <-ctx.Done():
+			goto Finish
+		case sem <- struct{}{}:
+		}
 
+		wg.Add(1)
 		go func(f *File) {
 			defer func() { <-sem; wg.Done() }()
 
 			fpath := filepath.Join(path, f.name)
-			if err := z.extractFile(f, fpath); err != nil {
-				errChan <- fmt.Errorf("failed to extract %s: %w", f.name, err)
+
+			if err := z.extractFile(ctx, f, fpath); err != nil {
+				if ctx.Err() == nil {
+					errChan <- fmt.Errorf("failed to extract %s: %w", f.name, err)
+				}
 			} else if z.config.OnExtract != nil {
-				z.config.OnExtract(f)
+				if ctx.Err() == nil {
+					z.config.OnExtract(f)
+				}
 			}
 		}(f)
 	}
 
+Finish:
 	wg.Wait()
 	close(errChan)
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	for err := range errChan {
 		errs = append(errs, err)
@@ -837,15 +900,21 @@ func (z *Zip) createMissingDirs(filePath string) error {
 }
 
 // extractFile handles the extraction of a single file from the archive to disk.
-// It opens the file from the archive, creates the destination file, copies data
-// with buffered I/O, and sets permissions and timestamps. Uses the shared buffer
-// pool for efficient memory allocation.
-func (z *Zip) extractFile(f *File, path string) error {
+// It opens the file from the archive, creates the destination file, copies data with buffered I/O,
+// and sets permissions and timestamps. Uses the shared buffer pool for efficient memory allocation. 
+// It uses contextReader to wrap the source stream, ensuring io.Copy stops if ctx is done.
+func (z *Zip) extractFile(ctx context.Context, f *File, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	src, err := f.Open()
 	if err != nil {
 		return err
 	}
 	defer src.Close()
+
+	reader := &contextReader{ctx: ctx, r: src}
 
 	dst, err := os.Create(path)
 	if err != nil {
@@ -860,7 +929,7 @@ func (z *Zip) extractFile(f *File, path string) error {
 	}
 
 	bufPtr := z.bufferPool.Get().(*[]byte)
-	_, err = io.CopyBuffer(dst, src, *bufPtr)
+	_, err = io.CopyBuffer(dst, reader, *bufPtr)
 	z.bufferPool.Put(bufPtr)
 
 	if err != nil {

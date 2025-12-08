@@ -6,6 +6,7 @@ package gozip
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -505,7 +506,7 @@ func newParallelZipWriter(config ZipConfig, compressors compressorsMap, dest io.
 // This method performs compression concurrently using a worker pool and writes
 // files sequentially to maintain proper ZIP format structure.
 // Returns a slice of errors encountered during processing.
-func (pzw *parallelZipWriter) WriteFiles(files []*File) []error {
+func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []error {
 	var wg sync.WaitGroup
 	results := make(chan struct {
 		file *File
@@ -513,15 +514,24 @@ func (pzw *parallelZipWriter) WriteFiles(files []*File) []error {
 		err  error
 	}, len(files))
 
+Loop:
 	for _, f := range files {
-		wg.Add(1)
-		pzw.sem <- struct{}{}
+		if err := ctx.Err(); err != nil {
+			break Loop
+		}
 
+		select {
+		case <-ctx.Done():
+			break Loop
+		case pzw.sem <- struct{}{}:
+		}
+
+		wg.Add(1)
 		go func(f *File) {
 			defer wg.Done()
 			defer func() { <-pzw.sem }()
 
-			src, err := pzw.compressFile(f)
+			src, err := pzw.compressFile(ctx, f)
 			results <- struct {
 				file *File
 				src  io.Reader
@@ -538,14 +548,23 @@ func (pzw *parallelZipWriter) WriteFiles(files []*File) []error {
 	var errs []error
 	for result := range results {
 		if result.err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", result.file.name, result.err))
+			if !errors.Is(result.err, context.Canceled) && !errors.Is(result.err, context.DeadlineExceeded) {
+				errs = append(errs, fmt.Errorf("%s: %w", result.file.name, result.err))
+			}
 			continue
 		}
+
+		if ctx.Err() != nil {
+			pzw.cleanupBuf(result.src)
+			continue
+		}
+
 		if err := pzw.writeCompressedFile(result.file, result.src); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", result.file.name, err))
 		} else if err := pzw.zw.addCentralDirEntry(result.file); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", result.file.name, err))
 		}
+
 		pzw.cleanupBuf(result.src)
 	}
 	return errs
@@ -553,9 +572,13 @@ func (pzw *parallelZipWriter) WriteFiles(files []*File) []error {
 
 // compressFile compresses a single file according to its configuration.
 // Returns a reader containing the compressed data, using memory or temp file based on size.
-func (pzw *parallelZipWriter) compressFile(file *File) (io.Reader, error) {
+func (pzw *parallelZipWriter) compressFile(ctx context.Context, file *File) (io.Reader, error) {
 	if file.isDir || file.uncompressedSize == 0 {
 		return nil, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	var fileBuffer io.ReadWriteSeeker
@@ -577,10 +600,22 @@ func (pzw *parallelZipWriter) compressFile(file *File) (io.Reader, error) {
 		fileBuffer = tmpFile
 	}
 
-	if err := pzw.zw.encodeAndUpdateFile(file, fileBuffer); err != nil {
+	src, err := file.Open()
+	if err != nil {
 		pzw.cleanupBuf(fileBuffer)
-		return nil, fmt.Errorf("encode and update file %w", err)
+		return nil, err
 	}
+	defer src.Close()
+
+	stats, err := pzw.zw.encodeToWriter(&contextReader{ctx: ctx, r: src}, pzw.zw.dest, file.config)
+	if err != nil {
+		pzw.cleanupBuf(fileBuffer)
+		return nil, fmt.Errorf("encode: %w", err)
+	}
+
+	file.uncompressedSize = stats.uncompressedSize
+	file.compressedSize = stats.compressedSize
+	file.crc32 = stats.crc32
 
 	if _, err := fileBuffer.Seek(0, io.SeekStart); err != nil {
 		pzw.cleanupBuf(fileBuffer)

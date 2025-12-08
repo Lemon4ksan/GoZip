@@ -5,6 +5,7 @@
 package gozip
 
 import (
+	"context"
 	"io"
 	"time"
 )
@@ -19,6 +20,19 @@ func (w *byteCountWriter) Write(p []byte) (int, error) {
 	n, err := w.dest.Write(p)
 	w.bytesWritten += int64(n)
 	return n, err
+}
+
+// contextReader wraps an io.Reader to make it respect context cancellation.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (cr *contextReader) Read(p []byte) (n int, err error) {
+	if err := cr.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return cr.r.Read(p)
 }
 
 // Time conversion functions

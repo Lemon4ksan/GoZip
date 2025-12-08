@@ -6,6 +6,7 @@ package gozip
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -78,7 +79,7 @@ func TestFindAndReadEndOfCentralDir(t *testing.T) {
 			r := bytes.NewReader(tt.data)
 			zr := newZipReader(r, r.Size(), nil, ZipConfig{})
 
-			got, err := zr.findAndReadEndOfCentralDir()
+			got, err := zr.findAndReadEndOfCentralDir(context.Background())
 
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("findAndReadEndOfCentralDir() error = %v, wantErr %v", err, tt.wantErr)
@@ -105,7 +106,7 @@ func TestFindEOCD_BufferBoundary(t *testing.T) {
 	r := bytes.NewReader(data)
 	zr := newZipReader(r, r.Size(), nil, ZipConfig{})
 
-	res, err := zr.findAndReadEndOfCentralDir()
+	res, err := zr.findAndReadEndOfCentralDir(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to find EOCD across buffer boundaries: %v", err)
 	}
