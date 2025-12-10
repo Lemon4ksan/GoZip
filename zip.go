@@ -272,14 +272,6 @@ func NewZip() *Zip {
 	}
 }
 
-// GetFiles returns a slice of all files currently stored in the archive.
-// The returned slice includes both regular files and directory entries.
-// Note: The returned slice is a copy of internal references; modifications to
-// File objects may affect archive behavior.
-func (z *Zip) GetFiles() []*File {
-	return z.files
-}
-
 // SetConfig updates the global configuration for the ZIP archive.
 // This configuration applies to all subsequently added files unless overridden
 // by file-specific options. Thread-safe.
@@ -305,6 +297,59 @@ func (z *Zip) RegisterDecompressor(method CompressionMethod, d Decompressor) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.decompressors[method] = d
+}
+
+// GetFiles returns a slice of all files currently stored in the archive.
+// The returned slice includes both regular files and directory entries.
+// Note: The returned slice is a copy of internal references; modifications to
+// File objects may affect archive behavior.
+func (z *Zip) GetFiles() []*File {
+	return z.files
+}
+
+// GetFile returns the file entry with the given name and path. It returns nil if the file is not found.
+// The name is automatically normalized to match ZIP standards (forward slashes).
+func (z *Zip) GetFile(name string) (*File, error) {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+
+	searchName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
+
+	if !z.fileCache[searchName] && !z.fileCache[searchName+"/"] {
+		return nil, ErrFileNotFound
+	}
+
+	for _, f := range z.files {
+		target := searchName
+		if f.isDir {
+			target += "/"
+		}
+
+		if f.getFilename() == target {
+			return f, nil
+		}
+	}
+
+	return nil, ErrFileNotFound
+}
+
+// GetMatchingFiles returns a list of files matching the glob pattern.
+// The pattern syntax is the same as [path.Match].
+func (z *Zip) GetMatchingFiles(pattern string) ([]*File, error) {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+
+	var matches []*File
+	for _, f := range z.files {
+		matched, err := path.Match(pattern, f.name)
+		if err != nil {
+			return nil, fmt.Errorf("invalid pattern: %w", err)
+		}
+		if matched {
+			matches = append(matches, f)
+		}
+	}
+	return matches, nil
 }
 
 // AddFile adds an existing opened file (os.File) to the archive.
@@ -528,25 +573,6 @@ func (z *Zip) RemoveDir(name string) error {
 	return nil
 }
 
-// FindFiles returns a list of files matching the glob pattern.
-// The pattern syntax is the same as [path.Match].
-func (z *Zip) FindFiles(pattern string) ([]*File, error) {
-	z.mu.RLock()
-	defer z.mu.RUnlock()
-
-	var matches []*File
-	for _, f := range z.files {
-		matched, err := path.Match(pattern, f.name)
-		if err != nil {
-			return nil, fmt.Errorf("invalid pattern: %w", err)
-		}
-		if matched {
-			matches = append(matches, f)
-		}
-	}
-	return matches, nil
-}
-
 // Write serializes the entire ZIP archive to the destination writer.
 // This method processes files sequentially, making it more memory-efficient
 // than WriteParallel for most use cases. If dest implements io.Seeker,
@@ -618,13 +644,16 @@ func (z *Zip) ReadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	
+
 	reader := newZipReader(src, size, z.decompressors, z.config)
 	files, err := reader.ReadFiles(ctx)
 	if err != nil {
 		return err
 	}
 	z.files = append(z.files, files...)
+	for _, file := range files {
+		z.fileCache[file.getFilename()] = true
+	}
 	return nil
 }
 
@@ -657,7 +686,7 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 	for _, opt := range options {
 		files = opt(files)
 	}
-	files = sortAlphabetical(z.files)
+	files = sortAlphabetical(files)
 	z.mu.RUnlock()
 
 	for _, f := range files {
@@ -716,7 +745,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 	for _, opt := range options {
 		files = opt(files)
 	}
-	files = sortAlphabetical(z.files)
+	files = sortAlphabetical(files)
 	z.mu.RUnlock()
 
 	for _, f := range files {
@@ -901,7 +930,7 @@ func (z *Zip) createMissingDirs(filePath string) error {
 
 // extractFile handles the extraction of a single file from the archive to disk.
 // It opens the file from the archive, creates the destination file, copies data with buffered I/O,
-// and sets permissions and timestamps. Uses the shared buffer pool for efficient memory allocation. 
+// and sets permissions and timestamps. Uses the shared buffer pool for efficient memory allocation.
 // It uses contextReader to wrap the source stream, ensuring io.Copy stops if ctx is done.
 func (z *Zip) extractFile(ctx context.Context, f *File, path string) error {
 	if err := ctx.Err(); err != nil {
