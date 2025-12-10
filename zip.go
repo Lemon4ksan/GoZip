@@ -352,6 +352,58 @@ func (z *Zip) GetMatchingFiles(pattern string) ([]*File, error) {
 	return matches, nil
 }
 
+// Rename updates the file base name leaving the directory path unchanged.
+// For example, renaming "logs/current.log" to "old.log" results in "logs/old.log".
+// If the entry is a directory, the trailing slash is preserved automatically.
+// Returns error if the new name results in a path exceeding ZIP limits.
+func (z *Zip) Rename(file *File, newName string) error {
+	if newName == "" {
+		return fmt.Errorf("%w: new name cannot be empty", ErrFileEntry)
+	}
+
+	dir := path.Dir(file.name)
+	if dir == "." {
+		dir = ""
+	}
+
+	fullPath := path.Join(dir, newName)
+	fullPath = strings.TrimPrefix(path.Clean(strings.ReplaceAll(fullPath, "\\", "/")), "/")
+
+	if len(fullPath)+1 > math.MaxUint16 {
+		return fmt.Errorf("%w: %s (%d bytes)", ErrFilenameTooLong, fullPath, len(fullPath))
+	}
+
+	delete(z.fileCache, file.getFilename())
+	file.name = fullPath
+	z.fileCache[file.getFilename()] = true
+
+	return nil
+}
+
+// Move updates the directory path of the file, keeping the base filename.
+// For example, moving "logs/app.log" to "backup/2023" results in "backup/2023/app.log".
+// Passing "" or "." as newPath moves the file to the archive root.
+func (z *Zip) Move(file *File, newPath string) error {
+	baseName := path.Base(file.name)
+
+	if file.isDir && baseName == "." {
+		baseName = strings.TrimSuffix(file.name, "/")
+		baseName = path.Base(baseName)
+	}
+
+	fullPath := path.Join(newPath, baseName)
+	fullPath = strings.TrimPrefix(path.Clean(strings.ReplaceAll(fullPath, "\\", "/")), "/")
+
+	if len(fullPath)+1 > math.MaxUint16 {
+		return fmt.Errorf("%w: %s (%d bytes)", ErrFilenameTooLong, fullPath, len(fullPath))
+	}
+
+	delete(z.fileCache, file.getFilename())
+	file.name = fullPath
+	z.fileCache[file.getFilename()] = true
+	return nil
+}
+
 // AddFile adds an existing opened file (os.File) to the archive.
 // The file's current position is used for reading; the caller is responsible
 // for opening and closing the file. File metadata (size, mod time, etc.) is
