@@ -59,9 +59,10 @@ type ZipConfig struct {
 	// Default: CP437 (US DOS).
 	TextEncoding TextDecoder
 
-	// OnExtract is called immediately after a file is successfully extracted to disk.
-	// NOTE: In ExtractParallel, this callback is called concurrently.
-	OnExtract func(f *File)
+	// OnFileProcessed is called immediately after a file entry is successfully
+	// processed in Write, Read and Extract methods and their variants.
+	// NOTE: In ExtractParallel this callback is called concurrently.
+	OnFileProcessed func(f *File)
 }
 
 // FileConfig defines per-file configuration options that override archive defaults.
@@ -648,6 +649,9 @@ func (z *Zip) WriteWithContext(ctx context.Context, dest io.Writer) error {
 		if err := writer.WriteFile(file); err != nil {
 			return fmt.Errorf("zip: write file %s: %w", file.name, err)
 		}
+		if z.config.OnFileProcessed != nil {
+			z.config.OnFileProcessed(file)
+		}
 	}
 
 	if err := writer.WriteCentralDirAndEndRecords(); err != nil {
@@ -768,8 +772,8 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 				return err
 			}
 			errs = append(errs, fmt.Errorf("failed to extract %s: %w", fpath, err))
-		} else if z.config.OnExtract != nil {
-			z.config.OnExtract(f)
+		} else if z.config.OnFileProcessed != nil {
+			z.config.OnFileProcessed(f)
 		}
 	}
 
@@ -827,6 +831,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
 	for dir := range dirsToCreate {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
@@ -854,9 +859,9 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 				if ctx.Err() == nil {
 					errChan <- fmt.Errorf("failed to extract %s: %w", f.name, err)
 				}
-			} else if z.config.OnExtract != nil {
+			} else if z.config.OnFileProcessed != nil {
 				if ctx.Err() == nil {
-					z.config.OnExtract(f)
+					z.config.OnFileProcessed(f)
 				}
 			}
 		}(f)

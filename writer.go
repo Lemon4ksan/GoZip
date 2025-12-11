@@ -159,6 +159,10 @@ func (zw *zipWriter) writeWithTempFile(file *File) error {
 // and writes to the provided writer while collecting size and CRC information.
 // It does not update local file header offset.
 func (zw *zipWriter) encodeAndUpdateFile(file *File, writer io.Writer) error {
+	if file.originalRFunc != nil {
+		return nil
+	}
+
 	src, err := file.Open()
 	if err != nil {
 		return err
@@ -485,6 +489,7 @@ type parallelZipWriter struct {
 	sem             chan struct{} // Semaphore for limiting concurrent workers
 	memoryThreshold int64         // Size threshold for memory vs disk buffering
 	bufferPool      sync.Pool     // Reusable memory buffers for small files
+	onFileProcessed func(f *File) // Callback after writing
 }
 
 // newParallelZipWriter creates a new parallelZipWriter instance.
@@ -499,6 +504,7 @@ func newParallelZipWriter(config ZipConfig, compressors compressorsMap, dest io.
 				return NewMemoryBuffer(64 * 1024) // 64KB default
 			},
 		},
+		onFileProcessed: config.OnFileProcessed,
 	}
 }
 
@@ -565,6 +571,10 @@ Loop:
 			errs = append(errs, fmt.Errorf("%s: %w", result.file.name, err))
 		}
 
+		if pzw.onFileProcessed != nil {
+			pzw.onFileProcessed(result.file)
+		}
+
 		pzw.cleanupBuf(result.src)
 	}
 	return errs
@@ -600,22 +610,32 @@ func (pzw *parallelZipWriter) compressFile(ctx context.Context, file *File) (io.
 		fileBuffer = tmpFile
 	}
 
-	src, err := file.Open()
-	if err != nil {
-		pzw.cleanupBuf(fileBuffer)
-		return nil, err
-	}
-	defer src.Close()
+	if file.originalRFunc != nil {
+		src, err := file.originalRFunc()
+		if err != nil {
+			pzw.cleanupBuf(fileBuffer)
+			return nil, err
+		}
 
-	stats, err := pzw.zw.encodeToWriter(&contextReader{ctx: ctx, r: src}, pzw.zw.dest, file.config)
-	if err != nil {
-		pzw.cleanupBuf(fileBuffer)
-		return nil, fmt.Errorf("encode: %w", err)
-	}
+		io.Copy(fileBuffer, src)
+	} else {
+		src, err := file.Open()
+		if err != nil {
+			pzw.cleanupBuf(fileBuffer)
+			return nil, err
+		}
+		defer src.Close()
 
-	file.uncompressedSize = stats.uncompressedSize
-	file.compressedSize = stats.compressedSize
-	file.crc32 = stats.crc32
+		stats, err := pzw.zw.encodeToWriter(&contextReader{ctx: ctx, r: src}, pzw.zw.dest, file.config)
+		if err != nil {
+			pzw.cleanupBuf(fileBuffer)
+			return nil, fmt.Errorf("encode: %w", err)
+		}
+
+		file.uncompressedSize = stats.uncompressedSize
+		file.compressedSize = stats.compressedSize
+		file.crc32 = stats.crc32
+	}
 
 	if _, err := fileBuffer.Seek(0, io.SeekStart); err != nil {
 		pzw.cleanupBuf(fileBuffer)

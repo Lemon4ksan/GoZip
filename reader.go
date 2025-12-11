@@ -28,11 +28,12 @@ const (
 
 // zipReader handles low-level reading of ZIP archive structure.
 type zipReader struct {
-	mu            sync.RWMutex
-	src           io.ReaderAt         // Source stream for reading archive data
-	fileSize      int64               // Total size of the archive
-	decompressors decompressorsMap    // Registry of available compressors
-	textEncoder   func(string) string // Filename and comment encoder
+	mu              sync.RWMutex
+	src             io.ReaderAt         // Source stream for reading archive data
+	fileSize        int64               // Total size of the archive
+	decompressors   decompressorsMap    // Registry of available compressors
+	textEncoder     func(string) string // Filename and comment encoder
+	onFileProcessed func(f *File)       // Callback after reading
 }
 
 // newZipReader creates and initializes a new zipReader instance.
@@ -45,10 +46,11 @@ func newZipReader(src io.ReaderAt, size int64, decompressors decompressorsMap, c
 	decompressors[Deflated] = new(DeflateDecompressor)
 
 	return &zipReader{
-		src:           src,
-		fileSize:      size,
-		decompressors: decompressors,
-		textEncoder:   config.TextEncoding,
+		src:             src,
+		fileSize:        size,
+		decompressors:   decompressors,
+		textEncoder:     config.TextEncoding,
+		onFileProcessed: config.OnFileProcessed,
 	}
 }
 
@@ -202,7 +204,11 @@ func (zr *zipReader) readCentralDir(ctx context.Context, offset int64, entries i
 			return nil, fmt.Errorf("decode central dir entry: %w", err)
 		}
 
-		files = append(files, zr.newFileFromCentralDir(entry))
+		file := zr.newFileFromCentralDir(entry)
+		files = append(files, file)
+		if zr.onFileProcessed != nil {
+			zr.onFileProcessed(file)
+		}
 	}
 
 	return files, nil
@@ -279,6 +285,25 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 	f.openFunc = func() (io.ReadCloser, error) {
 		return zr.openFile(f)
 	}
+	f.originalRFunc = func() (*io.SectionReader, error) {
+		headerReader := io.NewSectionReader(zr.src, f.localHeaderOffset, localHeaderLen)
+
+		buf := make([]byte, localHeaderLen)
+		if _, err := io.ReadFull(headerReader, buf); err != nil {
+			return nil, fmt.Errorf("read local header: %w", err)
+		}
+
+		if binary.LittleEndian.Uint32(buf[0:4]) != internal.LocalFileHeaderSignature {
+			return nil, fmt.Errorf("%w: expected local file header signature", ErrFormat)
+		}
+
+		filenameLen := int64(binary.LittleEndian.Uint16(buf[26:28]))
+		extraLen := int64(binary.LittleEndian.Uint16(buf[28:30]))
+		dataOffset := f.localHeaderOffset + localHeaderLen + filenameLen + extraLen
+
+		return io.NewSectionReader(zr.src, dataOffset, f.compressedSize), nil
+	}
+
 	return f
 }
 
