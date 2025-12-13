@@ -48,15 +48,16 @@ type File struct {
 	isDir bool        // True if this entry represents a directory
 	mode  fs.FileMode // Unix-style file permissions and type bits
 
-	openFunc      func() (io.ReadCloser, error)     // Factory function for reading original content
-	originalRFunc func() (*io.SectionReader, error) // Factory function for reading uncompressed content
+	openFunc   func() (io.ReadCloser, error)     // Factory function for reading original content
+	sourceFunc func() (*io.SectionReader, error) // Factory function for reading uncompressed content
 
 	uncompressedSize int64  // Size of original content before compression in bytes
 	compressedSize   int64  // Size of compressed data within archive in bytes
 	crc32            uint32 // CRC-32 checksum of uncompressed data
 
 	// Per-file configuration overriding archive defaults
-	config FileConfig
+	config       FileConfig
+	sourceConfig FileConfig
 
 	localHeaderOffset int64          // Byte offset of this file's local header within archive
 	hostSystem        sys.HostSystem // Operating system that created the file (for attribute mapping)
@@ -264,7 +265,7 @@ func (f *File) SetConfig(config FileConfig) {
 // This allows customizing how file data is read, which is useful for advanced
 // scenarios like streaming from network sources or applying transformations.
 func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) {
-	f.originalRFunc = nil
+	f.sourceFunc = nil
 	f.openFunc = openFunc
 }
 
@@ -306,6 +307,29 @@ func (f *File) getFilename() string {
 		return f.name + "/"
 	}
 	return f.name
+}
+
+// shouldCopyRaw checks if we can optimize by copying raw compressed data directly.
+// Returns true ONLY if content hasn't changed AND configuration matches the source.
+func (f *File) shouldCopyRaw() bool {
+    if f.sourceFunc == nil {
+        return false
+    }
+
+    if f.config.CompressionMethod != f.sourceConfig.CompressionMethod {
+        return false
+    }
+    if f.config.EncryptionMethod != f.sourceConfig.EncryptionMethod {
+        return false
+    }
+
+    if f.config.EncryptionMethod != NotEncrypted {
+        if f.config.Password != f.sourceConfig.Password {
+            return false
+        }
+    }
+
+    return true
 }
 
 // zipHeaders is responsible for generating ZIP format headers from File metadata.

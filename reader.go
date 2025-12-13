@@ -282,10 +282,11 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 			EncryptionMethod:  encryptionMethod,
 		},
 	}
+	f.sourceConfig = f.config
 	f.openFunc = func() (io.ReadCloser, error) {
 		return zr.openFile(f)
 	}
-	f.originalRFunc = func() (*io.SectionReader, error) {
+	f.sourceFunc = func() (*io.SectionReader, error) {
 		headerReader := io.NewSectionReader(zr.src, f.localHeaderOffset, localHeaderLen)
 
 		buf := make([]byte, localHeaderLen)
@@ -380,13 +381,6 @@ func (zr *zipReader) verifySignature(r io.Reader, s uint32) bool {
 		return false
 	}
 	return binary.LittleEndian.Uint32(buf) == s
-}
-
-// parseFileExternalAttributes converts file attributes from central directory to fs.FileMode.
-func (zr *zipReader) parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {
-	// (moved to be a method for style consistency, though could be standalone)
-	// implementation is same as standalone version
-	return parseFileExternalAttributes(entry)
 }
 
 func parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {

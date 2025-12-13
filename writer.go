@@ -159,7 +159,15 @@ func (zw *zipWriter) writeWithTempFile(file *File) error {
 // and writes to the provided writer while collecting size and CRC information.
 // It does not update local file header offset.
 func (zw *zipWriter) encodeAndUpdateFile(file *File, writer io.Writer) error {
-	if file.originalRFunc != nil {
+	if file.shouldCopyRaw() {
+		src, err := file.sourceFunc()
+		if err != nil {
+			return err
+		}
+
+		if _, err := io.Copy(writer, src); err != nil {
+			return fmt.Errorf("copy raw: %w", err)
+		}
 		return nil
 	}
 
@@ -610,14 +618,17 @@ func (pzw *parallelZipWriter) compressFile(ctx context.Context, file *File) (io.
 		fileBuffer = tmpFile
 	}
 
-	if file.originalRFunc != nil {
-		src, err := file.originalRFunc()
+	if file.shouldCopyRaw() {
+		src, err := file.sourceFunc()
 		if err != nil {
 			pzw.cleanupBuf(fileBuffer)
 			return nil, err
 		}
 
-		io.Copy(fileBuffer, src)
+		if _, err := io.Copy(fileBuffer, src); err != nil {
+			pzw.cleanupBuf(fileBuffer)
+			return nil, fmt.Errorf("copy raw: %w", err)
+		}
 	} else {
 		src, err := file.Open()
 		if err != nil {
