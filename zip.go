@@ -362,29 +362,70 @@ func (z *Zip) Rename(file *File, newName string) error {
 		return fmt.Errorf("%w: new name cannot be empty", ErrFileEntry)
 	}
 
-	dir := path.Dir(file.name)
-	if dir == "." {
-		dir = ""
+	z.mu.Lock()
+	defer z.mu.Unlock()
+
+	parentDir := path.Dir(file.name)
+	if parentDir == "." {
+		parentDir = ""
 	}
 
-	fullPath := path.Join(dir, newName)
+	fullPath := path.Join(parentDir, newName)
 	fullPath = strings.TrimPrefix(path.Clean(strings.ReplaceAll(fullPath, "\\", "/")), "/")
+
+	if (z.fileCache[fullPath] || z.fileCache[fullPath+"/"]) && fullPath != file.name {
+		return fmt.Errorf("%w: '%s' already exists", ErrDuplicateEntry, fullPath)
+	}
 
 	if len(fullPath)+1 > math.MaxUint16 {
 		return fmt.Errorf("%w: %s (%d bytes)", ErrFilenameTooLong, fullPath, len(fullPath))
 	}
 
-	delete(z.fileCache, file.getFilename())
-	file.name = fullPath
-	z.fileCache[file.getFilename()] = true
+	if !file.isDir {
+		delete(z.fileCache, file.getFilename())
+		file.name = fullPath
+		z.fileCache[file.getFilename()] = true
+		return nil
+	}
+
+	oldPrefix := file.getFilename() // e.g., "docs/old/"
+	newPrefix := fullPath + "/" // e.g., "docs/new/"
+
+	// Iterate over all files to update children
+	// NOTE: This loop also handles the directory entry 'file' itself,
+	// because file.getFilename() equals oldPrefix.
+	for _, f := range z.files {
+		filename := f.getFilename()
+
+		if after, ok :=strings.CutPrefix(filename, oldPrefix); ok  {
+			// Replace the prefix
+			// "docs/old/file.txt" -> "docs/new/file.txt"
+			suffix := after
+			newChildPath := newPrefix + suffix
+			cleanChildName := strings.TrimSuffix(newChildPath, "/")
+
+			if len(cleanChildName)+1 > math.MaxUint16 {
+				return fmt.Errorf("%w: child path %s too long", ErrFilenameTooLong, cleanChildName)
+			}
+
+			delete(z.fileCache, filename)
+			f.name = cleanChildName
+			z.fileCache[f.getFilename()] = true
+		}
+	}
 
 	return nil
 }
 
 // Move updates the directory path of the file, keeping the base filename.
 // For example, moving "logs/app.log" to "backup/2023" results in "backup/2023/app.log".
+// If the entry is a directory, all its contents are moved recursively.
 // Passing "" or "." as newPath moves the file to the archive root.
+// Missing directories from newPath are created automatically.
 func (z *Zip) Move(file *File, newPath string) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+
 	baseName := path.Base(file.name)
 
 	if file.isDir && baseName == "." {
@@ -395,13 +436,49 @@ func (z *Zip) Move(file *File, newPath string) error {
 	fullPath := path.Join(newPath, baseName)
 	fullPath = strings.TrimPrefix(path.Clean(strings.ReplaceAll(fullPath, "\\", "/")), "/")
 
+	if (z.fileCache[fullPath] || z.fileCache[fullPath+"/"]) && fullPath != file.name {
+		return fmt.Errorf("%w: destination '%s' already exists", ErrDuplicateEntry, fullPath)
+	}
+
 	if len(fullPath)+1 > math.MaxUint16 {
 		return fmt.Errorf("%w: %s (%d bytes)", ErrFilenameTooLong, fullPath, len(fullPath))
 	}
 
-	delete(z.fileCache, file.getFilename())
-	file.name = fullPath
-	z.fileCache[file.getFilename()] = true
+	if !file.isDir {
+		delete(z.fileCache, file.getFilename())
+		file.name = fullPath
+		z.fileCache[file.getFilename()] = true
+		return nil
+	}
+
+	if !z.fileCache[newPath] || !z.fileCache[newPath+"/"] {
+		z.createMissingDirs(fullPath)
+	}
+
+	oldPrefix := file.getFilename() // e.g. "photos/"
+	newPrefix := fullPath + "/"     // e.g. "backup/photos/"
+
+	// Iterate over all files to find children
+	// NOTE: This includes the 'file' directory entry itself because it matches the prefix
+	for _, f := range z.files {
+		filename := f.getFilename()
+
+		if after, ok := strings.CutPrefix(filename, oldPrefix); ok  {
+			// Calculate new name:
+			// "photos/img.jpg" -> strip "photos/" -> "img.jpg" -> join "backup/photos/" + "img.jpg"
+			newChildPath := newPrefix + after
+			cleanChildName := strings.TrimSuffix(newChildPath, "/")
+
+			if len(cleanChildName)+1 > math.MaxUint16 {
+				return fmt.Errorf("%w: child path %s too long", ErrFilenameTooLong, cleanChildName)
+			}
+
+			delete(z.fileCache, filename)
+			f.name = cleanChildName
+			z.fileCache[f.getFilename()] = true
+		}
+	}
+
 	return nil
 }
 
