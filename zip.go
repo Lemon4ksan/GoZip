@@ -59,10 +59,10 @@ type ZipConfig struct {
 	// Default: CP437 (US DOS).
 	TextEncoding TextDecoder
 
-	// OnFileProcessed is called immediately after a file entry is successfully
+	// OnFileProcessed is called immediately after a file entry is
 	// processed in Write, Read and Extract methods and their variants.
 	// NOTE: In ExtractParallel this callback is called concurrently.
-	OnFileProcessed func(f *File)
+	OnFileProcessed func(*File, error)
 }
 
 // FileConfig defines per-file configuration options that override archive defaults.
@@ -723,11 +723,16 @@ func (z *Zip) WriteWithContext(ctx context.Context, dest io.Writer) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := writer.WriteFile(file); err != nil {
-			return fmt.Errorf("zip: write file %s: %w", file.name, err)
+
+		err := writer.WriteFile(file)
+		if err != nil {
+			err = fmt.Errorf("zip: write file %s: %w", file.name, err)
 		}
 		if z.config.OnFileProcessed != nil {
-			z.config.OnFileProcessed(file)
+			z.config.OnFileProcessed(file, err)
+		}
+		if err != nil {
+			return err
 		}
 	}
 
@@ -844,7 +849,8 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 			continue
 		}
 
-		if err := z.extractFile(ctx, f, fpath); err != nil {
+		err := z.extractFile(ctx, f, fpath)
+		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
@@ -852,8 +858,9 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 				f.config.Password = ""
 			}
 			errs = append(errs, fmt.Errorf("failed to extract %s: %w", fpath, err))
-		} else if z.config.OnFileProcessed != nil {
-			z.config.OnFileProcessed(f)
+		}
+		if z.config.OnFileProcessed != nil {
+			z.config.OnFileProcessed(f, err)
 		}
 	}
 
@@ -935,16 +942,18 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 
 			fpath := filepath.Join(path, f.name)
 
-			if err := z.extractFile(ctx, f, fpath); err != nil {
+			err := z.extractFile(ctx, f, fpath)
+			if err != nil {
 				if ctx.Err() == nil {
 					errChan <- fmt.Errorf("failed to extract %s: %w", f.name, err)
 				}
 				if errors.Is(err, ErrPasswordMismatch) {
 					f.config.Password = ""
 				}
-			} else if z.config.OnFileProcessed != nil {
+			} 
+			if z.config.OnFileProcessed != nil {
 				if ctx.Err() == nil {
-					z.config.OnFileProcessed(f)
+					z.config.OnFileProcessed(f, err)
 				}
 			}
 		}(f)

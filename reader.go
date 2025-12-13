@@ -33,7 +33,7 @@ type zipReader struct {
 	fileSize        int64               // Total size of the archive
 	decompressors   decompressorsMap    // Registry of available compressors
 	textEncoder     func(string) string // Filename and comment encoder
-	onFileProcessed func(f *File)       // Callback after reading
+	onFileProcessed func(*File, error)  // Callback after reading
 }
 
 // newZipReader creates and initializes a new zipReader instance.
@@ -207,7 +207,7 @@ func (zr *zipReader) readCentralDir(ctx context.Context, offset int64, entries i
 		file := zr.newFileFromCentralDir(entry)
 		files = append(files, file)
 		if zr.onFileProcessed != nil {
-			zr.onFileProcessed(file)
+			zr.onFileProcessed(file, nil)
 		}
 	}
 

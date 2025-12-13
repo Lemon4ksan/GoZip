@@ -493,11 +493,11 @@ func cleanupTempFile(tmpFile *os.File) {
 
 // parallelZipWriter handles parallel compression and writing of files to a ZIP archive.
 type parallelZipWriter struct {
-	zw              *zipWriter    // Underlying sequential writer
-	sem             chan struct{} // Semaphore for limiting concurrent workers
-	memoryThreshold int64         // Size threshold for memory vs disk buffering
-	bufferPool      sync.Pool     // Reusable memory buffers for small files
-	onFileProcessed func(f *File) // Callback after writing
+	zw              *zipWriter         // Underlying sequential writer
+	sem             chan struct{}      // Semaphore for limiting concurrent workers
+	memoryThreshold int64              // Size threshold for memory vs disk buffering
+	bufferPool      sync.Pool          // Reusable memory buffers for small files
+	onFileProcessed func(*File, error) // Callback after writing
 }
 
 // newParallelZipWriter creates a new parallelZipWriter instance.
@@ -573,14 +573,15 @@ Loop:
 			continue
 		}
 
-		if err := pzw.writeCompressedFile(result.file, result.src); err != nil {
+		err := pzw.writeCompressedFile(result.file, result.src)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", result.file.name, err))
-		} else if err := pzw.zw.addCentralDirEntry(result.file); err != nil {
+		} else if err = pzw.zw.addCentralDirEntry(result.file); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", result.file.name, err))
 		}
 
 		if pzw.onFileProcessed != nil {
-			pzw.onFileProcessed(result.file)
+			pzw.onFileProcessed(result.file, err)
 		}
 
 		pzw.cleanupBuf(result.src)
