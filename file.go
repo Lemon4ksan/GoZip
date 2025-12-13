@@ -312,24 +312,24 @@ func (f *File) getFilename() string {
 // shouldCopyRaw checks if we can optimize by copying raw compressed data directly.
 // Returns true ONLY if content hasn't changed AND configuration matches the source.
 func (f *File) shouldCopyRaw() bool {
-    if f.sourceFunc == nil {
-        return false
-    }
+	if f.sourceFunc == nil {
+		return false
+	}
 
-    if f.config.CompressionMethod != f.sourceConfig.CompressionMethod {
-        return false
-    }
-    if f.config.EncryptionMethod != f.sourceConfig.EncryptionMethod {
-        return false
-    }
+	if f.config.CompressionMethod != f.sourceConfig.CompressionMethod {
+		return false
+	}
+	if f.config.EncryptionMethod != f.sourceConfig.EncryptionMethod {
+		return false
+	}
 
-    if f.config.EncryptionMethod != NotEncrypted {
-        if f.config.Password != f.sourceConfig.Password {
-            return false
-        }
-    }
+	if f.config.EncryptionMethod != NotEncrypted {
+		if f.config.Password != f.sourceConfig.Password {
+			return false
+		}
+	}
 
-    return true
+	return true
 }
 
 // zipHeaders is responsible for generating ZIP format headers from File metadata.

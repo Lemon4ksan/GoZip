@@ -389,7 +389,7 @@ func (z *Zip) Rename(file *File, newName string) error {
 	}
 
 	oldPrefix := file.getFilename() // e.g., "docs/old/"
-	newPrefix := fullPath + "/" // e.g., "docs/new/"
+	newPrefix := fullPath + "/"     // e.g., "docs/new/"
 
 	// Iterate over all files to update children
 	// NOTE: This loop also handles the directory entry 'file' itself,
@@ -397,7 +397,7 @@ func (z *Zip) Rename(file *File, newName string) error {
 	for _, f := range z.files {
 		filename := f.getFilename()
 
-		if after, ok :=strings.CutPrefix(filename, oldPrefix); ok  {
+		if after, ok := strings.CutPrefix(filename, oldPrefix); ok {
 			// Replace the prefix
 			// "docs/old/file.txt" -> "docs/new/file.txt"
 			suffix := after
@@ -463,7 +463,7 @@ func (z *Zip) Move(file *File, newPath string) error {
 	for _, f := range z.files {
 		filename := f.getFilename()
 
-		if after, ok := strings.CutPrefix(filename, oldPrefix); ok  {
+		if after, ok := strings.CutPrefix(filename, oldPrefix); ok {
 			// Calculate new name:
 			// "photos/img.jpg" -> strip "photos/" -> "img.jpg" -> join "backup/photos/" + "img.jpg"
 			newChildPath := newPrefix + after
@@ -950,7 +950,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 				if errors.Is(err, ErrPasswordMismatch) {
 					f.config.Password = ""
 				}
-			} 
+			}
 			if z.config.OnFileProcessed != nil {
 				if ctx.Err() == nil {
 					z.config.OnFileProcessed(f, err)

@@ -40,7 +40,7 @@ func init() {
 func generateFiles(count, size int) []testFile {
 	files := make([]testFile, count)
 	rng := rand.New(rand.NewSource(42))
-	
+
 	baseContent := make([]byte, size)
 	for i := range baseContent {
 		baseContent[i] = byte(rng.Intn(26) + 'a') // a-z
@@ -88,7 +88,7 @@ func BenchmarkWrite_Medium_GoZip_Par(b *testing.B) {
 func runStdLibBenchmark(b *testing.B, files []testFile) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		zw := zip.NewWriter(io.Discard) 
+		zw := zip.NewWriter(io.Discard)
 
 		for _, f := range files {
 			w, err := zw.CreateHeader(&zip.FileHeader{
@@ -133,7 +133,7 @@ func runGoZipSeqBenchmark(b *testing.B, files []testFile) {
 func runGoZipParBenchmark(b *testing.B, files []testFile) {
 	b.ReportAllocs()
 	workers := runtime.NumCPU()
-	
+
 	for i := 0; i < b.N; i++ {
 		archive := gozip.NewZip()
 		archive.SetConfig(gozip.ZipConfig{

@@ -55,7 +55,7 @@ func NewDeflateCompressor(level int) *DeflateCompressor {
 		},
 		buffers: sync.Pool{
 			New: func() interface{} {
-				b := make([]byte, 32*1024) 
+				b := make([]byte, 32*1024)
 				return &b
 			},
 		},

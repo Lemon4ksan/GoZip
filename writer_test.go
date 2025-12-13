@@ -440,7 +440,7 @@ func TestMemoryBuffer_LargeGrowth(t *testing.T) {
 	mb := NewMemoryBuffer(1)
 	size := 64 * 1024
 	data := make([]byte, size)
-	
+
 	// Faster random fill
 	rng := rand.New(rand.NewSource(42))
 	rng.Read(data)

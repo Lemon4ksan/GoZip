@@ -406,11 +406,11 @@ func parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {
 			mode |= fs.ModeDevice
 		}
 		return mode
-	} 
-	
+	}
+
 	if hostSystem.IsWindows() {
 		isDir := strings.HasSuffix(entry.Filename, "/") || (entry.ExternalFileAttributes&0x10 != 0)
-		
+
 		if isDir {
 			mode = 0755 | fs.ModeDir
 		} else {
