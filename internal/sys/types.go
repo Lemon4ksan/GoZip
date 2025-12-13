@@ -74,7 +74,15 @@ func (h HostSystem) String() string {
 
 // Unix constants for file types (standard POSIX)
 const (
-	S_IFREG = 0100000 // Regular file
-	S_IFDIR = 0040000 // Directory
-	S_IFLNK = 0120000 // Symlink
+	S_IFMT   = 0170000 // Mask for file type
+	S_IFSOCK = 0140000 // Socket
+	S_IFLNK  = 0120000 // Symbolic link
+	S_IFREG  = 0100000 // Regular file
+	S_IFBLK  = 0060000 // Block device
+	S_IFDIR  = 0040000 // Directory
+	S_IFCHR  = 0020000 // Character device
+	S_IFIFO  = 0010000 // FIFO / Named pipe
+	S_ISUID  = 0004000 // Set-user-ID bit
+	S_ISGID  = 0002000 // Set-group-ID bit
+	S_ISVTX  = 0001000 // Sticky bit
 )

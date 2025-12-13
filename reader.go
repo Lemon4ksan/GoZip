@@ -397,14 +397,24 @@ func parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {
 		unixMode := uint32(entry.ExternalFileAttributes >> 16)
 		mode = fs.FileMode(unixMode & 0777)
 
-		switch {
-		case unixMode&sys.S_IFDIR != 0:
+		switch unixMode & sys.S_IFMT {
+		case sys.S_IFDIR:
 			mode |= fs.ModeDir
-		case unixMode&sys.S_IFLNK != 0:
+		case sys.S_IFLNK:
 			mode |= fs.ModeSymlink
+		case sys.S_IFSOCK:
+			mode |= fs.ModeSocket
+		case sys.S_IFIFO:
+			mode |= fs.ModeNamedPipe
+		case sys.S_IFCHR:
+			mode |= fs.ModeCharDevice
+		case sys.S_IFBLK:
+			mode |= fs.ModeDevice
 		}
 	} else {
-		if strings.HasSuffix(entry.Filename, "/") {
+		isDir := strings.HasSuffix(entry.Filename, "/") || (entry.ExternalFileAttributes&0x10 != 0)
+		
+		if isDir {
 			mode = 0755 | fs.ModeDir
 		} else {
 			mode = 0644

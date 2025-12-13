@@ -626,7 +626,7 @@ func (pzw *parallelZipWriter) compressFile(ctx context.Context, file *File) (io.
 		}
 		defer src.Close()
 
-		stats, err := pzw.zw.encodeToWriter(&contextReader{ctx: ctx, r: src}, pzw.zw.dest, file.config)
+		stats, err := pzw.zw.encodeToWriter(&contextReader{ctx: ctx, r: src}, fileBuffer, file.config)
 		if err != nil {
 			pzw.cleanupBuf(fileBuffer)
 			return nil, fmt.Errorf("encode: %w", err)
