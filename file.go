@@ -186,6 +186,9 @@ func (f *File) Name() string { return f.name }
 // IsDir returns true if the file represents a directory entry.
 func (f *File) IsDir() bool { return f.isDir }
 
+// Mode returns underlying file attributes.
+func (f *File) Mode() fs.FileMode { return f.mode }
+
 // UncompressedSize returns the size of the original file content before compression.
 // Returns sizeUnknown (-1) for files created from io.Reader with unknown size.
 func (f *File) UncompressedSize() int64 { return f.uncompressedSize }
@@ -198,8 +201,34 @@ func (f *File) CompressedSize() int64 { return f.compressedSize }
 // This value is used for data integrity verification during extraction.
 func (f *File) CRC32() uint32 { return f.crc32 }
 
+// Config returns archive file entry configuration.
+func (f *File) Config() FileConfig { return f.config }
+
+// HostSystem returns the system file was created in.
+func (f *File) HostSystem() sys.HostSystem { return f.hostSystem }
+
 // ModTime returns the file's last modification timestamp.
 func (f *File) ModTime() time.Time { return f.modTime }
+
+// FsTime returns extended file timestamps if they exist.
+func (f *File) FsTime() (mtime, atime, ctime time.Time) {
+	if val, ok := f.metadata["LastWriteTime"]; ok {
+		if t, ok := val.(uint64); ok {
+			mtime = time.Unix(0, int64(t))
+		}
+	}
+	if val, ok := f.metadata["LastAccessTime"]; ok {
+		if t, ok := val.(uint64); ok {
+			atime = time.Unix(0, int64(t))
+		}
+	}
+	if val, ok := f.metadata["CreationTime"]; ok {
+		if t, ok := val.(uint64); ok {
+			ctime = time.Unix(0, int64(t))
+		}
+	}
+	return
+}
 
 // Open returns a ReadCloser for reading the original, uncompressed file content.
 // The returned reader should be closed after use to release any held resources.
