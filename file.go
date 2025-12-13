@@ -151,6 +151,7 @@ func newFileFromReader(src io.Reader, name string, size int64) (*File, error) {
 
 	return &File{
 		name:             name,
+		mode:             0644,
 		uncompressedSize: size,
 		modTime:          time.Now(),
 		hostSystem:       sys.GetHostSystemByOS(),

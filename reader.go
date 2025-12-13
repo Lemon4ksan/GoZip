@@ -393,7 +393,7 @@ func parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {
 	var mode fs.FileMode
 	hostSystem := sys.HostSystem(entry.VersionMadeBy >> 8)
 
-	if hostSystem == sys.HostSystemUNIX {
+	if hostSystem.IsUnix() {
 		unixMode := uint32(entry.ExternalFileAttributes >> 16)
 		mode = fs.FileMode(unixMode & 0777)
 
@@ -411,7 +411,10 @@ func parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {
 		case sys.S_IFBLK:
 			mode |= fs.ModeDevice
 		}
-	} else {
+		return mode
+	} 
+	
+	if hostSystem.IsWindows() {
 		isDir := strings.HasSuffix(entry.Filename, "/") || (entry.ExternalFileAttributes&0x10 != 0)
 		
 		if isDir {
@@ -419,11 +422,17 @@ func parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {
 		} else {
 			mode = 0644
 		}
+
 		if entry.ExternalFileAttributes&0x01 != 0 {
 			mode &^= 0222 // Remove write permission (a-w)
 		}
+		return mode
 	}
-	return mode
+
+	if strings.HasSuffix(entry.Filename, "/") {
+		return 0755 | fs.ModeDir
+	}
+	return 0644
 }
 
 // checksumReader wraps an io.ReadCloser to verify CRC32 checksum and size during reading.

@@ -6,10 +6,6 @@
 
 package sys
 
-import (
-	"runtime"
-)
-
 // getHostSystem returns the HostSystem type.
 // On Unix we usually don't inspect the FD for filesystem type (like NTFS),
 // we just report the OS type.
@@ -18,9 +14,6 @@ func GetHostSystem(_ uintptr) HostSystem {
 }
 
 func GetHostSystemByOS() HostSystem {
-	if runtime.GOOS == "darwin" {
-		return HostSystemDarwin
-	}
 	return HostSystemUNIX
 }
 

@@ -41,10 +41,33 @@ const (
 	// 20-255: unused
 )
 
+// IsWindows returns true if the host system is a Windows variant.
+// In the wild, 99% of Windows archives use HostSystemFAT (0),
+// but HostSystemNTFS (10) and HostSystemVFAT (14) are also possible per spec.
+func (h HostSystem) IsWindows() bool {
+	switch h {
+	case HostSystemFAT, HostSystemNTFS, HostSystemVFAT:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsUnix returns true if the host system is a Unix variant.
+// Most modern archives use HostSystemUNIX (3), but macOS might theoretically use HostSystemDarwin (19).
+func (h HostSystem) IsUnix() bool {
+	switch h {
+	case HostSystemUNIX, HostSystemDarwin:
+		return true
+	default:
+		return false
+	}
+}
+
 // String representation of HostSystem for debugging
 func (h HostSystem) String() string {
 	names := map[HostSystem]string{
-		HostSystemFAT:       "MS-DOS/OS2 (FAT)",
+		HostSystemFAT:       "FAT",
 		HostSystemAmiga:     "Amiga",
 		HostSystemOpenVMS:   "OpenVMS",
 		HostSystemUNIX:      "UNIX",
