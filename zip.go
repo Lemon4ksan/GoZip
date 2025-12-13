@@ -848,6 +848,9 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
+			if errors.Is(err, ErrPasswordMismatch) {
+				f.config.Password = ""
+			}
 			errs = append(errs, fmt.Errorf("failed to extract %s: %w", fpath, err))
 		} else if z.config.OnFileProcessed != nil {
 			z.config.OnFileProcessed(f)
@@ -935,6 +938,9 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 			if err := z.extractFile(ctx, f, fpath); err != nil {
 				if ctx.Err() == nil {
 					errChan <- fmt.Errorf("failed to extract %s: %w", f.name, err)
+				}
+				if errors.Is(err, ErrPasswordMismatch) {
+					f.config.Password = ""
 				}
 			} else if z.config.OnFileProcessed != nil {
 				if ctx.Err() == nil {
