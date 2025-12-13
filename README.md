@@ -20,7 +20,7 @@ Designed for high-load applications, GoZip focuses on concurrency, memory safety
 * **Cross-Platform Metadata:** Preserves **NTFS** (Windows) timestamps and **Unix/macOS** file permissions.
 * **Standard Compliance:** Full **Zip64** support for files larger than 4GB.
 * **Memory Efficient:** Extensive use of `sync.Pool` to minimize GC pressure.
-* **Extensible:** Interface-based architecture allowing registration of custom compressors (e.g., Zstd, Brotli).
+* **Context Support:** Full support for `context.Context` for cancellation and timeouts in long-running operations.
 
 ## 📦 Installation
 
@@ -104,8 +104,8 @@ func main() {
     f, _ := os.Open("backup.zip")
     defer f.Close()
 
-    // ReadFile is a helper for os.File (uses Stat() for size)
-    // For other readers, use archive.Read(readerAt, size)
+    // ReadFile is a helper for os.File.
+    // For arbitrary readers use archive.Read(readerAt, size).
     if err := archive.ReadFile(f); err != nil {
         panic(err)
     }
@@ -178,7 +178,33 @@ func main() {
 }
 ```
 
-### 6. Fixing Broken Encodings (CP866 / Russian DOS)
+### 6. Context Support (Timeout & Cancellation) ⏱️
+
+All long-running operations support `context.Context`.
+
+```go
+func main() {
+    archive := gozip.NewZip()
+    f, _ := os.Open("huge_backup.zip")
+    defer f.Close()
+    archive.ReadFile(f)
+
+    // Create a context with a 30-second timeout
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+
+    // If extraction takes longer than 30s, it will be cancelled automatically
+    // and cleanup temporary files.
+    err := archive.ExtractParallelWithContext(ctx, "output", 4)
+    if err != nil {
+        if errors.Is(err, context.DeadlineExceeded) {
+            fmt.Println("Extraction timed out!")
+        }
+    }
+}
+```
+
+### 7. Fixing Broken Encodings (CP866 / Russian DOS)
 
 If you have old archives created on Windows/DOS that show up as gibberish (e.g., `ΓÑßΓ.txt`), use the `TextEncoding` option.
 
@@ -230,37 +256,10 @@ Configure individual files using the Option pattern:
 
 ### Sort Strategies
 
-Optimize archive structure for different scenarios:
-
 * `SortDefault`: Preserves insertion order.
 * `SortAlphabetical`: Sorts by name (A-Z).
-* `SortLargeFilesFirst`: Optimizes **parallel writing** (starts big tasks first).
-* `SortLargeFilesLast`: Optimizes sequential access.
+* `SortLargeFilesFirst`: Optimizes **parallel writing**.
 * `SortZIP64Optimized`: Buckets files by size to optimize Zip64 header overhead.
-
-```go
-archive.SetConfig(gozip.ZipConfig{
-    FileSortStrategy: gozip.SortLargeFilesFirst,
-})
-```
-
-## 🛠 Custom Compressors
-
-GoZip allows registering custom compression algorithms without modifying the library source.
-
-```go
-// Implement gozip.Compressor interface
-type ZstdCompressor struct {}
-func (z *ZstdCompressor) Compress(src io.Reader, dest io.Writer) (int64, error) {
-    // ... implementation ...
-}
-
-func main() {
-    archive := gozip.NewZip()
-    // Register custom method
-    archive.RegisterCompressor(gozip.ZStandard, 0, new(ZstdCompressor))
-}
-```
 
 ## License
 
