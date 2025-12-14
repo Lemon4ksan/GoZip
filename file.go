@@ -212,21 +212,22 @@ func (f *File) HostSystem() sys.HostSystem { return f.hostSystem }
 // ModTime returns the file's last modification timestamp.
 func (f *File) ModTime() time.Time { return f.modTime }
 
-// FsTime returns extended file timestamps if they exist.
+// FsTime returns the file timestamps (Modification, Access, Creation) if available.
+// Returns zero time values if the metadata is missing.
 func (f *File) FsTime() (mtime, atime, ctime time.Time) {
 	if val, ok := f.metadata["LastWriteTime"]; ok {
 		if t, ok := val.(uint64); ok {
-			mtime = time.Unix(0, int64(t))
+			mtime = winFiletimeToTime(t)
 		}
 	}
 	if val, ok := f.metadata["LastAccessTime"]; ok {
 		if t, ok := val.(uint64); ok {
-			atime = time.Unix(0, int64(t))
+			atime = winFiletimeToTime(t)
 		}
 	}
 	if val, ok := f.metadata["CreationTime"]; ok {
 		if t, ok := val.(uint64); ok {
-			ctime = time.Unix(0, int64(t))
+			ctime = winFiletimeToTime(t)
 		}
 	}
 	return

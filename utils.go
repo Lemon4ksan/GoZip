@@ -76,3 +76,39 @@ func hasPreciseTimestamps(metadata map[string]interface{}) bool {
 	_, c := metadata["CreationTime"]
 	return w || a || c
 }
+
+// winFiletimeToTime converts Windows FILETIME (100ns ticks since 1601) to Go time.Time.
+func winFiletimeToTime(ft uint64) time.Time {
+	if ft == 0 {
+		return time.Time{}
+	}
+
+	// 116444736000000000 is the number of 100ns intervals between
+	// Jan 1, 1601 (UTC) and Jan 1, 1970 (UTC).
+	const offset = 116444736000000000
+	const ticksPerSecond = 10000000
+
+	// Perform calculation in uint64 to avoid overflow issues with dates before 1970 during subtraction
+	// Note: We assume the date is within valid Unix range for int64 conversion logic below.
+	
+	// Handle dates before 1970
+	if ft < offset {
+		diff := int64(offset - ft)
+		seconds := -(diff / ticksPerSecond)
+		nanos := -(diff % ticksPerSecond) * 100
+		
+		// Adjust if nanos is negative (standard time.Unix behavior handles this, 
+		// but explicit adjustment ensures correctness)
+		if nanos < 0 {
+			seconds--
+			nanos += 1000000000
+		}
+		return time.Unix(seconds, nanos).UTC()
+	}
+
+	diff := ft - offset
+	seconds := int64(diff / ticksPerSecond)
+	nanos := int64(diff % ticksPerSecond) * 100
+
+	return time.Unix(seconds, nanos).UTC()
+}

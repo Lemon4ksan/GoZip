@@ -17,7 +17,6 @@ import (
 	"sync"
 
 	"github.com/lemon4ksan/gozip/internal"
-	"github.com/lemon4ksan/gozip/internal/sys"
 )
 
 // zipWriter handles the low-level writing of ZIP archive structure.
@@ -820,7 +819,7 @@ func addFilesystemExtraField(f *File) {
 		return
 	}
 
-	if f.hostSystem == sys.HostSystemNTFS && hasPreciseTimestamps(f.metadata) {
+	if hasPreciseTimestamps(f.metadata) {
 		f.SetExtraField(NTFSFieldTag, encodeNTFSExtraField(f.metadata))
 	}
 }
