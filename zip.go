@@ -373,7 +373,11 @@ func (z *Zip) Rename(file *File, newName string) error {
 	fullPath := path.Join(parentDir, newName)
 	fullPath = strings.TrimPrefix(path.Clean(strings.ReplaceAll(fullPath, "\\", "/")), "/")
 
-	if (z.fileCache[fullPath] || z.fileCache[fullPath+"/"]) && fullPath != file.name {
+	if fullPath == file.name {
+		return nil
+	}
+
+	if z.fileCache[fullPath] || z.fileCache[fullPath+"/"] {
 		return fmt.Errorf("%w: '%s' already exists", ErrDuplicateEntry, fullPath)
 	}
 
@@ -436,7 +440,11 @@ func (z *Zip) Move(file *File, newPath string) error {
 	fullPath := path.Join(newPath, baseName)
 	fullPath = strings.TrimPrefix(path.Clean(strings.ReplaceAll(fullPath, "\\", "/")), "/")
 
-	if (z.fileCache[fullPath] || z.fileCache[fullPath+"/"]) && fullPath != file.name {
+	if fullPath == file.name {
+		return nil
+	}
+
+	if z.fileCache[fullPath] || z.fileCache[fullPath+"/"] {
 		return fmt.Errorf("%w: destination '%s' already exists", ErrDuplicateEntry, fullPath)
 	}
 
@@ -444,15 +452,15 @@ func (z *Zip) Move(file *File, newPath string) error {
 		return fmt.Errorf("%w: %s (%d bytes)", ErrFilenameTooLong, fullPath, len(fullPath))
 	}
 
+	if !z.fileCache[newPath] || !z.fileCache[newPath+"/"] {
+		z.createMissingDirs(fullPath)
+	}
+
 	if !file.isDir {
 		delete(z.fileCache, file.getFilename())
 		file.name = fullPath
 		z.fileCache[file.getFilename()] = true
 		return nil
-	}
-
-	if !z.fileCache[newPath] || !z.fileCache[newPath+"/"] {
-		z.createMissingDirs(fullPath)
 	}
 
 	oldPrefix := file.getFilename() // e.g. "photos/"
