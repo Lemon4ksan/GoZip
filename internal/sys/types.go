@@ -41,10 +41,33 @@ const (
 	// 20-255: unused
 )
 
+// IsWindows returns true if the host system is a Windows variant.
+// In the wild, 99% of Windows archives use HostSystemFAT (0),
+// but HostSystemNTFS (10) and HostSystemVFAT (14) are also possible per spec.
+func (h HostSystem) IsWindows() bool {
+	switch h {
+	case HostSystemFAT, HostSystemNTFS, HostSystemVFAT:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsUnix returns true if the host system is a Unix variant.
+// Most modern archives use HostSystemUNIX (3), but macOS might theoretically use HostSystemDarwin (19).
+func (h HostSystem) IsUnix() bool {
+	switch h {
+	case HostSystemUNIX, HostSystemDarwin:
+		return true
+	default:
+		return false
+	}
+}
+
 // String representation of HostSystem for debugging
 func (h HostSystem) String() string {
 	names := map[HostSystem]string{
-		HostSystemFAT:       "MS-DOS/OS2 (FAT)",
+		HostSystemFAT:       "FAT",
 		HostSystemAmiga:     "Amiga",
 		HostSystemOpenVMS:   "OpenVMS",
 		HostSystemUNIX:      "UNIX",
@@ -74,7 +97,15 @@ func (h HostSystem) String() string {
 
 // Unix constants for file types (standard POSIX)
 const (
-	S_IFREG = 0100000 // Regular file
-	S_IFDIR = 0040000 // Directory
-	S_IFLNK = 0120000 // Symlink
+	S_IFMT   = 0170000 // Mask for file type
+	S_IFSOCK = 0140000 // Socket
+	S_IFLNK  = 0120000 // Symbolic link
+	S_IFREG  = 0100000 // Regular file
+	S_IFBLK  = 0060000 // Block device
+	S_IFDIR  = 0040000 // Directory
+	S_IFCHR  = 0020000 // Character device
+	S_IFIFO  = 0010000 // FIFO / Named pipe
+	S_ISUID  = 0004000 // Set-user-ID bit
+	S_ISGID  = 0002000 // Set-group-ID bit
+	S_ISVTX  = 0001000 // Sticky bit
 )

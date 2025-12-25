@@ -172,3 +172,95 @@ func TestRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestWinFiletimeToTime(t *testing.T) {
+	const epochOffset = 116444736000000000
+
+	tests := []struct {
+		name  string
+		input uint64
+		want  time.Time
+	}{
+		{
+			name:  "Zero value",
+			input: 0,
+			want:  time.Time{},
+		},
+		{
+			name:  "Unix Epoch (1970-01-01)",
+			input: epochOffset,
+			want:  time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "Modern Date (2025-05-15 12:00:00)",
+			// Unix Seconds for 2025-05-15 12:00:00 UTC = 1747310400
+			// 1747310400 * 10000000 + 116444736000000000 = 133917840000000000
+			input: 133917840000000000,
+			want:  time.Date(2025, 5, 15, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "Pre-1970 Date (1900-01-01)",
+			// -2208988800 * 10000000 + 116444736000000000
+			input: 94354848000000000,
+			want:  time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:  "Precision Check (100ns)",
+			input: epochOffset + 1,
+			want:  time.Date(1970, 1, 1, 0, 0, 0, 100, time.UTC),
+		},
+		{
+			name:  "Precision Check (1s)",
+			input: epochOffset + 10000000,
+			want:  time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := winFiletimeToTime(tt.input)
+			if !got.Equal(tt.want) {
+				t.Errorf("winFiletimeToTime(%d) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFile_FsTime(t *testing.T) {
+	// 2023-01-01 00:00:00 UTC
+	targetTime := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	winTicks := uint64(targetTime.UnixNano()/100) + 116444736000000000
+
+	f := &File{
+		metadata: map[string]interface{}{
+			"LastWriteTime":  winTicks,
+			"LastAccessTime": winTicks,
+			"CreationTime":   winTicks,
+		},
+	}
+
+	mtime, atime, ctime := f.FsTime()
+
+	if !mtime.Equal(targetTime) {
+		t.Errorf("mtime mismatch: got %v, want %v", mtime, targetTime)
+	}
+	if !atime.Equal(targetTime) {
+		t.Errorf("atime mismatch: got %v, want %v", atime, targetTime)
+	}
+	if !ctime.Equal(targetTime) {
+		t.Errorf("ctime mismatch: got %v, want %v", ctime, targetTime)
+	}
+}
+
+func TestFile_FsTime_Empty(t *testing.T) {
+	f := &File{
+		metadata: nil,
+	}
+
+	mtime, atime, ctime := f.FsTime()
+
+	if !mtime.IsZero() || !atime.IsZero() || !ctime.IsZero() {
+		t.Error("expected zero times for empty metadata")
+	}
+}

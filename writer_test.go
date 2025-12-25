@@ -7,6 +7,7 @@ package gozip
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -262,7 +263,7 @@ func TestParallelZipWriter_Integration(t *testing.T) {
 
 	pzw := newParallelZipWriter(config, nil, mw, 2)
 
-	errs := pzw.WriteFiles(files)
+	errs := pzw.WriteFiles(context.Background(), files)
 	if len(errs) > 0 {
 		t.Fatalf("WriteFiles returned errors: %v", errs)
 	}
@@ -324,7 +325,7 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 	pzw := newParallelZipWriter(config, nil, mw, 1)
 	pzw.memoryThreshold = 10 // Force second file to disk
 
-	errs := pzw.WriteFiles(files)
+	errs := pzw.WriteFiles(context.Background(), files)
 	if len(errs) > 0 {
 		t.Fatalf("WriteFiles errors: %v", errs)
 	}
@@ -357,7 +358,7 @@ func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 		},
 	}
 
-	errs := pzw.WriteFiles(files)
+	errs := pzw.WriteFiles(context.Background(), files)
 	if len(errs) == 0 {
 		t.Fatal("Expected error, got none")
 	}
@@ -439,7 +440,7 @@ func TestMemoryBuffer_LargeGrowth(t *testing.T) {
 	mb := NewMemoryBuffer(1)
 	size := 64 * 1024
 	data := make([]byte, size)
-	
+
 	// Faster random fill
 	rng := rand.New(rand.NewSource(42))
 	rng.Read(data)

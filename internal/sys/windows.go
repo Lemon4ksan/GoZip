@@ -9,12 +9,6 @@ package sys
 import (
 	"os"
 	"syscall"
-	"unsafe"
-)
-
-var (
-	kernel32                  = syscall.NewLazyDLL("kernel32.dll")
-	procGetVolumeInfoByHandle = kernel32.NewProc("GetVolumeInformationByHandleW")
 )
 
 func GetFileMetadata(stat os.FileInfo) map[string]interface{} {
@@ -28,52 +22,10 @@ func GetFileMetadata(stat os.FileInfo) map[string]interface{} {
 	return metadata
 }
 
-func GetHostSystem(fd uintptr) HostSystem {
-	switch getWindowsFileSystem(fd) {
-	case FileSystemNTFS:
-		return HostSystemNTFS
-	case FileSystemFAT:
-		return HostSystemFAT
-	default:
-		return HostSystemNTFS
-	}
+func GetHostSystem(_ uintptr) HostSystem {
+	return GetHostSystemByOS()
 }
 
 func GetHostSystemByOS() HostSystem {
-	return HostSystemNTFS
-}
-
-func getWindowsFileSystem(fd uintptr) FileSystemType {
-	var (
-		volumeName      [256]uint16
-		fileSystemName  [256]uint16
-		serialNumber    uint32
-		maxComponentLen uint32
-		fileSystemFlags uint32
-	)
-
-	ret, _, _ := procGetVolumeInfoByHandle.Call(
-		fd,
-		uintptr(unsafe.Pointer(&volumeName[0])),
-		uintptr(len(volumeName)),
-		uintptr(unsafe.Pointer(&serialNumber)),
-		uintptr(unsafe.Pointer(&maxComponentLen)),
-		uintptr(unsafe.Pointer(&fileSystemFlags)),
-		uintptr(unsafe.Pointer(&fileSystemName[0])),
-		uintptr(len(fileSystemName)),
-	)
-
-	if ret == 0 {
-		return FileSystemUnknown
-	}
-
-	fsName := syscall.UTF16ToString(fileSystemName[:])
-	switch fsName {
-	case "NTFS":
-		return FileSystemNTFS
-	case "FAT", "FAT32", "exFAT":
-		return FileSystemFAT
-	default:
-		return FileSystemUnknown
-	}
+	return HostSystemFAT
 }

@@ -48,13 +48,16 @@ type File struct {
 	isDir bool        // True if this entry represents a directory
 	mode  fs.FileMode // Unix-style file permissions and type bits
 
-	openFunc         func() (io.ReadCloser, error) // Factory function for reading original content
-	uncompressedSize int64                         // Size of original content before compression in bytes
-	compressedSize   int64                         // Size of compressed data within archive in bytes
-	crc32            uint32                        // CRC-32 checksum of uncompressed data
+	openFunc   func() (io.ReadCloser, error)     // Factory function for reading original content
+	sourceFunc func() (*io.SectionReader, error) // Factory function for reading uncompressed content
+
+	uncompressedSize int64  // Size of original content before compression in bytes
+	compressedSize   int64  // Size of compressed data within archive in bytes
+	crc32            uint32 // CRC-32 checksum of uncompressed data
 
 	// Per-file configuration overriding archive defaults
-	config FileConfig
+	config       FileConfig
+	sourceConfig FileConfig
 
 	localHeaderOffset int64          // Byte offset of this file's local header within archive
 	hostSystem        sys.HostSystem // Operating system that created the file (for attribute mapping)
@@ -149,6 +152,7 @@ func newFileFromReader(src io.Reader, name string, size int64) (*File, error) {
 
 	return &File{
 		name:             name,
+		mode:             0644,
 		uncompressedSize: size,
 		modTime:          time.Now(),
 		hostSystem:       sys.GetHostSystemByOS(),
@@ -184,6 +188,9 @@ func (f *File) Name() string { return f.name }
 // IsDir returns true if the file represents a directory entry.
 func (f *File) IsDir() bool { return f.isDir }
 
+// Mode returns underlying file attributes.
+func (f *File) Mode() fs.FileMode { return f.mode }
+
 // UncompressedSize returns the size of the original file content before compression.
 // Returns sizeUnknown (-1) for files created from io.Reader with unknown size.
 func (f *File) UncompressedSize() int64 { return f.uncompressedSize }
@@ -196,8 +203,35 @@ func (f *File) CompressedSize() int64 { return f.compressedSize }
 // This value is used for data integrity verification during extraction.
 func (f *File) CRC32() uint32 { return f.crc32 }
 
+// Config returns archive file entry configuration.
+func (f *File) Config() FileConfig { return f.config }
+
+// HostSystem returns the system file was created in.
+func (f *File) HostSystem() sys.HostSystem { return f.hostSystem }
+
 // ModTime returns the file's last modification timestamp.
 func (f *File) ModTime() time.Time { return f.modTime }
+
+// FsTime returns the file timestamps (Modification, Access, Creation) if available.
+// Returns zero time values if the metadata is missing.
+func (f *File) FsTime() (mtime, atime, ctime time.Time) {
+	if val, ok := f.metadata["LastWriteTime"]; ok {
+		if t, ok := val.(uint64); ok {
+			mtime = winFiletimeToTime(t)
+		}
+	}
+	if val, ok := f.metadata["LastAccessTime"]; ok {
+		if t, ok := val.(uint64); ok {
+			atime = winFiletimeToTime(t)
+		}
+	}
+	if val, ok := f.metadata["CreationTime"]; ok {
+		if t, ok := val.(uint64); ok {
+			ctime = winFiletimeToTime(t)
+		}
+	}
+	return
+}
 
 // Open returns a ReadCloser for reading the original, uncompressed file content.
 // The returned reader should be closed after use to release any held resources.
@@ -231,7 +265,10 @@ func (f *File) SetConfig(config FileConfig) {
 // SetOpenFunc replaces the internal function used to open the file's content.
 // This allows customizing how file data is read, which is useful for advanced
 // scenarios like streaming from network sources or applying transformations.
-func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) { f.openFunc = openFunc }
+func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) {
+	f.sourceFunc = nil
+	f.openFunc = openFunc
+}
 
 // SetExtraField adds or replaces an extra field entry for this file.
 // The data parameter must include the 4-byte header (tag + size) followed by
@@ -271,6 +308,29 @@ func (f *File) getFilename() string {
 		return f.name + "/"
 	}
 	return f.name
+}
+
+// shouldCopyRaw checks if we can optimize by copying raw compressed data directly.
+// Returns true ONLY if content hasn't changed AND configuration matches the source.
+func (f *File) shouldCopyRaw() bool {
+	if f.sourceFunc == nil {
+		return false
+	}
+
+	if f.config.CompressionMethod != f.sourceConfig.CompressionMethod {
+		return false
+	}
+	if f.config.EncryptionMethod != f.sourceConfig.EncryptionMethod {
+		return false
+	}
+
+	if f.config.EncryptionMethod != NotEncrypted {
+		if f.config.Password != f.sourceConfig.Password {
+			return false
+		}
+	}
+
+	return true
 }
 
 // zipHeaders is responsible for generating ZIP format headers from File metadata.

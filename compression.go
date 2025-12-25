@@ -40,28 +40,38 @@ func (sc *StoredCompressor) Compress(src io.Reader, dest io.Writer) (int64, erro
 
 // DeflateCompressor implements DEFLATE compression with memory pooling
 type DeflateCompressor struct {
-	pool sync.Pool
+	writers sync.Pool
+	buffers sync.Pool
 }
 
 // NewDeflateCompressor creates a reusable compressor for a specific level
 func NewDeflateCompressor(level int) *DeflateCompressor {
 	return &DeflateCompressor{
-		pool: sync.Pool{
+		writers: sync.Pool{
 			New: func() interface{} {
 				w, _ := flate.NewWriter(io.Discard, level)
 				return w
+			},
+		},
+		buffers: sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, 32*1024)
+				return &b
 			},
 		},
 	}
 }
 
 func (d *DeflateCompressor) Compress(src io.Reader, dest io.Writer) (int64, error) {
-	w := d.pool.Get().(*flate.Writer)
-	defer d.pool.Put(w)
+	w := d.writers.Get().(*flate.Writer)
+	defer d.writers.Put(w)
 
 	w.Reset(dest)
 
-	n, err := io.Copy(w, src)
+	bufPtr := d.buffers.Get().(*[]byte)
+	defer d.buffers.Put(bufPtr)
+
+	n, err := io.CopyBuffer(w, src, *bufPtr)
 	if err != nil {
 		return n, err
 	}

@@ -6,6 +6,7 @@ package gozip
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -16,7 +17,6 @@ import (
 	"sync"
 
 	"github.com/lemon4ksan/gozip/internal"
-	"github.com/lemon4ksan/gozip/internal/sys"
 )
 
 // zipWriter handles the low-level writing of ZIP archive structure.
@@ -158,6 +158,18 @@ func (zw *zipWriter) writeWithTempFile(file *File) error {
 // and writes to the provided writer while collecting size and CRC information.
 // It does not update local file header offset.
 func (zw *zipWriter) encodeAndUpdateFile(file *File, writer io.Writer) error {
+	if file.shouldCopyRaw() {
+		src, err := file.sourceFunc()
+		if err != nil {
+			return err
+		}
+
+		if _, err := io.Copy(writer, src); err != nil {
+			return fmt.Errorf("copy raw: %w", err)
+		}
+		return nil
+	}
+
 	src, err := file.Open()
 	if err != nil {
 		return err
@@ -480,10 +492,11 @@ func cleanupTempFile(tmpFile *os.File) {
 
 // parallelZipWriter handles parallel compression and writing of files to a ZIP archive.
 type parallelZipWriter struct {
-	zw              *zipWriter    // Underlying sequential writer
-	sem             chan struct{} // Semaphore for limiting concurrent workers
-	memoryThreshold int64         // Size threshold for memory vs disk buffering
-	bufferPool      sync.Pool     // Reusable memory buffers for small files
+	zw              *zipWriter         // Underlying sequential writer
+	sem             chan struct{}      // Semaphore for limiting concurrent workers
+	memoryThreshold int64              // Size threshold for memory vs disk buffering
+	bufferPool      sync.Pool          // Reusable memory buffers for small files
+	onFileProcessed func(*File, error) // Callback after writing
 }
 
 // newParallelZipWriter creates a new parallelZipWriter instance.
@@ -498,6 +511,7 @@ func newParallelZipWriter(config ZipConfig, compressors compressorsMap, dest io.
 				return NewMemoryBuffer(64 * 1024) // 64KB default
 			},
 		},
+		onFileProcessed: config.OnFileProcessed,
 	}
 }
 
@@ -505,7 +519,7 @@ func newParallelZipWriter(config ZipConfig, compressors compressorsMap, dest io.
 // This method performs compression concurrently using a worker pool and writes
 // files sequentially to maintain proper ZIP format structure.
 // Returns a slice of errors encountered during processing.
-func (pzw *parallelZipWriter) WriteFiles(files []*File) []error {
+func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []error {
 	var wg sync.WaitGroup
 	results := make(chan struct {
 		file *File
@@ -513,15 +527,24 @@ func (pzw *parallelZipWriter) WriteFiles(files []*File) []error {
 		err  error
 	}, len(files))
 
+Loop:
 	for _, f := range files {
-		wg.Add(1)
-		pzw.sem <- struct{}{}
+		if err := ctx.Err(); err != nil {
+			break Loop
+		}
 
+		select {
+		case <-ctx.Done():
+			break Loop
+		case pzw.sem <- struct{}{}:
+		}
+
+		wg.Add(1)
 		go func(f *File) {
 			defer wg.Done()
 			defer func() { <-pzw.sem }()
 
-			src, err := pzw.compressFile(f)
+			src, err := pzw.compressFile(ctx, f)
 			results <- struct {
 				file *File
 				src  io.Reader
@@ -538,14 +561,28 @@ func (pzw *parallelZipWriter) WriteFiles(files []*File) []error {
 	var errs []error
 	for result := range results {
 		if result.err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", result.file.name, result.err))
+			if !errors.Is(result.err, context.Canceled) && !errors.Is(result.err, context.DeadlineExceeded) {
+				errs = append(errs, fmt.Errorf("%s: %w", result.file.name, result.err))
+			}
 			continue
 		}
-		if err := pzw.writeCompressedFile(result.file, result.src); err != nil {
+
+		if ctx.Err() != nil {
+			pzw.cleanupBuf(result.src)
+			continue
+		}
+
+		err := pzw.writeCompressedFile(result.file, result.src)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", result.file.name, err))
-		} else if err := pzw.zw.addCentralDirEntry(result.file); err != nil {
+		} else if err = pzw.zw.addCentralDirEntry(result.file); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", result.file.name, err))
 		}
+
+		if pzw.onFileProcessed != nil {
+			pzw.onFileProcessed(result.file, err)
+		}
+
 		pzw.cleanupBuf(result.src)
 	}
 	return errs
@@ -553,9 +590,13 @@ func (pzw *parallelZipWriter) WriteFiles(files []*File) []error {
 
 // compressFile compresses a single file according to its configuration.
 // Returns a reader containing the compressed data, using memory or temp file based on size.
-func (pzw *parallelZipWriter) compressFile(file *File) (io.Reader, error) {
+func (pzw *parallelZipWriter) compressFile(ctx context.Context, file *File) (io.Reader, error) {
 	if file.isDir || file.uncompressedSize == 0 {
 		return nil, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	var fileBuffer io.ReadWriteSeeker
@@ -577,9 +618,34 @@ func (pzw *parallelZipWriter) compressFile(file *File) (io.Reader, error) {
 		fileBuffer = tmpFile
 	}
 
-	if err := pzw.zw.encodeAndUpdateFile(file, fileBuffer); err != nil {
-		pzw.cleanupBuf(fileBuffer)
-		return nil, fmt.Errorf("encode and update file %w", err)
+	if file.shouldCopyRaw() {
+		src, err := file.sourceFunc()
+		if err != nil {
+			pzw.cleanupBuf(fileBuffer)
+			return nil, err
+		}
+
+		if _, err := io.Copy(fileBuffer, src); err != nil {
+			pzw.cleanupBuf(fileBuffer)
+			return nil, fmt.Errorf("copy raw: %w", err)
+		}
+	} else {
+		src, err := file.Open()
+		if err != nil {
+			pzw.cleanupBuf(fileBuffer)
+			return nil, err
+		}
+		defer src.Close()
+
+		stats, err := pzw.zw.encodeToWriter(&contextReader{ctx: ctx, r: src}, fileBuffer, file.config)
+		if err != nil {
+			pzw.cleanupBuf(fileBuffer)
+			return nil, fmt.Errorf("encode: %w", err)
+		}
+
+		file.uncompressedSize = stats.uncompressedSize
+		file.compressedSize = stats.compressedSize
+		file.crc32 = stats.crc32
 	}
 
 	if _, err := fileBuffer.Seek(0, io.SeekStart); err != nil {
@@ -753,7 +819,7 @@ func addFilesystemExtraField(f *File) {
 		return
 	}
 
-	if f.hostSystem == sys.HostSystemNTFS && hasPreciseTimestamps(f.metadata) {
+	if hasPreciseTimestamps(f.metadata) {
 		f.SetExtraField(NTFSFieldTag, encodeNTFSExtraField(f.metadata))
 	}
 }
