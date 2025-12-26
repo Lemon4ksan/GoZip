@@ -29,7 +29,7 @@ type zipWriter struct {
 	entriesNum       int            // Number of files written to the archive
 	sizeOfCentralDir int64          // Cumulative size of central directory entries
 	headerOffset     int64          // Current write position for local file headers
-	centralDir       *bytes.Buffer  // Buffer for accumulating central directory before final write
+	centralDir       *spillBuffer   // Buffer for accumulating central directory before final write
 }
 
 // newZipWriter creates and initializes a new zipWriter instance.
@@ -39,7 +39,7 @@ func newZipWriter(config ZipConfig, factories factoriesMap, dest io.Writer) *zip
 		config:      config,
 		factories:   factories,
 		compressors: make(map[compressorKey]Compressor),
-		centralDir:  new(bytes.Buffer),
+		centralDir:  newSpillBuffer(),
 	}
 }
 
@@ -76,7 +76,9 @@ func (zw *zipWriter) WriteFile(file *File) error {
 
 // WriteCentralDirAndEndRecords writes the central directory and end records.
 func (zw *zipWriter) WriteCentralDirAndEndRecords() error {
-	if _, err := zw.dest.Write(zw.centralDir.Bytes()); err != nil {
+	defer zw.centralDir.Close()
+
+	if _, err := zw.centralDir.WriteTo(zw.dest); err != nil {
 		return fmt.Errorf("write central directory: %w", err)
 	}
 
@@ -557,53 +559,71 @@ type zipResult struct {
 	err  error
 }
 
-// WriteFiles processes multiple files concurrently.
-// It ensures that files are written to the archive in the exact order of the input slice,
-// even if parallel compression finishes out of order.
+// WriteFiles processes multiple files in parallel and writes them to the ZIP archive.
+// It uses a back pressure mechanism to ensure memory usage remains bounded,
+// even if files are processed out of order or vary significantly in size.
 func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []error {
-	// Channels to preserve order. Each file gets a dedicated channel.
 	results := make([]chan zipResult, len(files))
 	for i := range results {
 		results[i] = make(chan zipResult, 1)
 	}
 
+	maxInFlight := cap(pzw.sem) * 2
+	inflightSem := make(chan struct{}, maxInFlight)
+
 	var wg sync.WaitGroup
 	var errs []error
 
-	// 1. Launch compression workers
-	for i, f := range files {
-		// If context is already cancelled, stop spawning
-		if err := ctx.Err(); err != nil {
-			errs = append(errs, err)
-			break
-		}
-
-		wg.Add(1)
-		go func(idx int, f *File) {
-			defer wg.Done()
-
-			// Acquire semaphore
+	go func() {
+		// Feeds work into the system up to the inflight limit
+		for i, f := range files {
+			// Acquire In-Flight Slot ALWAYS.
+			// This ensures the writer can always release it.
 			select {
 			case <-ctx.Done():
-				results[idx] <- zipResult{file: f, err: ctx.Err()}
-				return
-			case pzw.sem <- struct{}{}:
+				// If cancelled, we still acquire to keep the accounting symmetrical
+				// or we break the loop? If we break, the writer hangs waiting on results[i].
+				// We MUST populate all results channels.
+			case inflightSem <- struct{}{}:
 			}
-			defer func() { <-pzw.sem }()
+			
+			// If context is dead, fast-path the result
+			if ctx.Err() != nil {
+				results[i] <- zipResult{file: f, err: ctx.Err()}
+				close(results[i])
+				continue
+			}
+			
+			wg.Add(1)
+			go func(idx int, f *File) {
+				defer wg.Done()
 
-			src, err := pzw.compressFile(ctx, f)
-			results[idx] <- zipResult{file: f, src: src, err: err}
-			close(results[idx])
-		}(i, f)
-	}
+				// Acquire CPU Semaphore (Blocks if all CPUs are busy)
+				select {
+				case <-ctx.Done():
+					// Even if cancelled, we must send a result to unblock the reader
+					results[idx] <- zipResult{file: f, err: ctx.Err()}
+					close(results[idx])
+					return
+				case pzw.sem <- struct{}{}:
+				}
+				defer func() { <-pzw.sem }()
 
-	// 2. Consume results sequentially to maintain physical order in archive
-	// We run this in the main thread
+				// Compress
+				src, err := pzw.compressFile(ctx, f)
+				results[idx] <- zipResult{file: f, src: src, err: err}
+				close(results[idx])
+			}(i, f)
+		}
+	}()
+	// We cheat slightly: we don't wg.Wait() the spawner because the writer loop 
+	// knows exactly how many files to expect (len(files)).
+
 	for _, resultChan := range results {
 		// Wait for the specific file's result
 		res, ok := <-resultChan
 		if !ok {
-			// Channel closed without result (shouldn't happen with logic above unless panic)
+			// Should not happen unless logic bug or extreme panic
 			continue
 		}
 
@@ -611,28 +631,26 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 			if !errors.Is(res.err, context.Canceled) && !errors.Is(res.err, context.DeadlineExceeded) {
 				errs = append(errs, fmt.Errorf("%s: %w", res.file.name, res.err))
 			}
-			continue
-		}
+		} else {
+			// Write to the actual ZIP stream
+			// Check context again before expensive I/O
+			if ctx.Err() != nil {
+				pzw.cleanupBuf(res.src)
+			} else {
+				err := pzw.writeCompressedFile(res.file, res.src)
+				if err != nil {
+					errs = append(errs, fmt.Errorf("%s: %w", res.file.name, err))
+				} else if err = pzw.zw.addCentralDirEntry(res.file); err != nil {
+					errs = append(errs, fmt.Errorf("%s: %w", res.file.name, err))
+				}
 
-		// Check context again before writing to disk
-		if ctx.Err() != nil {
-			pzw.cleanupBuf(res.src)
-			continue
+				if pzw.onFileProcessed != nil {
+					pzw.onFileProcessed(res.file, err)
+				}
+				pzw.cleanupBuf(res.src)
+			}
 		}
-
-		// Write to the actual ZIP stream
-		err := pzw.writeCompressedFile(res.file, res.src)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", res.file.name, err))
-		} else if err = pzw.zw.addCentralDirEntry(res.file); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", res.file.name, err))
-		}
-
-		if pzw.onFileProcessed != nil {
-			pzw.onFileProcessed(res.file, err)
-		}
-
-		pzw.cleanupBuf(res.src)
+		<-inflightSem
 	}
 
 	wg.Wait()
@@ -840,6 +858,101 @@ func addFilesystemExtraField(f *File) {
 	if hasPreciseTimestamps(f.metadata) {
 		f.SetExtraField(NTFSFieldTag, encodeNTFSExtraField(f.metadata))
 	}
+}
+
+// defaultSpillThreshold defines the limit (10MB) before the Central Directory
+// is moved from RAM to a temporary file.
+const defaultSpillThreshold = 10 * 1024 * 1024
+
+// spillBuffer is a write buffer that stores data in memory up to a threshold,
+// then spills to a temporary file. This prevents OOM when creating archives
+// with millions of files.
+type spillBuffer struct {
+	mem       *bytes.Buffer
+	disk      *os.File
+	threshold int64
+	written   int64
+}
+
+func newSpillBuffer() *spillBuffer {
+	return &spillBuffer{
+		mem:       bytes.NewBuffer(make([]byte, 0, 64*1024)), // Start with 64KB capacity
+		threshold: defaultSpillThreshold,
+	}
+}
+
+// Write implements io.Writer.
+func (sb *spillBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	sb.written += int64(n)
+
+	// Case 1: Already on disk
+	if sb.disk != nil {
+		return sb.disk.Write(p)
+	}
+
+	// Case 2: Still in memory, fitting within threshold
+	if int64(sb.mem.Len()+n) <= sb.threshold {
+		return sb.mem.Write(p)
+	}
+
+	// Case 3: Overflow - spill to disk
+	if err := sb.spillToDisk(); err != nil {
+		return 0, err
+	}
+
+	// Write the new data to the file
+	return sb.disk.Write(p)
+}
+
+// spillToDisk moves current memory content to a temp file
+func (sb *spillBuffer) spillToDisk() error {
+	f, err := os.CreateTemp("", "gozip-cd-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+
+	if _, err := io.Copy(f, sb.mem); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return fmt.Errorf("spill to disk: %w", err)
+	}
+
+	sb.disk = f
+	sb.mem = nil // Release memory to GC
+	return nil
+}
+
+// WriteTo implements io.WriterTo. It copies the buffer content to the destination
+// and cleans up any temporary resources.
+func (sb *spillBuffer) WriteTo(w io.Writer) (int64, error) {
+	// If in memory, just write out
+	if sb.disk == nil {
+		return sb.mem.WriteTo(w)
+	}
+
+	// If on disk, seek to start and copy
+	if _, err := sb.disk.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("seek temp CD: %w", err)
+	}
+
+	n, err := io.Copy(w, sb.disk)
+
+	// Close and remove the temp file immediately after flushing
+	sb.Close()
+
+	return n, err
+}
+
+// Close cleans up temporary files.
+func (sb *spillBuffer) Close() error {
+	if sb.disk != nil {
+		sb.disk.Close()
+		os.Remove(sb.disk.Name())
+		sb.disk = nil
+	}
+	sb.mem = nil
+	return nil
 }
 
 func encodeZip64ExtraField(f *File) []byte {
