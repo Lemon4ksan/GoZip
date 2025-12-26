@@ -48,16 +48,19 @@ func newZipWriter(config ZipConfig, factories factoriesMap, dest io.Writer) *zip
 func (zw *zipWriter) WriteFile(file *File) error {
 	var err error
 	_, isSeeker := zw.dest.(io.WriteSeeker)
+	file.flags = 0
 
-	// Determine if we need to buffer the file to a temporary location/memory before writing.
-	// Buffering is required if:
-	// 1. The destination is not seekable (can't patch headers later).
-	// 2. Encryption is enabled (need CRC/Size headers before data for some formats).
-	// 3. Size is unknown or potentially huge (safer to calculate exact ZIP64 requirements upfront).
-	shouldBuffer := !isSeeker ||
+	// Optimization: If not seeking, use Data Descriptor (Stream Mode)
+	// This avoids temp files for standard Deflate/Store operations.
+	// Note: Encryption logic often requires known sizes or temp files for MAC calculation,
+	// so we stick to buffering for encrypted files for now.
+	canStream := !isSeeker &&
+		file.config.EncryptionMethod == NotEncrypted &&
+		file.config.CompressionMethod != Deflate64 // Deflate64 behaves oddly with DD sometimes
+
+	shouldBuffer := !isSeeker && !canStream ||
 		file.config.EncryptionMethod != NotEncrypted ||
-		file.uncompressedSize > math.MaxUint32 ||
-		file.uncompressedSize == SizeUnknown
+		file.uncompressedSize == SizeUnknown && !canStream
 
 	if shouldBuffer {
 		err = zw.writeWithTempFile(file)
@@ -100,26 +103,34 @@ func (zw *zipWriter) WriteCentralDirAndEndRecords() error {
 // writeStream writes file directly to destination.
 // Efficient for small files on seekable storage.
 func (zw *zipWriter) writeStream(file *File) error {
+	_, isSeeker := zw.dest.(io.WriteSeeker)
+	usesDataDescriptor := !isSeeker
+
+	if usesDataDescriptor {
+		file.flags |= 0x08 // Set Bit 3
+	}
+
 	if err := zw.writeFileHeader(file); err != nil {
 		return err
 	}
 
-	if file.isDir {
-		return nil
+	if !file.isDir {
+		if err := zw.encodeAndUpdateFile(file, zw.dest); err != nil {
+			return err
+		}
+		zw.headerOffset += file.compressedSize
 	}
 
-	if err := zw.encodeAndUpdateFile(file, zw.dest); err != nil {
-		return err
-	}
-	zw.headerOffset += file.compressedSize
-
-	// If the file turned out to be huge, we can't retrospectively change the
-	// 32-bit local header to a 64-bit one without rewriting the whole stream.
-	if file.compressedSize > math.MaxUint32 || file.uncompressedSize > math.MaxUint32 {
-		return errors.New("file too large for stream mode (zip64 required but header already written 32-bit)")
+	// 1. If Seeker: Go back and patch the header
+	if isSeeker {
+		if file.compressedSize > math.MaxUint32 || file.uncompressedSize > math.MaxUint32 {
+			return errors.New("file too large for stream mode (zip64 required but data already written)")
+		}
+		return zw.updateLocalHeader(file)
 	}
 
-	return zw.updateLocalHeader(file)
+	// 2. If Not Seeker: Write Data Descriptor at the tail
+	return zw.writeDataDescriptor(file)
 }
 
 // writeWithTempFile compresses/encrypts to a temporary file, then copies to destination.
@@ -154,6 +165,35 @@ func (zw *zipWriter) writeWithTempFile(file *File) error {
 		zw.headerOffset += file.compressedSize
 	}
 
+	return nil
+}
+
+func (zw *zipWriter) writeDataDescriptor(file *File) error {
+	var buf []byte
+
+	if file.RequiresZip64() {
+		// ZIP64 Data Descriptor: Sig(4) + CRC(4) + Comp(8) + Uncomp(8)
+		buf = make([]byte, 24)
+		binary.LittleEndian.PutUint32(buf[0:4], 0x08074b50)
+		binary.LittleEndian.PutUint32(buf[4:8], file.crc32)
+		binary.LittleEndian.PutUint64(buf[8:16], uint64(file.compressedSize))
+		binary.LittleEndian.PutUint64(buf[16:24], uint64(file.uncompressedSize))
+	} else {
+		// Standard Data Descriptor: Sig(4) + CRC(4) + Comp(4) + Uncomp(4)
+		buf = make([]byte, 16)
+		binary.LittleEndian.PutUint32(buf[0:4], 0x08074b50)
+		binary.LittleEndian.PutUint32(buf[4:8], file.crc32)
+		binary.LittleEndian.PutUint32(buf[8:12], uint32(file.compressedSize))
+		binary.LittleEndian.PutUint32(buf[12:16], uint32(file.uncompressedSize))
+	}
+
+	if _, err := zw.dest.Write(buf); err != nil {
+		return fmt.Errorf("write data descriptor: %w", err)
+	}
+	
+	// Track offset for Central Directory (though usually CD offset calculation handles this)
+	zw.headerOffset += int64(len(buf))
+	
 	return nil
 }
 

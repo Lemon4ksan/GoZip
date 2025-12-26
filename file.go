@@ -48,6 +48,7 @@ type File struct {
 	name  string      // File path within the archive (using forward slashes)
 	isDir bool        // True if this entry represents a directory
 	mode  fs.FileMode // Unix-style file permissions and type bits
+	flags uint16      // Internal flags state
 
 	openFunc   func() (io.ReadCloser, error)     // Factory function for reading original content
 	sourceFunc func() (*io.SectionReader, error) // Factory function for reading uncompressed content
@@ -408,7 +409,7 @@ func (zh *zipHeaders) getVersionMadeBy() uint16 {
 }
 
 func (zh *zipHeaders) getFileBitFlag() uint16 {
-	var flag uint16
+	flag := zh.file.flags
 
 	if zh.file.config.EncryptionMethod != NotEncrypted {
 		flag |= 0x1
