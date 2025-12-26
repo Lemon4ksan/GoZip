@@ -1,3 +1,7 @@
+// Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gozip_test
 
 import (
@@ -113,7 +117,7 @@ func runGoZipSeqBenchmark(b *testing.B, files []testFile) {
 	for i := 0; i < b.N; i++ {
 		archive := gozip.NewZip()
 		archive.SetConfig(gozip.ZipConfig{
-			CompressionMethod: gozip.Deflated,
+			CompressionMethod: gozip.Deflate,
 			CompressionLevel:  flate.DefaultCompression,
 		})
 
@@ -124,7 +128,7 @@ func runGoZipSeqBenchmark(b *testing.B, files []testFile) {
 			}
 		}
 
-		if err := archive.Write(io.Discard); err != nil {
+		if _, err := archive.WriteTo(io.Discard); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -137,7 +141,7 @@ func runGoZipParBenchmark(b *testing.B, files []testFile) {
 	for i := 0; i < b.N; i++ {
 		archive := gozip.NewZip()
 		archive.SetConfig(gozip.ZipConfig{
-			CompressionMethod: gozip.Deflated,
+			CompressionMethod: gozip.Deflate,
 			CompressionLevel:  flate.DefaultCompression,
 		})
 
@@ -145,7 +149,7 @@ func runGoZipParBenchmark(b *testing.B, files []testFile) {
 			archive.AddBytes(f.body, f.name)
 		}
 
-		if err := archive.WriteParallel(io.Discard, workers); err != nil {
+		if _, err := archive.WriteToParallel(io.Discard, workers); err != nil {
 			b.Fatal(err)
 		}
 	}

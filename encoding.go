@@ -4,16 +4,20 @@
 
 package gozip
 
-import "unicode/utf8"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 // TextDecoder is a function that converts raw binary string (interpreted as specific encoding) into UTF-8.
 type TextDecoder func(string) string
 
-// decodeText logic:
-// 1. If Bit 11 (0x800) is set, return as is (UTF-8).
-// 2. If valid UTF-8, return as is (heuristic).
-// 3. Use provided fallback decoder (e.g. CP866).
-// 4. If no decoder provided, fallback to CP437 (ZIP standard default).
+// decodeText handles the character set decoding logic for ZIP metadata.
+// Order of operations:
+// 1. Bit 11 Check: If the ZIP flag says it's UTF-8, trust it.
+// 2. Heuristic: If it looks like valid UTF-8, assume it is (prevents mojibake for modern archives w/o flags).
+// 3. Custom Decoder: Use user-provided fallback (e.g., CP866).
+// 4. Default: Fallback to CP437 (Standard DOS encoding).
 func decodeText(data string, flags uint16, fallback TextDecoder) string {
 	if flags&0x800 != 0 {
 		return data
@@ -27,25 +31,30 @@ func decodeText(data string, flags uint16, fallback TextDecoder) string {
 		return fallback(data)
 	}
 
-	return cp437ToUtf8(data)
+	return DecodeCP437(data)
 }
 
-// DecodeIBM866 converts CP866 (Russian DOS) string to UTF-8
+// DecodeIBM866 converts CP866 (Cyrillic DOS) string to UTF-8.
 func DecodeIBM866(s string) string {
-	res := make([]rune, 0, len(s))
-	for _, b := range []byte(s) {
-		res = append(res, ibm866[b])
+	var sb strings.Builder
+	sb.Grow(len(s)) // Optimistic allocation
+
+	for i := 0; i < len(s); i++ {
+		sb.WriteRune(ibm866[s[i]])
 	}
-	return string(res)
+	return sb.String()
 }
 
-// cp437ToUtf8 converts CP437 (US DOS) string to UTF-8
-func cp437ToUtf8(s string) string {
-	res := make([]rune, 0, len(s))
-	for _, b := range []byte(s) {
-		res = append(res, cp437[b])
+// DecodeCP437 converts CP437 (US DOS) string to UTF-8.
+// This is the default fallback for ZIP archives.
+func DecodeCP437(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+
+	for i := 0; i < len(s); i++ {
+		sb.WriteRune(cp437[s[i]])
 	}
-	return string(res)
+	return sb.String()
 }
 
 // CP866 table (Cyrillic DOS)

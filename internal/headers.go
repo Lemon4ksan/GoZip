@@ -41,8 +41,9 @@ type LocalFileHeader struct {
 
 func (h LocalFileHeader) Encode() []byte {
 	// Fixed size (30 bytes) + variable filename length
-	// Signature(4) + Header(26) = 30 bytes
-	buf := make([]byte, 30+h.FilenameLength+h.ExtraFieldLength)
+	size := 30 + h.FilenameLength + h.ExtraFieldLength
+	buf := make([]byte, size)
+	
 	binary.LittleEndian.PutUint32(buf[0:4], LocalFileHeaderSignature)
 	binary.LittleEndian.PutUint16(buf[4:6], h.VersionNeededToExtract)
 	binary.LittleEndian.PutUint16(buf[6:8], h.GeneralPurposeBitFlag)
@@ -84,8 +85,8 @@ type CentralDirectory struct {
 }
 
 func ReadCentralDirEntry(src io.Reader) (CentralDirectory, error) {
-	buf := make([]byte, 42)
-	if _, err := io.ReadFull(src, buf); err != nil {
+	var buf [42]byte
+	if _, err := io.ReadFull(src, buf[:]); err != nil {
 		return CentralDirectory{}, fmt.Errorf("read source: %w", err)
 	}
 
@@ -107,34 +108,36 @@ func ReadCentralDirEntry(src io.Reader) (CentralDirectory, error) {
 		ExternalFileAttributes: binary.LittleEndian.Uint32(buf[34:38]),
 		LocalHeaderOffset:      binary.LittleEndian.Uint32(buf[38:42]),
 	}
+
 	if entry.FilenameLength > 0 {
 		filename := make([]byte, entry.FilenameLength)
 		if _, err := io.ReadFull(src, filename); err != nil {
-			return CentralDirectory{}, fmt.Errorf("read source: %w", err)
+			return CentralDirectory{}, fmt.Errorf("read filename: %w", err)
 		}
 		entry.Filename = string(filename)
 	}
+
 	if entry.ExtraFieldLength > 0 {
 		extraField := make([]byte, entry.ExtraFieldLength)
 		if _, err := io.ReadFull(src, extraField); err != nil {
-			return CentralDirectory{}, fmt.Errorf("read source: %w", err)
+			return CentralDirectory{}, fmt.Errorf("read extra field: %w", err)
 		}
 		entry.ExtraField = parseExtraField(extraField)
 	}
+
 	if entry.FileCommentLength > 0 {
 		comment := make([]byte, entry.FileCommentLength)
 		if _, err := io.ReadFull(src, comment); err != nil {
-			return CentralDirectory{}, fmt.Errorf("read source: %w", err)
+			return CentralDirectory{}, fmt.Errorf("read comment: %w", err)
 		}
 		entry.Comment = string(comment)
 	}
+
 	return entry, nil
 }
 
 func (d CentralDirectory) Encode() []byte {
-	// Fixed header (46 bytes) + Filename + Extra Fields + Comment
-	// Signature(4) + Header(42) = 46 bytes
-	totalSize := 46 + d.FilenameLength + d.ExtraFieldLength + d.FileCommentLength
+	totalSize := 46 + int(d.FilenameLength) + int(d.ExtraFieldLength) + int(d.FileCommentLength)
 	buf := make([]byte, totalSize)
 
 	binary.LittleEndian.PutUint32(buf[0:4], CentralDirectorySignature)
@@ -157,15 +160,14 @@ func (d CentralDirectory) Encode() []byte {
 
 	offset := 46
 
-	// Write Filename
 	offset += copy(buf[offset:], d.Filename)
 
-	// Write Extra Fields
-	for _, entry := range getSortedExtraField(d.ExtraField) {
+	// Determine deterministic order for extra fields
+	sortedFields := getSortedExtraField(d.ExtraField)
+	for _, entry := range sortedFields {
 		offset += copy(buf[offset:], entry)
 	}
 
-	// Write Comment
 	copy(buf[offset:], d.Comment)
 
 	return buf
@@ -183,16 +185,14 @@ type EndOfCentralDirectory struct {
 }
 
 func EncodeEndOfCentralDirRecord(entriesNum int, centralDirSize uint64, centralDirOffset uint64, comment string) []byte {
-	// Fixed header (22 bytes) + Comment length
-	// Signature(4) + Header(18) = 22 bytes
-	buf := make([]byte, 22+len(comment))
-
 	commentLen := min(len(comment), math.MaxUint16)
+	buf := make([]byte, 22+commentLen)
+
 	binary.LittleEndian.PutUint32(buf[0:4], EndOfCentralDirSignature)
-	binary.LittleEndian.PutUint16(buf[4:6], 0)                                         // ThisDiskNum
-	binary.LittleEndian.PutUint16(buf[6:8], 0)                                         // DiskNumWithTheStartOfCentralDir
-	binary.LittleEndian.PutUint16(buf[8:10], uint16(min(math.MaxUint16, entriesNum)))  // TotalNumberOfEntriesOnThisDisk
-	binary.LittleEndian.PutUint16(buf[10:12], uint16(min(math.MaxUint16, entriesNum))) // TotalNumberOfEntries
+	binary.LittleEndian.PutUint16(buf[4:6], 0)
+	binary.LittleEndian.PutUint16(buf[6:8], 0)
+	binary.LittleEndian.PutUint16(buf[8:10], uint16(min(math.MaxUint16, entriesNum)))
+	binary.LittleEndian.PutUint16(buf[10:12], uint16(min(math.MaxUint16, entriesNum)))
 	binary.LittleEndian.PutUint32(buf[12:16], uint32(min(math.MaxUint32, centralDirSize)))
 	binary.LittleEndian.PutUint32(buf[16:20], uint32(min(math.MaxUint32, centralDirOffset)))
 	binary.LittleEndian.PutUint16(buf[20:22], uint16(commentLen))
@@ -203,8 +203,8 @@ func EncodeEndOfCentralDirRecord(entriesNum int, centralDirSize uint64, centralD
 }
 
 func ReadEndOfCentralDir(src io.Reader) (EndOfCentralDirectory, error) {
-	buf := make([]byte, 18)
-	if _, err := io.ReadFull(src, buf); err != nil {
+	var buf [18]byte
+	if _, err := io.ReadFull(src, buf[:]); err != nil {
 		return EndOfCentralDirectory{}, fmt.Errorf("read source: %w", err)
 	}
 	end := EndOfCentralDirectory{
@@ -217,9 +217,11 @@ func ReadEndOfCentralDir(src io.Reader) (EndOfCentralDirectory, error) {
 		CommentLength:                   binary.LittleEndian.Uint16(buf[16:18]),
 	}
 	if end.CommentLength > 0 {
-		buf := make([]byte, end.CommentLength)
-		io.ReadFull(src, buf)
-		end.Comment = string(buf)
+		commentBuf := make([]byte, end.CommentLength)
+		if _, err := io.ReadFull(src, commentBuf); err != nil {
+			return EndOfCentralDirectory{}, fmt.Errorf("read comment: %w", err)
+		}
+		end.Comment = string(commentBuf)
 	}
 
 	return end, nil
@@ -238,8 +240,8 @@ type Zip64EndOfCentralDirectory struct {
 }
 
 func ReadZip64EndOfCentralDir(src io.Reader) (Zip64EndOfCentralDirectory, error) {
-	buf := make([]byte, 52)
-	if _, err := io.ReadFull(src, buf); err != nil {
+	var buf [52]byte
+	if _, err := io.ReadFull(src, buf[:]); err != nil {
 		return Zip64EndOfCentralDirectory{}, fmt.Errorf("read source: %w", err)
 	}
 	return Zip64EndOfCentralDirectory{
@@ -256,17 +258,16 @@ func ReadZip64EndOfCentralDir(src io.Reader) (Zip64EndOfCentralDirectory, error)
 }
 
 func EncodeZip64EndOfCentralDirRecord(entriesNum uint64, centralDirSize uint64, centralDirOffset uint64) []byte {
-	// Fixed size: Signature(4) + Header(52) = 56 bytes
 	buf := make([]byte, 56)
 
 	binary.LittleEndian.PutUint32(buf[0:4], Zip64EndOfCentralDirSignature)
-	binary.LittleEndian.PutUint64(buf[4:12], 44)          // Size of the rest of the record
-	binary.LittleEndian.PutUint16(buf[12:14], 45)         // VersionMadeBy
-	binary.LittleEndian.PutUint16(buf[14:16], 45)         // VersionNeededToExtract
-	binary.LittleEndian.PutUint32(buf[16:20], 0)          // ThisDiskNum
-	binary.LittleEndian.PutUint32(buf[20:24], 0)          // DiskNumWithTheStartOfCentralDir
-	binary.LittleEndian.PutUint64(buf[24:32], entriesNum) // TotalEntriesDisk
-	binary.LittleEndian.PutUint64(buf[32:40], entriesNum) // TotalEntries
+	binary.LittleEndian.PutUint64(buf[4:12], 44)
+	binary.LittleEndian.PutUint16(buf[12:14], 45)
+	binary.LittleEndian.PutUint16(buf[14:16], 45)
+	binary.LittleEndian.PutUint32(buf[16:20], 0)
+	binary.LittleEndian.PutUint32(buf[20:24], 0)
+	binary.LittleEndian.PutUint64(buf[24:32], entriesNum)
+	binary.LittleEndian.PutUint64(buf[32:40], entriesNum)
 	binary.LittleEndian.PutUint64(buf[40:48], centralDirSize)
 	binary.LittleEndian.PutUint64(buf[48:56], centralDirOffset)
 
@@ -280,8 +281,8 @@ type Zip64EndOfCentralDirectoryLocator struct {
 }
 
 func ReadZip64EndOfCentralDirLocator(src io.Reader) (Zip64EndOfCentralDirectoryLocator, error) {
-	buf := make([]byte, 16)
-	if _, err := io.ReadFull(src, buf); err != nil {
+	var buf [16]byte
+	if _, err := io.ReadFull(src, buf[:]); err != nil {
 		return Zip64EndOfCentralDirectoryLocator{}, fmt.Errorf("read source: %w", err)
 	}
 	return Zip64EndOfCentralDirectoryLocator{
@@ -292,19 +293,21 @@ func ReadZip64EndOfCentralDirLocator(src io.Reader) (Zip64EndOfCentralDirectoryL
 }
 
 func EncodeZip64EndOfCentralDirLocator(endOfCentralDirOffset uint64) []byte {
-	// Fixed size: Signature(4) + Header(16) = 20 bytes
 	buf := make([]byte, 20)
 
 	binary.LittleEndian.PutUint32(buf[0:4], Zip64EndOfCentralDirLocatorSignature)
-	binary.LittleEndian.PutUint32(buf[4:8], 0) // EndOfCentralDirStartDiskNum
+	binary.LittleEndian.PutUint32(buf[4:8], 0)
 	binary.LittleEndian.PutUint64(buf[8:16], endOfCentralDirOffset)
-	binary.LittleEndian.PutUint32(buf[16:20], 1) // TotalNumberOfDisks
+	binary.LittleEndian.PutUint32(buf[16:20], 1)
 
 	return buf
 }
 
 // getSortedExtraField returns a sorted slice of extra fields for deterministic writes.
 func getSortedExtraField(extraField map[uint16][]byte) [][]byte {
+	if len(extraField) == 0 {
+		return nil
+	}
 	keys := make([]uint16, 0, len(extraField))
 	for key := range extraField {
 		keys = append(keys, key)
@@ -319,12 +322,10 @@ func getSortedExtraField(extraField map[uint16][]byte) [][]byte {
 }
 
 // parseExtraField converts raw extra field bytes into a map keyed by tag IDs.
-// Extra fields contain additional metadata like ZIP64 extensions, NTFS timestamps, etc.
 func parseExtraField(extraField []byte) map[uint16][]byte {
 	m := make(map[uint16][]byte)
 
 	for offset := 0; offset < len(extraField); {
-		// Need at least 4 bytes for tag and size
 		if offset+4 > len(extraField) {
 			break
 		}
@@ -333,12 +334,10 @@ func parseExtraField(extraField []byte) map[uint16][]byte {
 		size := int(binary.LittleEndian.Uint16(extraField[offset+2 : offset+4]))
 
 		offset += 4
-
 		if offset+size > len(extraField) {
 			break
 		}
 
-		// Store the entire extra field block (header + data)
 		m[tag] = extraField[offset-4 : offset+size]
 		offset += size
 	}

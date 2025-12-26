@@ -1,3 +1,7 @@
+// Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package sys
 
 // FileSystemType represents the type of file system on which the ZIP file was created
@@ -89,7 +93,7 @@ func (h HostSystem) String() string {
 		HostSystemDarwin:    "OS X (Darwin)",
 	}
 
-	if name, exists := names[h]; exists {
+	if name, ok := names[h]; ok {
 		return name
 	}
 	return "Unknown"

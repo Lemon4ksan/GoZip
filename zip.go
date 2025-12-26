@@ -2,6 +2,59 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// Package gozip provides a high-performance, concurrency-safe, and feature-rich
+// implementation of the ZIP archive format.
+//
+// It is designed as a robust alternative to the standard library's archive/zip,
+// specifically built for high-load applications, security-conscious environments,
+// and scenarios requiring legacy compatibility.
+//
+// # Key Features
+//
+// 1. Concurrency: Unlike the standard library, gozip supports parallel compression
+// (WriteToParallel) and parallel extraction (ExtractParallel), scaling linearly
+// with CPU cores.
+//
+// 2. Security: Native support for WinZip AES-256 encryption (reading and writing)
+// and built-in "Zip Slip" protection during extraction to prevent directory
+// traversal attacks.
+//
+// 3. Context Awareness: All long-running operations support context.Context for
+// cancellation and timeout management, making it ideal for HTTP handlers and
+// background jobs.
+//
+// 4. Compatibility: Handles Zip64 (files > 4GB), NTFS timestamps, Unix permissions,
+// and legacy DOS encodings (CP437, CP866) automatically.
+//
+// # Basic Usage
+//
+// Creating an archive sequentially:
+//
+//	archive := gozip.NewZip()
+//	archive.AddFromPath("file.txt")
+//	archive.AddFromDir("images/")
+//
+//	f, _ := os.Create("output.zip")
+//	archive.WriteTo(f)
+//
+// Creating an archive in parallel (faster for many files):
+//
+//	// compress using 8 workers
+//	archive.WriteToParallel(f, 8)
+//
+// Modifying an existing archive:
+//
+//	archive := gozip.NewZip()
+//	src, _ := os.Open("old.zip")
+//	archive.LoadFromFile(src)
+//
+//	// Add new files, remove old ones, rename entries...
+//	archive.RemoveFile("obsolete.log")
+//	archive.AddBytes([]byte("data"), "new.log")
+//
+//	// Save changes to a new writer
+//	dest, _ := os.Create("new.zip")
+//	archive.WriteTo(dest)
 package gozip
 
 import (
@@ -20,95 +73,79 @@ import (
 	"time"
 )
 
-// SizeUnknown is a sentinel value indicating that the uncompressed size of a file
-// cannot be determined in advance. This typically occurs when creating files from
-// io.Reader sources where the total data length is unknown until fully read.
+// SizeUnknown is a sentinel value used when the uncompressed size of a file
+// cannot be determined before writing (e.g., streaming from io.Reader).
 const SizeUnknown int64 = -1
 
-// ZipConfig defines global configuration parameters for creating or modifying ZIP archives.
-// These settings apply to the entire archive unless overridden at the file level.
+// ZipConfig defines global configuration parameters for the archive.
+// These settings apply to the entire archive but can be overridden
+// per-file using FileConfig options.
 type ZipConfig struct {
-	// CompressionMethod specifies the default compression algorithm used for files
+	// CompressionMethod is the default algorithm for new files.
 	CompressionMethod CompressionMethod
 
-	// CompressionLevel controls the trade-off between compression ratio and speed.
-	// Range is typically 0-9, where 0 means no compression (fastest) and 9 means
-	// maximum compression (slowest). Specific meaning depends on the CompressionMethod.
+	// CompressionLevel controls the speed vs size trade-off (0-9).
+	// 0 = Store (no compression), 9 = Best compression.
 	CompressionLevel int
 
-	// Password provides the default encryption password for the entire archive.
-	// This password will be used for all encrypted files unless overridden per file.
+	// Password is the default credentials for encrypting the archive.
 	Password string
 
-	// EncryptionMethod selects the encryption algorithm for the archive.
-	// Options include NotEncrypted, ZipCrypto (legacy), and AES256 (recommended).
+	// EncryptionMethod is the default encryption algorithm.
+	// Recommended: AES256.
 	EncryptionMethod EncryptionMethod
 
-	// FileSortStrategy determines how files are ordered when writing the archive.
-	// Different strategies can optimize for read performance, streaming, or
-	// directory traversal efficiency.
+	// FileSortStrategy defines the order of files in the written archive.
+	// Optimization strategies: Name (standard), Size (packing), or Directory (streaming).
 	FileSortStrategy FileSortStrategy
 
-	// Comment stores an optional text comment for the entire ZIP archive.
-	// Maximum length is 65535 bytes due to ZIP format limitations.
+	// Comment is the archive-level comment (max 65535 bytes).
 	Comment string
 
-	// TextEncoding specifies a fallback decoder for filenames/comments
-	// when UTF-8 flag is not set.
-	// Example: [DecodeIBM866] for Russian DOS archives.
-	// Default: CP437 (US DOS).
+	// TextEncoding handles filename decoding for non-UTF8 legacy archives.
+	// Default: CP437 (IBM PC).
 	TextEncoding TextDecoder
 
-	// OnFileProcessed is called immediately after a file entry is
-	// processed in Write, Read and Extract methods and their variants.
-	// NOTE: In ExtractParallel this callback is called concurrently.
+	// OnFileProcessed is a callback triggered after a file is successfully
+	// written, read, or extracted.
+	// WARNING: In parallel operations, this is called concurrently.
 	OnFileProcessed func(*File, error)
 }
 
-// FileConfig defines per-file configuration options that override archive defaults.
-// These settings allow fine-grained control over individual archive entries.
+// FileConfig defines configuration specific to a single archive entry.
+// It overrides the global ZipConfig.
 type FileConfig struct {
-	// Name specifies the file's path and filename within the ZIP archive.
-	// Directories shouldn't necessarily end with slashes, as they'll be added automatically.
+	// Name is the internal path in the ZIP. Forward slashes are enforced.
 	Name string
 
-	// Password provides an encryption password specific to this file,
-	// overriding the archive-level password if set.
+	// Password overrides the global archive password for this file.
 	Password string
 
-	// CompressionMethod selects the compression algorithm for this specific file,
-	// overriding the archive default.
+	// CompressionMethod overrides the global default.
 	CompressionMethod CompressionMethod
 
-	// EncryptionMethod selects the encryption algorithm for this specific file,
-	// overriding the archive default.
+	// EncryptionMethod overrides the global default.
 	EncryptionMethod EncryptionMethod
 
-	// CompressionLevel controls compression strength for this file (0-9),
-	// overriding the archive default. Higher values increase compression ratio
-	// at the cost of CPU time and memory.
+	// CompressionLevel overrides the global default.
 	CompressionLevel int
 
-	// Comment stores an optional text comment attached to this specific file.
-	// Maximum length is 65535 bytes due to ZIP format limitations.
+	// Comment is a file-specific comment (max 65535 bytes).
 	Comment string
 }
 
-// AddOption represents a functional option pattern for configuring File objects.
+// AddOption is a functional option for configuring file entries during addition.
 type AddOption func(f *File)
 
-// WithConfig applies a complete FileConfig to a File, overriding all configurable properties.
-// This is useful when you have a pre-configured FileConfig object or need to apply
-// multiple settings atomically.
+// WithConfig applies a complete FileConfig, overwriting existing settings.
 func WithConfig(c FileConfig) AddOption {
 	return func(f *File) {
 		f.SetConfig(c)
 	}
 }
 
-// WithCompression configures the compression method and level for a specific file.
-// This option only affects regular files (not directories) and overrides both
-// archive defaults and any previously set compression settings.
+// WithCompression sets the compression method and level for a regular file.
+// Ignored for directories.
 func WithCompression(c CompressionMethod, lvl int) AddOption {
 	return func(f *File) {
 		if !f.isDir {
@@ -118,9 +155,8 @@ func WithCompression(c CompressionMethod, lvl int) AddOption {
 	}
 }
 
-// WithEncryption configures encryption settings for a specific file.
-// This option only affects regular files (not directories) and overrides both
-// archive defaults and any previously set encryption settings.
+// WithEncryption sets the encryption method and password for a regular file.
+// Ignored for directories.
 func WithEncryption(e EncryptionMethod, pwd string) AddOption {
 	return func(f *File) {
 		if !f.isDir {
@@ -130,9 +166,8 @@ func WithEncryption(e EncryptionMethod, pwd string) AddOption {
 	}
 }
 
-// WithName sets or changes the filename and path within the ZIP archive.
-// The name is normalized to use forward slashes and cleaned to prevent directory
-// traversal issues. An empty name is ignored.
+// WithName overrides the destination filename within the archive.
+// The name is automatically normalized to use forward slashes.
 func WithName(name string) AddOption {
 	return func(f *File) {
 		if name != "" {
@@ -141,9 +176,8 @@ func WithName(name string) AddOption {
 	}
 }
 
-// WithPath prefixes the file's current name with the specified directory path.
-// This is useful for organizing files into subdirectories within the archive.
-// The path "." is treated as no path (current directory).
+// WithPath prepends a directory path to the file's name.
+// Useful for placing files into folders without modifying their base name.
 func WithPath(p string) AddOption {
 	return func(f *File) {
 		if p != "" && p != "." {
@@ -152,26 +186,23 @@ func WithPath(p string) AddOption {
 	}
 }
 
-// WithMode sets the file's permission mode (Unix-style) and type bits.
-// This affects both the stored metadata and the extracted file's permissions.
-// Use fs.FileMode constants like fs.ModeDir, fs.ModePerm, etc.
-// The final values stored in zip archive are system dependent.
+// WithMode sets the Unix-style permission bits.
+// This affects the external attributes field in the ZIP header.
 func WithMode(mode fs.FileMode) AddOption {
 	return func(f *File) {
 		f.mode = mode
 	}
 }
 
-// ExtractOption represents a function option for configuring extraction.
+// ExtractOption configures the extraction process (filtering).
 type ExtractOption func(files []*File) []*File
 
-// WithFiles allows to extract specific files from archive.
-// Empty slice results in no files being extracted.
+// WithFiles filters the extraction to only the specific files provided.
 func WithFiles(files []*File) ExtractOption {
 	return func(_ []*File) []*File { return files }
 }
 
-// FromDir allows to extract files from specific directory. Empty path is ignored.
+// FromDir restricts extraction to files nested under the specified path.
 func FromDir(path string) ExtractOption {
 	return func(files []*File) []*File {
 		if path == "" || path == "." {
@@ -193,8 +224,7 @@ func FromDir(path string) ExtractOption {
 	}
 }
 
-// WithoutDir allows to exclude directory and its contents from extraction.
-// Empty path results in all files being excluded.
+// WithoutDir excludes a directory and its contents from extraction.
 func WithoutDir(path string) ExtractOption {
 	return func(files []*File) []*File {
 		if path == "" || path == "." {
@@ -216,101 +246,97 @@ func WithoutDir(path string) ExtractOption {
 	}
 }
 
-// Compressor defines a strategy for compressing data.
-// See [DeflateCompressor] as an example.
+// Compressor transforms raw data into compressed data.
 type Compressor interface {
-	// Compress reads from src, compresses the data, and writes to dest.
-	// Returns the number of uncompressed bytes read from src.
+	// Compress reads from src and writes compressed data to dest.
+	// Returns the number of uncompressed bytes read.
 	Compress(src io.Reader, dest io.Writer) (int64, error)
 }
 
-// Decompressor defines a strategy for decompressing data.
-// See [DeflateDecompressor] as an example.
+// Decompressor transforms compressed data back into raw data.
 type Decompressor interface {
-	// Decompress returns a ReadCloser that reads uncompressed data from src.
-	// src is the stream of compressed data.
+	// Decompress returns a stream of uncompressed data.
 	Decompress(src io.Reader) (io.ReadCloser, error)
 }
 
-// compressorKey defines a key for compressors map
 type compressorKey struct {
 	method CompressionMethod
 	level  int
 }
 
+type factoriesMap map[CompressionMethod]CompressorFactory
 type compressorsMap map[compressorKey]Compressor
 type decompressorsMap map[CompressionMethod]Decompressor
 
-// Zip represents an in-memory ZIP archive that can be created, modified, and written.
-// It provides thread-safe operations for concurrent access and supports both
-// sequential and parallel processing modes.
+// Zip represents an in-memory ZIP archive manager.
+// It is concurrency-safe and supports streaming, random access, and parallel operations.
 type Zip struct {
-	mu            sync.RWMutex     // Protects concurrent access to archive state
-	config        ZipConfig        // Global archive configuration
-	files         []*File          // List of files in the archive (including directories)
-	fileCache     map[string]bool  // Fast lookup for file existence and type detection
-	compressors   compressorsMap   // Registry of custom compressors
-	decompressors decompressorsMap // Registry of custom decompressors
-	bufferPool    sync.Pool        // Reusable byte buffers for I/O operations
+	mu            sync.RWMutex     // Guards files, fileCache, and config
+	config        ZipConfig        // Global settings
+	files         []*File          // Ordered list of entries
+	fileCache     map[string]bool  // Lookup map for existence checks (normalized paths)
+	factories     factoriesMap     // Factories for creating new compressors (Method -> Factory)
+	decompressors decompressorsMap // Registered decompression codecs
+	bufferPool    sync.Pool        // Pool of 64KB buffers for IO optimization
 }
 
-// NewZip creates a new empty ZIP archive with default settings.
-// The returned archive supports Stored and Deflated compression methods by default.
-// Custom compression algorithms can be added using RegisterCompressor and RegisterDecompressor.
-// The archive uses a 64KB buffer pool for efficient I/O operations.
+// NewZip creates a ready-to-use empty ZIP archive.
+// Default support includes Store (NoCompression) and Deflate.
 func NewZip() *Zip {
 	return &Zip{
 		files:         make([]*File, 0),
 		fileCache:     make(map[string]bool),
-		compressors:   make(compressorsMap),
+		factories:     make(factoriesMap),
 		decompressors: make(decompressorsMap),
 		bufferPool: sync.Pool{
 			New: func() interface{} {
-				b := make([]byte, 64*1024) // 64KB buffer
+				b := make([]byte, 64*1024) // 64KB
 				return &b
 			},
 		},
 	}
 }
 
-// SetConfig updates the global configuration for the ZIP archive.
-// This configuration applies to all subsequently added files unless overridden
-// by file-specific options. Thread-safe.
+// SetConfig updates the global configuration atomically.
 func (z *Zip) SetConfig(c ZipConfig) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.config = c
 }
 
-// RegisterCompressor registers a custom compressor implementation for a specific
-// compression method and level combination. This is required when reading archives that
-// use compression methods not natively supported by the library. Thread-safe.
-func (z *Zip) RegisterCompressor(method CompressionMethod, level int, c Compressor) {
+// RegisterCompressor registers a factory function for a specific compression method.
+// The factory will be called when a file requires this method at a specific level.
+func (z *Zip) RegisterCompressor(method CompressionMethod, factory CompressorFactory) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	z.compressors[compressorKey{method, level}] = c
+	z.factories[method] = factory
 }
 
-// RegisterDecompressor registers a custom decompressor implementation for a
-// specific compression method. This is required when reading archives that
-// use compression methods not natively supported by the library. Thread-safe.
+// RegisterDecompressor adds support for reading a custom compression method.
 func (z *Zip) RegisterDecompressor(method CompressionMethod, d Decompressor) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.decompressors[method] = d
 }
 
-// GetFiles returns a slice of all files currently stored in the archive.
-// The returned slice includes both regular files and directory entries.
-// Note: The returned slice is a copy of internal references; modifications to
-// File objects may affect archive behavior.
-func (z *Zip) GetFiles() []*File {
-	return z.files
+// Files returns a copy of the list of files in the archive.
+// The slice is a copy, so appending to it will not affect the archive.
+// WARNING: Do not modify the 'Name' field of the returned Files directly,
+// as this will desynchronize the internal lookup cache. Use Rename() instead.
+func (z *Zip) Files() []*File {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+
+	// Return a copy to prevent slice manipulation from affecting internal state
+	result := make([]*File, len(z.files))
+	copy(result, z.files)
+	return result
 }
 
-// GetFile returns the file entry with the given name and path. It returns nil if the file is not found.
-// The name is automatically normalized to match ZIP standards (forward slashes).
-func (z *Zip) GetFile(name string) (*File, error) {
+// File returns the entry matching the given name.
+// Name is case-sensitive and normalized to forward slashes.
+// Returns ErrFileNotFound if no exact match is found.
+func (z *Zip) File(name string) (*File, error) {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
 
@@ -334,9 +360,9 @@ func (z *Zip) GetFile(name string) (*File, error) {
 	return nil, ErrFileNotFound
 }
 
-// GetMatchingFiles returns a list of files matching the glob pattern.
-// The pattern syntax is the same as [path.Match].
-func (z *Zip) GetMatchingFiles(pattern string) ([]*File, error) {
+// Glob returns all files whose names match the specified shell pattern.
+// Pattern syntax is identical to [path.Match].
+func (z *Zip) Glob(pattern string) ([]*File, error) {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
 
@@ -353,10 +379,9 @@ func (z *Zip) GetMatchingFiles(pattern string) ([]*File, error) {
 	return matches, nil
 }
 
-// Rename updates the file base name leaving the directory path unchanged.
-// For example, renaming "logs/current.log" to "old.log" results in "logs/old.log".
-// If the entry is a directory, the trailing slash is preserved automatically.
-// Returns error if the new name results in a path exceeding ZIP limits.
+// Rename changes a file's name while preserving its directory location.
+// e.g., "logs/old.txt" -> "logs/new.txt".
+// If the target is a directory, all children are recursively renamed.
 func (z *Zip) Rename(file *File, newName string) error {
 	if newName == "" {
 		return fmt.Errorf("%w: new name cannot be empty", ErrFileEntry)
@@ -392,20 +417,15 @@ func (z *Zip) Rename(file *File, newName string) error {
 		return nil
 	}
 
-	oldPrefix := file.getFilename() // e.g., "docs/old/"
-	newPrefix := fullPath + "/"     // e.g., "docs/new/"
+	oldPrefix := file.getFilename()
+	newPrefix := fullPath + "/"
 
-	// Iterate over all files to update children
-	// NOTE: This loop also handles the directory entry 'file' itself,
-	// because file.getFilename() equals oldPrefix.
 	for _, f := range z.files {
 		filename := f.getFilename()
 
 		if after, ok := strings.CutPrefix(filename, oldPrefix); ok {
-			// Replace the prefix
-			// "docs/old/file.txt" -> "docs/new/file.txt"
-			suffix := after
-			newChildPath := newPrefix + suffix
+			// e.g. "docs/old/file.txt" -> "docs/new/file.txt"
+			newChildPath := newPrefix + after
 			cleanChildName := strings.TrimSuffix(newChildPath, "/")
 
 			if len(cleanChildName)+1 > math.MaxUint16 {
@@ -421,11 +441,9 @@ func (z *Zip) Rename(file *File, newName string) error {
 	return nil
 }
 
-// Move updates the directory path of the file, keeping the base filename.
-// For example, moving "logs/app.log" to "backup/2023" results in "backup/2023/app.log".
-// If the entry is a directory, all its contents are moved recursively.
-// Passing "" or "." as newPath moves the file to the archive root.
-// Missing directories from newPath are created automatically.
+// Move changes the directory location of a file while preserving its base name.
+// e.g., "docs/file.txt" -> "backup/docs/file.txt".
+// Directories are moved recursively. Missing parent directories are created automatically.
 func (z *Zip) Move(file *File, newPath string) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()
@@ -433,6 +451,7 @@ func (z *Zip) Move(file *File, newPath string) error {
 	baseName := path.Base(file.name)
 
 	if file.isDir && baseName == "." {
+		// Handle root or weird paths
 		baseName = strings.TrimSuffix(file.name, "/")
 		baseName = path.Base(baseName)
 	}
@@ -452,6 +471,7 @@ func (z *Zip) Move(file *File, newPath string) error {
 		return fmt.Errorf("%w: %s (%d bytes)", ErrFilenameTooLong, fullPath, len(fullPath))
 	}
 
+	// Ensure destination directory exists
 	if !z.fileCache[newPath] || !z.fileCache[newPath+"/"] {
 		z.createMissingDirs(fullPath)
 	}
@@ -463,17 +483,13 @@ func (z *Zip) Move(file *File, newPath string) error {
 		return nil
 	}
 
-	oldPrefix := file.getFilename() // e.g. "photos/"
-	newPrefix := fullPath + "/"     // e.g. "backup/photos/"
+	oldPrefix := file.getFilename()
+	newPrefix := fullPath + "/"
 
-	// Iterate over all files to find children
-	// NOTE: This includes the 'file' directory entry itself because it matches the prefix
 	for _, f := range z.files {
 		filename := f.getFilename()
 
 		if after, ok := strings.CutPrefix(filename, oldPrefix); ok {
-			// Calculate new name:
-			// "photos/img.jpg" -> strip "photos/" -> "img.jpg" -> join "backup/photos/" + "img.jpg"
 			newChildPath := newPrefix + after
 			cleanChildName := strings.TrimSuffix(newChildPath, "/")
 
@@ -490,11 +506,9 @@ func (z *Zip) Move(file *File, newPath string) error {
 	return nil
 }
 
-// AddFile adds an existing opened file (os.File) to the archive.
-// The file's current position is used for reading; the caller is responsible
-// for opening and closing the file. File metadata (size, mod time, etc.) is
-// extracted from the os.File handle.
-func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
+// AddOSFile adds an open *os.File to the archive.
+// Uses the file's current read position and native OS metadata.
+func (z *Zip) AddOSFile(f *os.File, options ...AddOption) error {
 	fileEntry, err := newFileFromOS(f)
 	if err != nil {
 		return err
@@ -503,8 +517,7 @@ func (z *Zip) AddFile(f *os.File, options ...AddOption) error {
 }
 
 // AddFromPath adds a file from the local filesystem to the archive.
-// The file is opened, read, and closed automatically. The original filename
-// is used unless overridden by WithName or WithPath options.
+// Opens, reads, and closes the file automatically.
 func (z *Zip) AddFromPath(path string, options ...AddOption) error {
 	fileEntry, err := newFileFromPath(path)
 	if err != nil {
@@ -513,16 +526,14 @@ func (z *Zip) AddFromPath(path string, options ...AddOption) error {
 	return z.addEntry(fileEntry, options)
 }
 
-// AddFromDir recursively adds all files and directories from a filesystem directory
-// to the archive. The directory structure is preserved within the archive.
-// The root directory itself is not included; only its contents are added.
-// Returns a combined error if any operations failed (Best Effort strategy).
+// AddFromDir recursively adds a local directory and its contents to the archive.
+// Returns a combined error if any files fail to add (Best Effort). Symlinks aren't followed.
 func (z *Zip) AddFromDir(path string, options ...AddOption) error {
 	var errs []error
 
 	err := filepath.WalkDir(path, func(walkPath string, _ fs.DirEntry, err error) error {
 		if err != nil {
-			errs = append(errs, fmt.Errorf("access error %s: %w", walkPath, err))
+			errs = append(errs, err)
 			return nil
 		}
 
@@ -556,9 +567,8 @@ func (z *Zip) AddFromDir(path string, options ...AddOption) error {
 	return nil
 }
 
-// AddReader adds file content from an arbitrary io.Reader to the archive.
-// This is useful for adding dynamically generated content or reading from network streams.
-// If size is [SizeUnknown] it will be calculated during archive writing.
+// AddReader streams content from an io.Reader into the archive.
+// Use SizeUnknown for 'size' if the length is not known ahead of time.
 func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...AddOption) error {
 	fileEntry, err := newFileFromReader(r, filename, size)
 	if err != nil {
@@ -567,21 +577,20 @@ func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...Add
 	return z.addEntry(fileEntry, options)
 }
 
-// AddBytes adds a file created from a byte slice.
+// AddBytes creates a file from a byte slice.
 func (z *Zip) AddBytes(data []byte, filename string, options ...AddOption) error {
 	return z.AddReader(bytes.NewReader(data), filename, int64(len(data)), options...)
 }
 
-// AddString adds a file created from a string.
+// AddString creates a file from a string.
 func (z *Zip) AddString(content string, filename string, options ...AddOption) error {
 	return z.AddReader(strings.NewReader(content), filename, int64(len(content)), options...)
 }
 
-// CreateDirectory adds an explicit directory entry to the ZIP archive.
-// While directories are often created implicitly when files are added with
-// path components, this method allows creating empty directories or
-// directories with specific metadata (permissions, timestamps).
-func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
+// Mkdir creates an explicit directory entry in the archive.
+// Note: Directories are created implicitly by file paths; this is used for
+// empty directories or specific metadata.
+func (z *Zip) Mkdir(name string, options ...AddOption) error {
 	dirEntry, err := newDirectoryFile(name)
 	if err != nil {
 		return err
@@ -589,11 +598,8 @@ func (z *Zip) CreateDirectory(name string, options ...AddOption) error {
 	return z.addEntry(dirEntry, options)
 }
 
-// Exists checks whether a file or directory with the given name exists in the archive.
-// The name should use forward slashes as directory separators and will be
-// normalized for comparison. Returns true for both exact matches and
-// directory matches (e.g., "dir/" matches when checking for "dir").
-// Thread-safe for concurrent reads.
+// Exists checks if a file or directory exists in the archive.
+// Supports both exact matches and directory prefixes. Thread-safe.
 func (z *Zip) Exists(name string) bool {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
@@ -602,8 +608,8 @@ func (z *Zip) Exists(name string) bool {
 	return z.fileCache[key] || z.fileCache[key+"/"]
 }
 
-// Open returns a ReadCloser for the file with the given name inside the archive.
-// Returns ErrFileNotFound if the file does not exist. Thread-safe for concurrent reads.
+// OpenFile returns a ReadCloser for the named file within the archive.
+// Returns ErrFileNotFound if not found.
 func (z *Zip) OpenFile(name string) (io.ReadCloser, error) {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
@@ -623,11 +629,8 @@ func (z *Zip) OpenFile(name string) (io.ReadCloser, error) {
 	return nil, fmt.Errorf("%w: %s", ErrFileNotFound, name)
 }
 
-// RemoveFile deletes a file or directory entry from the archive by name.
-// If the entry is a directory, this ONLY removes the directory entry itself,
-// not its contents (files inside it). To remove a directory and its contents,
-// you would need to iterate and remove them individually or use RemoveDir.
-// Returns ErrFileNotFound if the entry does not exist.
+// RemoveFile deletes a single entry (file or empty directory).
+// To delete a directory and its contents, use RemoveDir.
 func (z *Zip) RemoveFile(name string) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()
@@ -653,7 +656,6 @@ func (z *Zip) RemoveFile(name string) error {
 	}
 
 	if idx == -1 {
-		// Should not happen if cache check passed, but safety first
 		return fmt.Errorf("%w: %s", ErrFileNotFound, name)
 	}
 
@@ -667,9 +669,8 @@ func (z *Zip) RemoveFile(name string) error {
 	return nil
 }
 
-// RemoveDir deletes a directory by name with its files and subdirectories.
-// If name is an empty strings, all files inside archive are deleted.
-// Returns ErrFileNotFound if no deletions were performed.
+// RemoveDir deletes a directory entry AND all its contents recursively.
+// If name is empty or ".", the archive is cleared.
 func (z *Zip) RemoveDir(name string) error {
 	if name == "" || name == "." {
 		z.files = make([]*File, 0)
@@ -687,23 +688,15 @@ func (z *Zip) RemoveDir(name string) error {
 
 	for _, f := range z.files {
 		fileName := f.getFilename()
-
-		// Check if file belongs to the directory (Prefix Match)
-		// Since searchName ends with "/", this covers:
-		// - The directory entry itself ("foo/bar/")
-		// - Files inside ("foo/bar/file.txt")
-		// - Subdirectories ("foo/bar/sub/")
 		if strings.HasPrefix(fileName, searchName) {
 			delete(z.fileCache, fileName)
 			deletedCount++
 			continue
 		}
-
 		newFiles = append(newFiles, f)
 	}
 
 	if deletedCount == 0 {
-		// Remove the trailing slash for the error message to look natural
 		return fmt.Errorf("%w: %s", ErrFileNotFound, strings.TrimSuffix(searchName, "/"))
 	}
 
@@ -711,25 +704,26 @@ func (z *Zip) RemoveDir(name string) error {
 	return nil
 }
 
-// Write serializes the entire ZIP archive to the destination writer.
-// This method processes files sequentially, making it more memory-efficient
-// than WriteParallel for most use cases. If dest implements io.Seeker,
-// the implementation can optimize by writing directly without temporary files.
-// Files are sorted according to the configured FileSortStrategy before writing.
-func (z *Zip) Write(dest io.Writer) error {
-	return z.WriteWithContext(context.Background(), dest)
+// WriteTo serializes the ZIP archive to the specified io.Writer.
+// Returns the total number of bytes written to the writer.
+// This is a sequential operation and will finalize the archive structure.
+func (z *Zip) WriteTo(dest io.Writer) (int64, error) {
+	return z.WriteToWithContext(context.Background(), dest)
 }
 
-// WriteWithContext serializes the ZIP archive with context support.
-func (z *Zip) WriteWithContext(ctx context.Context, dest io.Writer) error {
+// WriteToWithContext writes the archive with context cancellation support.
+// Returns the number of bytes written and any error encountered.
+func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer) (int64, error) {
 	z.mu.RLock()
 	files := SortFilesOptimized(z.files, z.config.FileSortStrategy)
 	z.mu.RUnlock()
 
-	writer := newZipWriter(z.config, z.compressors, dest)
+	counter := &byteCountWriter{dest: dest}
+	writer := newZipWriter(z.config, z.factories, counter)
+
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
-			return err
+			return counter.bytesWritten, err
 		}
 
 		err := writer.WriteFile(file)
@@ -740,53 +734,55 @@ func (z *Zip) WriteWithContext(ctx context.Context, dest io.Writer) error {
 			z.config.OnFileProcessed(file, err)
 		}
 		if err != nil {
-			return err
+			return counter.bytesWritten, err
 		}
 	}
 
 	if err := writer.WriteCentralDirAndEndRecords(); err != nil {
-		return fmt.Errorf("zip: %w", err)
+		return counter.bytesWritten, fmt.Errorf("zip: %w", err)
 	}
 
-	return nil
+	return counter.bytesWritten, nil
 }
 
-// WriteParallel serializes the ZIP archive using concurrent workers for compression.
-// This method can significantly improve performance on multi-core systems when
-// compressing many files. Temporary files and memory buffers are used to store
-// compressed data before final sequential writing to maintain ZIP format correctness.
-// maxWorkers controls the maximum number of concurrent compression operations.
-func (z *Zip) WriteParallel(dest io.Writer, maxWorkers int) error {
-	return z.WriteParallelWithContext(context.Background(), dest, maxWorkers)
+// WriteToParallel writes the archive using concurrent workers for compression.
+// Best used when the archive contains many large files that benefit from parallel CPU usage.
+// Returns the total bytes written to dest.
+func (z *Zip) WriteToParallel(dest io.Writer, maxWorkers int) (int64, error) {
+	return z.WriteToParallelWithContext(context.Background(), dest, maxWorkers)
 }
 
-// WriteParallelWithContext serializes the ZIP archive using concurrent workers with context support.
-func (z *Zip) WriteParallelWithContext(ctx context.Context, dest io.Writer, maxWorkers int) error {
+// WriteToParallelWithContext writes concurrently with context support.
+// Returns the total bytes written to dest.
+func (z *Zip) WriteToParallelWithContext(ctx context.Context, dest io.Writer, maxWorkers int) (int64, error) {
 	z.mu.RLock()
 	files := SortFilesOptimized(z.files, z.config.FileSortStrategy)
 	z.mu.RUnlock()
 
 	if err := ctx.Err(); err != nil {
-		return err
+		return 0, err
 	}
 
-	writer := newParallelZipWriter(z.config, z.compressors, dest, maxWorkers)
+	counter := &byteCountWriter{dest: dest}
+	writer := newParallelZipWriter(z.config, z.factories, counter, maxWorkers)
+
 	errs := writer.WriteFiles(ctx, files)
 
 	if err := writer.zw.WriteCentralDirAndEndRecords(); err != nil {
 		errs = append(errs, err)
 	}
 
-	return errors.Join(errs...)
+	return counter.bytesWritten, errors.Join(errs...)
 }
 
-// Read parses a ZIP archive from the source and appends its files to this archive.
-func (z *Zip) Read(src io.ReaderAt, size int64) error {
-	return z.ReadWithContext(context.Background(), src, size)
+// Load parses an existing ZIP archive from the reader and appends its entries to this struct.
+// It does not load file contents into memory, only the directory structure.
+func (z *Zip) Load(src io.ReaderAt, size int64) error {
+	return z.LoadWithContext(context.Background(), src, size)
 }
 
-// ReadWithContext parses a ZIP archive with context cancellation support.
-func (z *Zip) ReadWithContext(ctx context.Context, src io.ReaderAt, size int64) error {
+// LoadWithContext parses an archive with context support.
+func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -803,32 +799,28 @@ func (z *Zip) ReadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 	return nil
 }
 
-// ReadFile parses an existing ZIP archive and appends its files to this archive.
-func (z *Zip) ReadFile(f *os.File) error {
+// LoadFromFile parses a ZIP from a local os.File.
+func (z *Zip) LoadFromFile(f *os.File) error {
 	stat, err := f.Stat()
 	if err != nil {
 		return err
 	}
-	return z.Read(f, stat.Size())
+	return z.Load(f, stat.Size())
 }
 
-// Extract sequentially extracts all files from the archive to the specified directory.
-// Directory structure is preserved, and file permissions/timestamps are restored
-// when supported by the host filesystem. Path traversal attacks are prevented
-// by validating extracted paths. Returns combined errors if any extraction fails.
-// It expects that given path already exists.
+// Extract extracts files to the destination directory.
+// Includes Zip Slip protection to ensure files stay within the target path.
 func (z *Zip) Extract(path string, options ...ExtractOption) error {
 	return z.ExtractWithContext(context.Background(), path, options...)
 }
 
-// ExtractWithContext sequentially extracts files with context support.
-// Extraction stops immediately if context is cancelled.
+// ExtractWithContext extracts files with context cancellation support.
 func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...ExtractOption) error {
 	path = filepath.Clean(path)
 	var errs []error
 
 	z.mu.RLock()
-	files := z.GetFiles()
+	files := z.Files() // Use public getter to get a copy
 	for _, opt := range options {
 		files = opt(files)
 	}
@@ -845,6 +837,7 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 		}
 		fpath := filepath.Join(path, f.name)
 
+		// Zip Slip Protection
 		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
 			errs = append(errs, fmt.Errorf("%w: %s", ErrInsecurePath, fpath))
 			continue
@@ -875,16 +868,13 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 	return errors.Join(errs...)
 }
 
-// ExtractParallel extracts archive contents using multiple concurrent workers.
-// This can significantly improve extraction speed for archives with many files,
-// especially on SSDs or fast storage systems. Directory creation is performed
-// upfront, then file extraction is parallelized with controlled concurrency.
-// Any missing folders in given path will be created automatically.
+// ExtractParallel extracts files using multiple workers.
+// This is IO-bound optimized. Missing directories are created automatically.
 func (z *Zip) ExtractParallel(path string, workers int, options ...ExtractOption) error {
 	return z.ExtractParallelWithContext(context.Background(), path, workers, options...)
 }
 
-// ExtractParallelWithContext extracts files concurrently with context cancellation.
+// ExtractParallelWithContext extracts files concurrently.
 func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, workers int, options ...ExtractOption) error {
 	var errs []error
 	var filesToExtract []*File
@@ -892,7 +882,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 	path = filepath.Clean(path)
 
 	z.mu.RLock()
-	files := z.GetFiles()
+	files := z.Files()
 	for _, opt := range options {
 		files = opt(files)
 	}
@@ -905,6 +895,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 		}
 		fpath := filepath.Join(path, f.name)
 
+		// Zip Slip Protection
 		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
 			errs = append(errs, fmt.Errorf("%w: %s", ErrInsecurePath, fpath))
 			continue
@@ -927,6 +918,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 		return err
 	}
 
+	// Create directories upfront to avoid race conditions
 	for dir := range dirsToCreate {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
@@ -984,9 +976,8 @@ Finish:
 	return nil
 }
 
-// ExtractToWriter extracts a specific file directly to an io.Writer.
-// This is useful for streaming extracted content (e.g. to HTTP response)
-// without creating temporary files on disk.
+// ExtractToWriter streams the content of a specific file to a writer.
+// Does not create files on disk.
 func (z *Zip) ExtractToWriter(name string, dest io.Writer) error {
 	rc, err := z.OpenFile(name)
 	if err != nil {
@@ -1003,10 +994,7 @@ func (z *Zip) ExtractToWriter(name string, dest io.Writer) error {
 
 // Internal helpers
 
-// addEntry is an internal validator used to add files to archive.
-// It applies configuration defaults, processes AddOptions, normalizes the filename,
-// checks for duplicates and path collisions, creates implicit directories, and
-// updates internal data structures. Thread-safe.
+// addEntry validates and adds a file to the archive.
 func (z *Zip) addEntry(f *File, options []AddOption) error {
 	if !f.isDir {
 		f.config.CompressionMethod = z.config.CompressionMethod
@@ -1047,11 +1035,7 @@ func (z *Zip) addEntry(f *File, options []AddOption) error {
 	return nil
 }
 
-// createMissingDirs ensures that all parent directories for a file path exist
-// in the archive by creating implicit directory entries when necessary.
-// It traverses the path from bottom to top, creating missing directories and
-// checking for file/directory conflicts. Returns an error if a path component
-// already exists as a regular file.
+// createMissingDirs ensures implicit parent directories exist.
 func (z *Zip) createMissingDirs(filePath string) error {
 	dir := path.Dir(filePath)
 	if dir == "." || dir == "/" {
@@ -1085,10 +1069,8 @@ func (z *Zip) createMissingDirs(filePath string) error {
 	return nil
 }
 
-// extractFile handles the extraction of a single file from the archive to disk.
-// It opens the file from the archive, creates the destination file, copies data with buffered I/O,
-// and sets permissions and timestamps. Uses the shared buffer pool for efficient memory allocation.
-// It uses contextReader to wrap the source stream, ensuring io.Copy stops if ctx is done.
+// extractFile handles low-level extraction logic.
+// It uses the shared buffer pool and attempts to restore file metadata (times/perms).
 func (z *Zip) extractFile(ctx context.Context, f *File, path string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1126,6 +1108,8 @@ func (z *Zip) extractFile(ctx context.Context, f *File, path string) error {
 	if perm == 0 {
 		perm = 0644
 	}
+	// Best-effort attempts to restore metadata. Errors are ignored as they
+	// may occur on file systems that don't support these operations.
 	os.Chmod(path, perm)
 	os.Chtimes(path, time.Now(), f.modTime)
 

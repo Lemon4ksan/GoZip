@@ -75,13 +75,13 @@ func TestFileSetters(t *testing.T) {
 	file := &File{}
 
 	config := FileConfig{
-		CompressionMethod: Deflated,
+		CompressionMethod: Deflate,
 		CompressionLevel:  DeflateMaximum,
 	}
 
 	file.SetConfig(config)
 
-	if file.config.CompressionMethod != Deflated {
+	if file.config.CompressionMethod != Deflate {
 		t.Error("compression method not set correctly")
 	}
 }
@@ -92,14 +92,14 @@ func TestZipHeaders(t *testing.T) {
 		modTime:          time.Now(),
 		uncompressedSize: 1024,
 		config: FileConfig{
-			CompressionMethod: Deflated,
+			CompressionMethod: Deflate,
 		},
 	}
 
 	headers := newZipHeaders(file)
 	localHeader := headers.LocalHeader()
 
-	if localHeader.CompressionMethod != uint16(Deflated) {
+	if localHeader.CompressionMethod != uint16(Deflate) {
 		t.Error("compression method not set correctly")
 	}
 

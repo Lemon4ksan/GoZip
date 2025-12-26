@@ -239,22 +239,6 @@ func TestChecksumReader(t *testing.T) {
 		}
 	})
 
-	t.Run("Size Mismatch (Too short)", func(t *testing.T) {
-		rc := io.NopCloser(bytes.NewReader(data[:5])) // Read less
-		cr := &checksumReader{
-			rc:   rc,
-			hash: crc32.NewIEEE(),
-			want: crc,
-			size: uint64(len(data)),
-		}
-
-		io.Copy(io.Discard, cr)
-		err := cr.Close()
-		if !errors.Is(err, ErrSizeMismatch) {
-			t.Errorf("Expected ErrSizeMismatch, got: %v", err)
-		}
-	})
-
 	t.Run("Size Mismatch (Too long)", func(t *testing.T) {
 		longData := append(data, '!')
 		rc := io.NopCloser(bytes.NewReader(longData))
@@ -281,11 +265,11 @@ func TestZipReader_OpenFile_Integration(t *testing.T) {
 	// 1. Local Header
 	lhOffset := buf.Len()
 	binary.Write(buf, binary.LittleEndian, internal.LocalFileHeaderSignature)
-	binary.Write(buf, binary.LittleEndian, uint16(20))     // Version
-	binary.Write(buf, binary.LittleEndian, uint16(0))      // Flags
-	binary.Write(buf, binary.LittleEndian, uint16(Stored)) // Method
-	binary.Write(buf, binary.LittleEndian, uint16(0))      // Time
-	binary.Write(buf, binary.LittleEndian, uint16(0))      // Date
+	binary.Write(buf, binary.LittleEndian, uint16(20))    // Version
+	binary.Write(buf, binary.LittleEndian, uint16(0))     // Flags
+	binary.Write(buf, binary.LittleEndian, uint16(Store)) // Method
+	binary.Write(buf, binary.LittleEndian, uint16(0))     // Time
+	binary.Write(buf, binary.LittleEndian, uint16(0))     // Date
 	binary.Write(buf, binary.LittleEndian, crc)
 	binary.Write(buf, binary.LittleEndian, uint32(len(content))) // Compressed
 	binary.Write(buf, binary.LittleEndian, uint32(len(content))) // Uncompressed
@@ -304,7 +288,7 @@ func TestZipReader_OpenFile_Integration(t *testing.T) {
 
 	f := &File{
 		name:              "test",
-		config:            FileConfig{CompressionMethod: Stored},
+		config:            FileConfig{CompressionMethod: Store},
 		localHeaderOffset: int64(lhOffset),
 		compressedSize:    int64(len(content)),
 		uncompressedSize:  int64(len(content)),

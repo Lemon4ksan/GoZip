@@ -88,12 +88,12 @@ func TestZipWriter_EncodeToWriter(t *testing.T) {
 	}{
 		{
 			name:        "store compression",
-			compression: Stored,
+			compression: Store,
 			wantErr:     false,
 		},
 		{
 			name:        "deflate compression",
-			compression: Deflated,
+			compression: Deflate,
 			level:       DeflateNormal,
 			wantErr:     false,
 		},
@@ -169,7 +169,7 @@ func TestZipWriter_WriteFile_Strategies(t *testing.T) {
 				uncompressedSize: tt.uncompressedSize,
 				isDir:            tt.isDir,
 				modTime:          defaultTime(),
-				config:           FileConfig{CompressionMethod: Stored},
+				config:           FileConfig{CompressionMethod: Store},
 				openFunc: func() (io.ReadCloser, error) {
 					return io.NopCloser(bytes.NewReader(data)), nil
 				},
@@ -242,7 +242,7 @@ func TestZipWriter_UpdateLocalHeader(t *testing.T) {
 // TestParallelZipWriter_Integration verifies the full cycle with standard library Reader
 func TestParallelZipWriter_Integration(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
-	config := ZipConfig{CompressionMethod: Deflated}
+	config := ZipConfig{CompressionMethod: Deflate}
 
 	filesCount := 5
 	files := make([]*File, filesCount)
@@ -254,7 +254,7 @@ func TestParallelZipWriter_Integration(t *testing.T) {
 			name:             name,
 			uncompressedSize: int64(len(content)),
 			modTime:          defaultTime(),
-			config:           FileConfig{CompressionMethod: Deflated, CompressionLevel: DeflateNormal},
+			config:           FileConfig{CompressionMethod: Deflate, CompressionLevel: DeflateNormal},
 			openFunc: func() (io.ReadCloser, error) {
 				return io.NopCloser(strings.NewReader(content)), nil
 			},
@@ -300,7 +300,7 @@ func TestParallelZipWriter_Integration(t *testing.T) {
 
 func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
-	config := ZipConfig{CompressionMethod: Stored}
+	config := ZipConfig{CompressionMethod: Store}
 
 	smallContent := "small"
 	largeContent := "larger_data"
@@ -310,14 +310,14 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 			name:             "memory_file.txt",
 			uncompressedSize: int64(len(smallContent)),
 			modTime:          defaultTime(),
-			config:           FileConfig{CompressionMethod: Stored},
+			config:           FileConfig{CompressionMethod: Store},
 			openFunc:         func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(smallContent)), nil },
 		},
 		{
 			name:             "disk_file.txt",
 			uncompressedSize: int64(len(largeContent)),
 			modTime:          defaultTime(),
-			config:           FileConfig{CompressionMethod: Stored},
+			config:           FileConfig{CompressionMethod: Store},
 			openFunc:         func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(largeContent)), nil },
 		},
 	}
@@ -377,7 +377,7 @@ func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 
 // TestMemoryBuffer_ReadWriteSeek verifies custom buffer logic
 func TestMemoryBuffer_ReadWriteSeek(t *testing.T) {
-	mb := NewMemoryBuffer(10)
+	mb := newMemoryBuffer(10)
 	data := []byte("hello world")
 
 	// Write
@@ -437,7 +437,7 @@ func TestMemoryBuffer_ReadWriteSeek(t *testing.T) {
 }
 
 func TestMemoryBuffer_LargeGrowth(t *testing.T) {
-	mb := NewMemoryBuffer(1)
+	mb := newMemoryBuffer(1)
 	size := 64 * 1024
 	data := make([]byte, size)
 

@@ -1,6 +1,14 @@
+// Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gozip
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+)
 
 var (
 	// ErrFormat is returned when the input is not a valid ZIP archive.
@@ -15,7 +23,8 @@ var (
 	// ErrEncryption is returned when an encryption method is not supported.
 	ErrEncryption = errors.New("unsupported encryption method")
 
-	// ErrPasswordMismatch is returned when the provided password does not match.
+	// ErrPasswordMismatch is returned when the provided password does not match
+	// or when a password is required but not provided.
 	ErrPasswordMismatch = errors.New("zip: invalid password")
 
 	// ErrChecksum is returned when reading a file checksum does not match.
@@ -25,7 +34,8 @@ var (
 	ErrSizeMismatch = errors.New("zip: uncompressed size mismatch")
 
 	// ErrFileNotFound is returned when the requested file is not found in the archive.
-	ErrFileNotFound = errors.New("zip: file not found")
+	// It wraps fs.ErrNotExist so it can be checked with os.IsNotExist.
+	ErrFileNotFound = fmt.Errorf("zip: file not found: %w", fs.ErrNotExist)
 
 	// ErrInsecurePath is returned when a file path is invalid or attempts directory traversal (Zip Slip).
 	ErrInsecurePath = errors.New("zip: insecure file path")

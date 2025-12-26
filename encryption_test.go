@@ -55,7 +55,7 @@ func TestZipCrypto_WriterReader(t *testing.T) {
 
 	// 1. Write
 	buf := new(bytes.Buffer)
-	w, err := NewZipCryptoWriter(buf, password, checkByte)
+	w, err := newZipCryptoWriter(buf, password, checkByte)
 	if err != nil {
 		t.Fatalf("NewZipCryptoWriter: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestZipCrypto_WriterReader(t *testing.T) {
 	// 0xAB000000 >> 24 = 0xAB
 	fileCRC := uint32(0xAB000000)
 
-	r, err := NewZipCryptoReader(bytes.NewReader(buf.Bytes()), password, 0, fileCRC, 0)
+	r, err := newZipCryptoReader(bytes.NewReader(buf.Bytes()), password, 0, fileCRC, 0)
 	if err != nil {
 		t.Fatalf("NewZipCryptoReader failed: %v", err)
 	}
@@ -98,11 +98,11 @@ func TestZipCrypto_WrongPassword(t *testing.T) {
 	checkByte := byte(0x12)
 
 	buf := new(bytes.Buffer)
-	NewZipCryptoWriter(buf, password, checkByte)
+	newZipCryptoWriter(buf, password, checkByte)
 
 	// Try to read with wrong password
 	fileCRC := uint32(0x12000000)
-	_, err := NewZipCryptoReader(bytes.NewReader(buf.Bytes()), "wrong", 0, fileCRC, 0)
+	_, err := newZipCryptoReader(bytes.NewReader(buf.Bytes()), "wrong", 0, fileCRC, 0)
 
 	if err != ErrPasswordMismatch {
 		t.Errorf("Expected ErrPasswordMismatch, got %v", err)
@@ -116,11 +116,11 @@ func TestZipCrypto_CheckByteMismatch(t *testing.T) {
 	checkByte := byte(0x12)
 
 	buf := new(bytes.Buffer)
-	NewZipCryptoWriter(buf, password, checkByte)
+	newZipCryptoWriter(buf, password, checkByte)
 
 	// Provide CRC that doesn't match checkByte (0x99 != 0x12)
 	fileCRC := uint32(0x99000000)
-	_, err := NewZipCryptoReader(bytes.NewReader(buf.Bytes()), password, 0, fileCRC, 0)
+	_, err := newZipCryptoReader(bytes.NewReader(buf.Bytes()), password, 0, fileCRC, 0)
 
 	if err != ErrPasswordMismatch {
 		t.Errorf("Expected ErrPasswordMismatch (due to check byte), got %v", err)
@@ -133,7 +133,7 @@ func TestAes256_WriterReader_RoundTrip(t *testing.T) {
 
 	// 1. Write
 	buf := new(bytes.Buffer)
-	w, err := NewAes256Writer(buf, password)
+	w, err := newAes256Writer(buf, password)
 	if err != nil {
 		t.Fatalf("NewAes256Writer: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestAes256_WriterReader_RoundTrip(t *testing.T) {
 	}
 
 	// 2. Read
-	r, err := NewAes256Reader(bytes.NewReader(buf.Bytes()), password, int64(len(buf.Bytes())))
+	r, err := newAes256Reader(bytes.NewReader(buf.Bytes()), password, int64(len(buf.Bytes())))
 	if err != nil {
 		t.Fatalf("NewAes256Reader failed: %v", err)
 	}
@@ -173,11 +173,11 @@ func TestAes256_WrongPassword(t *testing.T) {
 	password := "secret"
 	buf := new(bytes.Buffer)
 
-	w, _ := NewAes256Writer(buf, password)
+	w, _ := newAes256Writer(buf, password)
 	w.Write([]byte("data"))
 	w.Close()
 
-	_, err := NewAes256Reader(bytes.NewReader(buf.Bytes()), "wrong_secret", 0)
+	_, err := newAes256Reader(bytes.NewReader(buf.Bytes()), "wrong_secret", 0)
 	if err != ErrPasswordMismatch {
 		t.Errorf("Expected ErrPasswordMismatch, got %v", err)
 	}
@@ -189,7 +189,7 @@ func TestAes256_CorruptedData(t *testing.T) {
 	content := []byte("data")
 
 	buf := new(bytes.Buffer)
-	w, _ := NewAes256Writer(buf, password)
+	w, _ := newAes256Writer(buf, password)
 	w.Write(content)
 	w.Close()
 
@@ -197,7 +197,7 @@ func TestAes256_CorruptedData(t *testing.T) {
 	// Corrupt a byte in the encrypted payload (offset: 16+2=18 is start of data)
 	data[18] ^= 0xFF
 
-	r, err := NewAes256Reader(bytes.NewReader(data), password, int64(len(data)))
+	r, err := newAes256Reader(bytes.NewReader(data), password, int64(len(data)))
 	if err != nil {
 		t.Fatalf("Reader creation should succeed (keys are valid): %v", err)
 	}
