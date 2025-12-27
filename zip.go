@@ -792,10 +792,11 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 	if err != nil {
 		return err
 	}
-	z.files = append(z.files, files...)
 	for _, file := range files {
+		file.config.Password = z.config.Password
 		z.fileCache[file.getFilename()] = true
 	}
+	z.files = append(z.files, files...)
 	return nil
 }
 
@@ -827,6 +828,12 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 	files = sortAlphabetical(files)
 	z.mu.RUnlock()
 
+	callback := func (f *File, err error) {
+		if z.config.OnFileProcessed != nil {
+			z.config.OnFileProcessed(f, err)
+		}
+	}
+
 	for _, f := range files {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -839,14 +846,18 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 
 		// Zip Slip Protection
 		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
-			errs = append(errs, fmt.Errorf("%w: %s", ErrInsecurePath, fpath))
+			err := fmt.Errorf("%w: %s", ErrInsecurePath, fpath)
+			errs = append(errs, err)
+			callback(f, err)
 			continue
 		}
 
 		if f.isDir {
-			if err := os.Mkdir(fpath, 0755); err != nil {
+			err := os.Mkdir(fpath, 0755)
+			if err != nil {
 				errs = append(errs, err)
 			}
+			callback(f, err)
 			continue
 		}
 
@@ -860,9 +871,7 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 			}
 			errs = append(errs, fmt.Errorf("failed to extract %s: %w", fpath, err))
 		}
-		if z.config.OnFileProcessed != nil {
-			z.config.OnFileProcessed(f, err)
-		}
+		callback(f, err)
 	}
 
 	return errors.Join(errs...)
@@ -878,7 +887,7 @@ func (z *Zip) ExtractParallel(path string, workers int, options ...ExtractOption
 func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, workers int, options ...ExtractOption) error {
 	var errs []error
 	var filesToExtract []*File
-	dirsToCreate := make(map[string]struct{})
+	dirsToCreate := make(map[string]*File)
 	path = filepath.Clean(path)
 
 	z.mu.RLock()
@@ -888,6 +897,12 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 	}
 	files = sortAlphabetical(files)
 	z.mu.RUnlock()
+
+	callback := func (f *File, err error) {
+		if z.config.OnFileProcessed != nil {
+			z.config.OnFileProcessed(f, err)
+		}
+	}
 
 	for _, f := range files {
 		if f.config.Password == "" {
@@ -902,11 +917,11 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 		}
 
 		if f.isDir {
-			dirsToCreate[fpath] = struct{}{}
+			dirsToCreate[fpath] = f
 			continue
 		}
 
-		dirsToCreate[filepath.Dir(fpath)] = struct{}{}
+		dirsToCreate[filepath.Dir(fpath)] = f
 		filesToExtract = append(filesToExtract, f)
 	}
 
@@ -919,10 +934,12 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 	}
 
 	// Create directories upfront to avoid race conditions
-	for dir := range dirsToCreate {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	for name, dir := range dirsToCreate {
+		err := os.MkdirAll(name, 0755)
+		if err != nil {
+			err = fmt.Errorf("failed to create directory: %w", err)
 		}
+		callback(dir, err)
 	}
 
 	sem := make(chan struct{}, workers)
@@ -951,10 +968,8 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 					f.config.Password = ""
 				}
 			}
-			if z.config.OnFileProcessed != nil {
-				if ctx.Err() == nil {
-					z.config.OnFileProcessed(f, err)
-				}
+			if ctx.Err() == nil {
+				callback(f, err)
 			}
 		}(f)
 	}
