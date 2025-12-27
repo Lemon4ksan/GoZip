@@ -7,6 +7,7 @@ package gozip
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"math"
 	"os"
 	"path"
@@ -21,31 +22,87 @@ func TestNewFileFromPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tmpfile.Close()
-	defer os.Remove(tmpfile.Name())
+	defer func() {
+		tmpfile.Close()
+		os.Remove(tmpfile.Name())
+	}()
 
 	testContent := "Hello, World!"
 	if _, err := tmpfile.WriteString(testContent); err != nil {
 		t.Fatal(err)
 	}
-	tmpfile.Sync()
+	tmpfile.Close() // Close it so newFileFromPath can open it fresh
 
 	file, err := newFileFromPath(tmpfile.Name())
 	if err != nil {
 		t.Fatalf("newFileFromPath failed: %v", err)
 	}
 
-	if file.Name() != filepath.Base(tmpfile.Name()) {
-		t.Errorf("expected name %s, got %s", filepath.Base(tmpfile.Name()), file.Name())
+	expectedName := filepath.Base(tmpfile.Name())
+	if file.Name() != expectedName {
+		t.Errorf("expected name %s, got %s", expectedName, file.Name())
 	}
 
 	if file.UncompressedSize() != int64(len(testContent)) {
 		t.Errorf("expected size %d, got %d", len(testContent), file.UncompressedSize())
 	}
+
+	rc, err := file.Open()
+	if err != nil {
+		t.Fatalf("file.Open() failed: %v", err)
+	}
+	defer rc.Close()
+
+	content, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read content failed: %v", err)
+	}
+
+	if string(content) != testContent {
+		t.Errorf("content mismatch: got %q, want %q", string(content), testContent)
+	}
+}
+
+func TestNewFileFromOS(t *testing.T) {
+	tmpfile, err := os.CreateTemp("", "testfile_os")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		tmpfile.Close()
+		os.Remove(tmpfile.Name())
+	}()
+
+	testContent := "OS File Content"
+	if _, err := tmpfile.WriteString(testContent); err != nil {
+		t.Fatal(err)
+	}
+	tmpfile.Sync()
+
+	file, err := newFileFromOS(tmpfile)
+	if err != nil {
+		t.Fatalf("newFileFromOS failed: %v", err)
+	}
+
+	rc, err := file.Open()
+	if err != nil {
+		t.Fatalf("file.Open() failed: %v", err)
+	}
+	defer rc.Close()
+
+	content, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read content failed: %v", err)
+	}
+
+	if string(content) != testContent {
+		t.Errorf("content mismatch: got %q, want %q", string(content), testContent)
+	}
 }
 
 func TestNewFileFromReader(t *testing.T) {
-	reader := strings.NewReader("test content")
+	testData := "test content"
+	reader := strings.NewReader(testData)
 	name := "test.txt"
 
 	file, err := newFileFromReader(reader, name, SizeUnknown)
@@ -55,6 +112,18 @@ func TestNewFileFromReader(t *testing.T) {
 
 	if file.Name() != name {
 		t.Errorf("expected name %s, got %s", name, file.Name())
+	}
+
+	// Verify reading
+	rc, err := file.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	got, _ := io.ReadAll(rc)
+	if string(got) != testData {
+		t.Errorf("content mismatch")
 	}
 }
 
@@ -68,6 +137,11 @@ func TestNewDirectoryFile(t *testing.T) {
 
 	if !file.IsDir() {
 		t.Error("expected file to be a directory")
+	}
+
+	// Directory size should be 0 (usually) or not matter, but mode should be correct
+	if file.Mode()&os.ModeDir == 0 {
+		t.Error("expected ModeDir bit set")
 	}
 }
 
@@ -83,6 +157,9 @@ func TestFileSetters(t *testing.T) {
 
 	if file.config.CompressionMethod != Deflate {
 		t.Error("compression method not set correctly")
+	}
+	if file.config.CompressionLevel != DeflateMaximum {
+		t.Error("compression level not set correctly")
 	}
 }
 
@@ -118,10 +195,15 @@ func TestZipHeaders_Directory(t *testing.T) {
 	headers := newZipHeaders(file)
 	localHeader := headers.LocalHeader()
 
+	// "archive/docs" + "/" = 13 bytes
 	expectedLength := uint16(len("archive/docs") + 1)
 	if localHeader.FilenameLength != expectedLength {
 		t.Errorf("directory filename length incorrect: got %d, expected %d",
 			localHeader.FilenameLength, expectedLength)
+	}
+
+	if !strings.HasSuffix(localHeader.Filename, "/") {
+		t.Error("directory filename in header missing trailing slash")
 	}
 }
 
@@ -152,6 +234,13 @@ func TestFile_RequiresZip64(t *testing.T) {
 			file: &File{
 				compressedSize:   math.MaxUint32 + 1,
 				uncompressedSize: 100,
+			},
+			expected: true,
+		},
+		{
+			name: "Large offset",
+			file: &File{
+				localHeaderOffset: math.MaxUint32 + 1,
 			},
 			expected: true,
 		},
@@ -193,7 +282,7 @@ func TestFile_GetFilenameLength(t *testing.T) {
 				name:  "archive/docs",
 				isDir: true,
 			},
-			expected: 13,
+			expected: 13, // +1 for slash
 		},
 	}
 
@@ -207,7 +296,7 @@ func TestFile_GetFilenameLength(t *testing.T) {
 	}
 }
 
-// TestIntegration_FileToHeaders verifies that file.go logic (getFilename) correctly propagates to types.go structures
+// TestIntegration_FileToHeaders verifies that file.go logic (getFilename) correctly propagates to internal structures
 func TestIntegration_FileToHeaders(t *testing.T) {
 	tests := []struct {
 		name     string
