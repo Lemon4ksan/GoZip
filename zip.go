@@ -363,19 +363,52 @@ func (z *Zip) File(name string) (*File, error) {
 // Glob returns all files whose names match the specified shell pattern.
 // Pattern syntax is identical to [path.Match].
 func (z *Zip) Glob(pattern string) ([]*File, error) {
+	if _, err := path.Match(pattern, ""); err != nil {
+		return nil, err
+	}
+
+	if !hasMeta(pattern) {
+		if f, err := z.File(pattern); err == nil {
+			return []*File{f}, nil
+		}
+		return nil, nil
+	}
+
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+
+	var matches []*File
+
+	for _, f := range z.files {
+		if matched, _ := path.Match(pattern, f.name); matched {
+			matches = append(matches, f)
+		}
+	}
+
+	return matches, nil
+}
+
+// Find searches for files matching the pattern in all directories.
+// Unlike Glob, the pattern "*" matches "/" characters.
+// Example: Find("*.log") matches "error.log" AND "var/logs/access.log".
+func (z *Zip) Find(pattern string) ([]*File, error) {
+	pattern = strings.ReplaceAll(pattern, "\\", "/")
+
+	if _, err := path.Match(pattern, ""); err != nil {
+		return nil, err
+	}
+
 	z.mu.RLock()
 	defer z.mu.RUnlock()
 
 	var matches []*File
 	for _, f := range z.files {
-		matched, err := path.Match(pattern, f.name)
-		if err != nil {
-			return nil, fmt.Errorf("invalid pattern: %w", err)
-		}
-		if matched {
+		// Check against base name (filename only)
+		if matched, _ := path.Match(pattern, path.Base(f.name)); matched {
 			matches = append(matches, f)
 		}
 	}
+
 	return matches, nil
 }
 
@@ -792,11 +825,13 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 	if err != nil {
 		return err
 	}
+
 	for _, file := range files {
 		file.config.Password = z.config.Password
 		z.fileCache[file.getFilename()] = true
 	}
 	z.files = append(z.files, files...)
+
 	return nil
 }
 

@@ -112,3 +112,14 @@ func winFiletimeToTime(ft uint64) time.Time {
 
 	return time.Unix(seconds, nanos).UTC()
 }
+
+// hasMeta checks if the string contains pattern matching characters.
+func hasMeta(path string) bool {
+	for i := 0; i < len(path); i++ {
+		switch path[i] {
+		case '*', '?', '[', '\\':
+			return true
+		}
+	}
+	return false
+}
