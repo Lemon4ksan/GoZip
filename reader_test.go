@@ -99,6 +99,7 @@ func TestFindEOCD_BufferBoundary(t *testing.T) {
 	comment := "short"
 	eocd := makeEOCD(1, 10, 10, comment)
 
+	// Ensure EOCD straddles the 1024-byte buffer boundary used in scanning
 	prefixLen := 1024 + 10
 	data := make([]byte, prefixLen)
 	data = append(data, eocd...)
@@ -121,19 +122,17 @@ func TestNewFileFromCentralDir_Zip64(t *testing.T) {
 		CompressedSize:    math.MaxUint32,
 		LocalHeaderOffset: math.MaxUint32,
 		Filename:          "large_file.dat",
-		ExtraField:        make(map[uint16][]byte, 0),
+		ExtraField:        make(map[uint16][]byte),
 	}
 
-	extra := new(bytes.Buffer)
-	binary.Write(extra, binary.LittleEndian, uint16(Zip64ExtraFieldTag))
-	binary.Write(extra, binary.LittleEndian, uint16(24))         // 8+8+8
-	binary.Write(extra, binary.LittleEndian, uint64(5000000000)) // Real Uncompressed > 4GB
-	binary.Write(extra, binary.LittleEndian, uint64(4000000000)) // Real Compressed
-	binary.Write(extra, binary.LittleEndian, uint64(1000000000)) // Real Offset
+	// Construct the Zip64 Extra Field payload (WITHOUT Tag/Size header)
+	// The map value in internal.CentralDirectory stores only the data payload.
+	extraPayload := new(bytes.Buffer)
+	binary.Write(extraPayload, binary.LittleEndian, uint64(5000000000)) // Real Uncompressed > 4GB
+	binary.Write(extraPayload, binary.LittleEndian, uint64(4000000000)) // Real Compressed
+	binary.Write(extraPayload, binary.LittleEndian, uint64(1000000000)) // Real Offset
 
-	cd.ExtraField = map[uint16][]byte{
-		Zip64ExtraFieldTag: extra.Bytes()[4:], // Skip Tag and Size headers for the map value
-	}
+	cd.ExtraField[Zip64ExtraFieldTag] = extraPayload.Bytes()
 
 	zr := &zipReader{}
 	f := zr.newFileFromCentralDir(cd)
@@ -223,6 +222,26 @@ func TestChecksumReader(t *testing.T) {
 		}
 	})
 
+	t.Run("Partial Read (No Error)", func(t *testing.T) {
+		rc := io.NopCloser(bytes.NewReader(data))
+		cr := &checksumReader{
+			rc:   rc,
+			hash: crc32.NewIEEE(),
+			want: crc,
+			size: uint64(len(data)),
+		}
+
+		// Read only 1 byte
+		if _, err := io.ReadFull(cr, make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+
+		// Closing partial read should NOT return error (allows peeking)
+		if err := cr.Close(); err != nil {
+			t.Errorf("Expected nil error for partial read close, got: %v", err)
+		}
+	})
+
 	t.Run("Invalid Checksum", func(t *testing.T) {
 		rc := io.NopCloser(bytes.NewReader([]byte("wrong data")))
 		cr := &checksumReader{
@@ -239,22 +258,6 @@ func TestChecksumReader(t *testing.T) {
 		}
 	})
 
-	t.Run("Size Mismatch (Too short)", func(t *testing.T) {
-		rc := io.NopCloser(bytes.NewReader(data[:5])) // Read less
-		cr := &checksumReader{
-			rc:   rc,
-			hash: crc32.NewIEEE(),
-			want: crc,
-			size: uint64(len(data)),
-		}
-
-		io.Copy(io.Discard, cr)
-		err := cr.Close()
-		if !errors.Is(err, ErrSizeMismatch) {
-			t.Errorf("Expected ErrSizeMismatch, got: %v", err)
-		}
-	})
-
 	t.Run("Size Mismatch (Too long)", func(t *testing.T) {
 		longData := append(data, '!')
 		rc := io.NopCloser(bytes.NewReader(longData))
@@ -266,8 +269,8 @@ func TestChecksumReader(t *testing.T) {
 		}
 
 		_, err := io.Copy(io.Discard, cr)
-		if err == nil {
-			t.Error("Expected error during read (too large), got nil")
+		if !errors.Is(err, ErrSizeMismatch) {
+			t.Errorf("Expected ErrSizeMismatch, got %v", err)
 		}
 	})
 }
@@ -278,14 +281,13 @@ func TestZipReader_OpenFile_Integration(t *testing.T) {
 	content := []byte("test content")
 	crc := crc32.ChecksumIEEE(content)
 
-	// 1. Local Header
 	lhOffset := buf.Len()
 	binary.Write(buf, binary.LittleEndian, internal.LocalFileHeaderSignature)
-	binary.Write(buf, binary.LittleEndian, uint16(20))     // Version
-	binary.Write(buf, binary.LittleEndian, uint16(0))      // Flags
-	binary.Write(buf, binary.LittleEndian, uint16(Stored)) // Method
-	binary.Write(buf, binary.LittleEndian, uint16(0))      // Time
-	binary.Write(buf, binary.LittleEndian, uint16(0))      // Date
+	binary.Write(buf, binary.LittleEndian, uint16(20))    // Version
+	binary.Write(buf, binary.LittleEndian, uint16(0))     // Flags
+	binary.Write(buf, binary.LittleEndian, uint16(Store)) // Method
+	binary.Write(buf, binary.LittleEndian, uint16(0))     // Time
+	binary.Write(buf, binary.LittleEndian, uint16(0))     // Date
 	binary.Write(buf, binary.LittleEndian, crc)
 	binary.Write(buf, binary.LittleEndian, uint32(len(content))) // Compressed
 	binary.Write(buf, binary.LittleEndian, uint32(len(content))) // Uncompressed
@@ -293,18 +295,14 @@ func TestZipReader_OpenFile_Integration(t *testing.T) {
 	binary.Write(buf, binary.LittleEndian, uint16(0))            // Extra Len
 	buf.WriteString("test")
 
-	// 2. Data
 	buf.Write(content)
 
-	// 3. Central Directory Header is mocked via struct injection usually,
-	// but to test openFile properly, we just need the ReaderAt logic to hit the right offset.
-
 	reader := bytes.NewReader(buf.Bytes())
-	zr := newZipReader(reader, reader.Size(), nil, ZipConfig{}) // Default decompressors
+	zr := newZipReader(reader, reader.Size(), nil, ZipConfig{})
 
 	f := &File{
 		name:              "test",
-		config:            FileConfig{CompressionMethod: Stored},
+		config:            FileConfig{CompressionMethod: Store},
 		localHeaderOffset: int64(lhOffset),
 		compressedSize:    int64(len(content)),
 		uncompressedSize:  int64(len(content)),

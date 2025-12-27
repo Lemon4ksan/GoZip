@@ -52,7 +52,7 @@ func TestZipWriter_WriteFileHeader(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mw := NewMemoryWriteSeeker()
-			zw := newZipWriter(ZipConfig{}, nil, mw)
+			zw := newZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw)
 
 			err := zw.writeFileHeader(tt.file)
 
@@ -88,12 +88,12 @@ func TestZipWriter_EncodeToWriter(t *testing.T) {
 	}{
 		{
 			name:        "store compression",
-			compression: Stored,
+			compression: Store,
 			wantErr:     false,
 		},
 		{
 			name:        "deflate compression",
-			compression: Deflated,
+			compression: Deflate,
 			level:       DeflateNormal,
 			wantErr:     false,
 		},
@@ -107,7 +107,8 @@ func TestZipWriter_EncodeToWriter(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var destBuf bytes.Buffer
-			zw := newZipWriter(ZipConfig{}, nil, NewMemoryWriteSeeker())
+			mw := NewMemoryWriteSeeker()
+			zw := newZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw)
 
 			src := strings.NewReader(testData)
 			config := FileConfig{
@@ -162,14 +163,14 @@ func TestZipWriter_WriteFile_Strategies(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mw := NewMemoryWriteSeeker()
-			zw := newZipWriter(ZipConfig{}, nil, mw)
+			zw := newZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw)
 
 			file := &File{
 				name:             "test",
 				uncompressedSize: tt.uncompressedSize,
 				isDir:            tt.isDir,
 				modTime:          defaultTime(),
-				config:           FileConfig{CompressionMethod: Stored},
+				config:           FileConfig{CompressionMethod: Store},
 				openFunc: func() (io.ReadCloser, error) {
 					return io.NopCloser(bytes.NewReader(data)), nil
 				},
@@ -207,7 +208,7 @@ func TestZipWriter_UpdateLocalHeader(t *testing.T) {
 	}
 
 	mw := NewMemoryWriteSeeker()
-	zw := newZipWriter(ZipConfig{}, nil, mw)
+	zw := newZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw)
 
 	// 1. Write initial header
 	err := zw.writeFileHeader(file)
@@ -242,7 +243,7 @@ func TestZipWriter_UpdateLocalHeader(t *testing.T) {
 // TestParallelZipWriter_Integration verifies the full cycle with standard library Reader
 func TestParallelZipWriter_Integration(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
-	config := ZipConfig{CompressionMethod: Deflated}
+	config := ZipConfig{CompressionMethod: Deflate}
 
 	filesCount := 5
 	files := make([]*File, filesCount)
@@ -254,14 +255,14 @@ func TestParallelZipWriter_Integration(t *testing.T) {
 			name:             name,
 			uncompressedSize: int64(len(content)),
 			modTime:          defaultTime(),
-			config:           FileConfig{CompressionMethod: Deflated, CompressionLevel: DeflateNormal},
+			config:           FileConfig{CompressionMethod: Deflate, CompressionLevel: DeflateNormal},
 			openFunc: func() (io.ReadCloser, error) {
 				return io.NopCloser(strings.NewReader(content)), nil
 			},
 		}
 	}
 
-	pzw := newParallelZipWriter(config, nil, mw, 2)
+	pzw := newParallelZipWriter(config, make(map[CompressionMethod]CompressorFactory), mw, 2)
 
 	errs := pzw.WriteFiles(context.Background(), files)
 	if len(errs) > 0 {
@@ -300,7 +301,7 @@ func TestParallelZipWriter_Integration(t *testing.T) {
 
 func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
-	config := ZipConfig{CompressionMethod: Stored}
+	config := ZipConfig{CompressionMethod: Store}
 
 	smallContent := "small"
 	largeContent := "larger_data"
@@ -310,19 +311,19 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 			name:             "memory_file.txt",
 			uncompressedSize: int64(len(smallContent)),
 			modTime:          defaultTime(),
-			config:           FileConfig{CompressionMethod: Stored},
+			config:           FileConfig{CompressionMethod: Store},
 			openFunc:         func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(smallContent)), nil },
 		},
 		{
 			name:             "disk_file.txt",
 			uncompressedSize: int64(len(largeContent)),
 			modTime:          defaultTime(),
-			config:           FileConfig{CompressionMethod: Stored},
+			config:           FileConfig{CompressionMethod: Store},
 			openFunc:         func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(largeContent)), nil },
 		},
 	}
 
-	pzw := newParallelZipWriter(config, nil, mw, 1)
+	pzw := newParallelZipWriter(config, make(map[CompressionMethod]CompressorFactory), mw, 1)
 	pzw.memoryThreshold = 10 // Force second file to disk
 
 	errs := pzw.WriteFiles(context.Background(), files)
@@ -345,7 +346,7 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 
 func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
-	pzw := newParallelZipWriter(ZipConfig{}, nil, mw, 2)
+	pzw := newParallelZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw, 2)
 
 	expectedErr := errors.New("simulated open error")
 	files := []*File{
@@ -377,7 +378,7 @@ func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 
 // TestMemoryBuffer_ReadWriteSeek verifies custom buffer logic
 func TestMemoryBuffer_ReadWriteSeek(t *testing.T) {
-	mb := NewMemoryBuffer(10)
+	mb := newMemoryBuffer(10)
 	data := []byte("hello world")
 
 	// Write
@@ -437,7 +438,7 @@ func TestMemoryBuffer_ReadWriteSeek(t *testing.T) {
 }
 
 func TestMemoryBuffer_LargeGrowth(t *testing.T) {
-	mb := NewMemoryBuffer(1)
+	mb := newMemoryBuffer(1)
 	size := 64 * 1024
 	data := make([]byte, size)
 
@@ -463,6 +464,7 @@ func TestMemoryBuffer_LargeGrowth(t *testing.T) {
 	}
 }
 
+// memoryWriteSeeker mocks io.WriteSeeker for testing
 type memoryWriteSeeker struct {
 	buf []byte
 	pos int64

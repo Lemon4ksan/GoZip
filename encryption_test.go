@@ -55,9 +55,9 @@ func TestZipCrypto_WriterReader(t *testing.T) {
 
 	// 1. Write
 	buf := new(bytes.Buffer)
-	w, err := NewZipCryptoWriter(buf, password, checkByte)
+	w, err := newZipCryptoWriter(buf, password, checkByte)
 	if err != nil {
-		t.Fatalf("NewZipCryptoWriter: %v", err)
+		t.Fatalf("newZipCryptoWriter: %v", err)
 	}
 
 	n, err := w.Write(content)
@@ -78,9 +78,9 @@ func TestZipCrypto_WriterReader(t *testing.T) {
 	// 0xAB000000 >> 24 = 0xAB
 	fileCRC := uint32(0xAB000000)
 
-	r, err := NewZipCryptoReader(bytes.NewReader(buf.Bytes()), password, 0, fileCRC, 0)
+	r, err := newZipCryptoReader(bytes.NewReader(buf.Bytes()), password, 0, fileCRC, 0)
 	if err != nil {
-		t.Fatalf("NewZipCryptoReader failed: %v", err)
+		t.Fatalf("newZipCryptoReader failed: %v", err)
 	}
 
 	readBuf := make([]byte, len(content))
@@ -98,11 +98,11 @@ func TestZipCrypto_WrongPassword(t *testing.T) {
 	checkByte := byte(0x12)
 
 	buf := new(bytes.Buffer)
-	NewZipCryptoWriter(buf, password, checkByte)
+	newZipCryptoWriter(buf, password, checkByte)
 
 	// Try to read with wrong password
 	fileCRC := uint32(0x12000000)
-	_, err := NewZipCryptoReader(bytes.NewReader(buf.Bytes()), "wrong", 0, fileCRC, 0)
+	_, err := newZipCryptoReader(bytes.NewReader(buf.Bytes()), "wrong", 0, fileCRC, 0)
 
 	if err != ErrPasswordMismatch {
 		t.Errorf("Expected ErrPasswordMismatch, got %v", err)
@@ -116,11 +116,11 @@ func TestZipCrypto_CheckByteMismatch(t *testing.T) {
 	checkByte := byte(0x12)
 
 	buf := new(bytes.Buffer)
-	NewZipCryptoWriter(buf, password, checkByte)
+	newZipCryptoWriter(buf, password, checkByte)
 
 	// Provide CRC that doesn't match checkByte (0x99 != 0x12)
 	fileCRC := uint32(0x99000000)
-	_, err := NewZipCryptoReader(bytes.NewReader(buf.Bytes()), password, 0, fileCRC, 0)
+	_, err := newZipCryptoReader(bytes.NewReader(buf.Bytes()), password, 0, fileCRC, 0)
 
 	if err != ErrPasswordMismatch {
 		t.Errorf("Expected ErrPasswordMismatch (due to check byte), got %v", err)
@@ -133,9 +133,9 @@ func TestAes256_WriterReader_RoundTrip(t *testing.T) {
 
 	// 1. Write
 	buf := new(bytes.Buffer)
-	w, err := NewAes256Writer(buf, password)
+	w, err := newAes256Writer(buf, password)
 	if err != nil {
-		t.Fatalf("NewAes256Writer: %v", err)
+		t.Fatalf("newAes256Writer: %v", err)
 	}
 
 	if _, err := w.Write(content); err != nil {
@@ -154,14 +154,21 @@ func TestAes256_WriterReader_RoundTrip(t *testing.T) {
 	}
 
 	// 2. Read
-	r, err := NewAes256Reader(bytes.NewReader(buf.Bytes()), password, int64(len(buf.Bytes())))
+	r, err := newAes256Reader(bytes.NewReader(buf.Bytes()), password, int64(len(buf.Bytes())))
 	if err != nil {
-		t.Fatalf("NewAes256Reader failed: %v", err)
+		t.Fatalf("newAes256Reader failed: %v", err)
 	}
 
 	readBuf := make([]byte, len(content))
 	if _, err := io.ReadFull(r, readBuf); err != nil {
 		t.Fatalf("ReadFull failed: %v", err)
+	}
+
+	// Ensure we read EOF to trigger MAC check (implied by ReadFull on exact size buffer if reader handles EOF correctly,
+	// but aesReader might need one more Read to hit EOF check)
+	n, err := r.Read(make([]byte, 1))
+	if n != 0 || err != io.EOF {
+		t.Errorf("Expected EOF after reading content, got n=%d, err=%v", n, err)
 	}
 
 	if !bytes.Equal(readBuf, content) {
@@ -173,46 +180,53 @@ func TestAes256_WrongPassword(t *testing.T) {
 	password := "secret"
 	buf := new(bytes.Buffer)
 
-	w, _ := NewAes256Writer(buf, password)
+	w, _ := newAes256Writer(buf, password)
 	w.Write([]byte("data"))
 	w.Close()
 
-	_, err := NewAes256Reader(bytes.NewReader(buf.Bytes()), "wrong_secret", 0)
+	_, err := newAes256Reader(bytes.NewReader(buf.Bytes()), "wrong_secret", 0)
 	if err != ErrPasswordMismatch {
 		t.Errorf("Expected ErrPasswordMismatch, got %v", err)
 	}
 }
 
-func TestAes256_CorruptedData(t *testing.T) {
-	// This tests HMAC failure implicitly if implemented, or garbage output
+func TestAes256_CorruptedData_MACFailure(t *testing.T) {
 	password := "secret"
 	content := []byte("data")
 
 	buf := new(bytes.Buffer)
-	w, _ := NewAes256Writer(buf, password)
+	w, _ := newAes256Writer(buf, password)
 	w.Write(content)
 	w.Close()
 
 	data := buf.Bytes()
 	// Corrupt a byte in the encrypted payload (offset: 16+2=18 is start of data)
-	data[18] ^= 0xFF
+	if len(data) > 18 {
+		data[18] ^= 0xFF
+	}
 
-	r, err := NewAes256Reader(bytes.NewReader(data), password, int64(len(data)))
+	r, err := newAes256Reader(bytes.NewReader(data), password, int64(len(data)))
 	if err != nil {
 		t.Fatalf("Reader creation should succeed (keys are valid): %v", err)
 	}
 
 	readBuf := make([]byte, len(content))
-	r.Read(readBuf)
+	_, err = io.ReadFull(r, readBuf)
+	if err != nil {
+		// It might fail during reading if decryption breaks stream (unlikely for CTR),
+		// but main check is at the end.
+	}
 
-	// Decrypted data should be garbage due to corruption
-	if bytes.Equal(readBuf, content) {
-		t.Error("Corrupted cipher text resulted in valid plaintext (impossible)")
+	// Now try to read EOF which triggers MAC check
+	_, err = r.Read(make([]byte, 1))
+	if err == nil || err == io.EOF {
+		t.Error("Expected error due to corrupted MAC/Data, got success/EOF")
+	} else if err.Error() != "zip: aes authentication failed" {
+		t.Errorf("Expected authentication failure, got: %v", err)
 	}
 }
 
 func TestDeriveAesKeys(t *testing.T) {
-	// Validates that PBKDF2 logic matches expectations (no regression)
 	password := "password"
 	salt, _ := hex.DecodeString("000102030405060708090A0B0C0D0E0F") // 16 bytes
 
@@ -251,11 +265,12 @@ func TestWinZipCounter_LittleEndian(t *testing.T) {
 	dstStandard := make([]byte, 32)
 	ctr.XORKeyStream(dstStandard, src)
 
-	if !bytes.Equal(dst[:16], dstStandard[:16]) {
-		t.Log("Note: First block differs (this is unexpected but not fatal if init differs)")
-	}
+	// Block 2 (Indices 16-31)
+	// Standard CTR increments last byte: {..., 0, 1} -> {..., 0, 2}
+	// WinZip CTR increments first byte:  {1, 0, ...} -> {2, 0, ...}
+	// These IVs are different, so the keystreams MUST be different.
 
 	if bytes.Equal(dst[16:], dstStandard[16:]) {
-		t.Error("WinZipCounter behaves like standard BigEndian CTR in the 2nd block!")
+		t.Error("WinZipCounter behaves like standard BigEndian CTR in the 2nd block! (Should be LittleEndian)")
 	}
 }

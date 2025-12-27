@@ -90,14 +90,14 @@ func winFiletimeToTime(ft uint64) time.Time {
 
 	// Perform calculation in uint64 to avoid overflow issues with dates before 1970 during subtraction
 	// Note: We assume the date is within valid Unix range for int64 conversion logic below.
-	
+
 	// Handle dates before 1970
 	if ft < offset {
 		diff := int64(offset - ft)
 		seconds := -(diff / ticksPerSecond)
 		nanos := -(diff % ticksPerSecond) * 100
-		
-		// Adjust if nanos is negative (standard time.Unix behavior handles this, 
+
+		// Adjust if nanos is negative (standard time.Unix behavior handles this,
 		// but explicit adjustment ensures correctness)
 		if nanos < 0 {
 			seconds--
@@ -108,7 +108,18 @@ func winFiletimeToTime(ft uint64) time.Time {
 
 	diff := ft - offset
 	seconds := int64(diff / ticksPerSecond)
-	nanos := int64(diff % ticksPerSecond) * 100
+	nanos := int64(diff%ticksPerSecond) * 100
 
 	return time.Unix(seconds, nanos).UTC()
+}
+
+// hasMeta checks if the string contains pattern matching characters.
+func hasMeta(path string) bool {
+	for i := 0; i < len(path); i++ {
+		switch path[i] {
+		case '*', '?', '[', '\\':
+			return true
+		}
+	}
+	return false
 }

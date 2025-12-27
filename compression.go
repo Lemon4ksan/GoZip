@@ -13,48 +13,64 @@ import (
 // CompressionMethod represents the compression algorithm used for a file in the ZIP archive
 type CompressionMethod uint16
 
-// Supported compression methods according to ZIP specification
+// Supported compression methods according to ZIP specification.
+// Note: This library natively supports Store (0) and Deflate (8).
+// Other methods require registering custom compressors via RegisterCompressor.
 const (
-	Stored    CompressionMethod = 0  // No compression - file stored as-is
-	Deflated  CompressionMethod = 8  // DEFLATE compression (most common)
-	Deflate64 CompressionMethod = 9  // DEFLATE64(tm) enhanced compression
-	BZIP2     CompressionMethod = 12 // BZIP2 compression (more efficient but slower compression)
-	LZMA      CompressionMethod = 14 // LZMA compression (high compression ratio)
-	ZStandard CompressionMethod = 93 // Zstandard compression (fastest decompression)
+	Store     CompressionMethod = 0  // No compression - file stored as-is
+	Deflate   CompressionMethod = 8  // DEFLATE compression (most common)
+	Deflate64 CompressionMethod = 9  // DEFLATE64(tm) - Not supported natively
+	BZIP2     CompressionMethod = 12 // BZIP2 - Not supported natively
+	LZMA      CompressionMethod = 14 // LZMA - Not supported natively
+	ZStandard CompressionMethod = 93 // Zstandard - Not supported natively
 )
 
-// Compression levels for DEFLATE algorithm
+// Compression levels for DEFLATE algorithm.
 const (
-	DeflateNormal    = 6 // Default compression level (good balance between speed and ratio)
-	DeflateMaximum   = 9 // Maximum compression (best ratio, slowest speed)
-	DeflateFast      = 3 // Fast compression (lower ratio, faster speed)
-	DeflateSuperFast = 1 // Super fast compression (lowest ratio, fastest speed)
+	DeflateNormal    = flate.DefaultCompression // -1
+	DeflateMaximum   = flate.BestCompression    // 9
+	DeflateFast      = 3
+	DeflateSuperFast = flate.BestSpeed     // 1 (Same as Fast in stdlib)
+	DeflateStore     = flate.NoCompression // 0
 )
 
-// StoredCompressor implements no compression (STORE method)
+// CompressorFactory creates a Compressor instance for a specific compression level.
+// The level parameter is typically 0-9, but interpretations vary by algorithm.
+// Implementations should normalize invalid levels to defaults.
+type CompressorFactory func(level int) Compressor
+
+// StoredCompressor implements no compression (STORE method).
 type StoredCompressor struct{}
 
 func (sc *StoredCompressor) Compress(src io.Reader, dest io.Writer) (int64, error) {
+	// io.Copy uses io.WriterTo if available, making this efficient
 	return io.Copy(dest, src)
 }
 
-// DeflateCompressor implements DEFLATE compression with memory pooling
+// DeflateCompressor implements DEFLATE compression with memory pooling.
 type DeflateCompressor struct {
 	writers sync.Pool
 	buffers sync.Pool
 }
 
-// NewDeflateCompressor creates a reusable compressor for a specific level
+// NewDeflateCompressor creates a reusable compressor for a specific level.
 func NewDeflateCompressor(level int) *DeflateCompressor {
+	if level < flate.HuffmanOnly || level > flate.BestCompression {
+		level = flate.DefaultCompression
+	}
+
 	return &DeflateCompressor{
 		writers: sync.Pool{
 			New: func() interface{} {
+				// We use io.Discard just to initialize the struct structure.
+				// The error is safe to ignore here because we validated the level above.
 				w, _ := flate.NewWriter(io.Discard, level)
 				return w
 			},
 		},
 		buffers: sync.Pool{
 			New: func() interface{} {
+				// 32KB is a standard efficient buffer size for io.CopyBuffer
 				b := make([]byte, 32*1024)
 				return &b
 			},
@@ -66,16 +82,20 @@ func (d *DeflateCompressor) Compress(src io.Reader, dest io.Writer) (int64, erro
 	w := d.writers.Get().(*flate.Writer)
 	defer d.writers.Put(w)
 
+	// Reset directs the compressor to write to the new destination
 	w.Reset(dest)
 
 	bufPtr := d.buffers.Get().(*[]byte)
 	defer d.buffers.Put(bufPtr)
 
+	// CopyBuffer avoids allocating a temporary buffer on every call
 	n, err := io.CopyBuffer(w, src, *bufPtr)
 	if err != nil {
 		return n, err
 	}
 
+	// Close flushes any pending data and writes the DEFLATE footer.
+	// It does NOT close the underlying destination writer.
 	if err := w.Close(); err != nil {
 		return n, err
 	}
@@ -83,7 +103,7 @@ func (d *DeflateCompressor) Compress(src io.Reader, dest io.Writer) (int64, erro
 	return n, nil
 }
 
-// StoredDecompressor implements the "Store" method (no compression)
+// StoredDecompressor implements the "Store" method (no compression).
 type StoredDecompressor struct{}
 
 func (sd *StoredDecompressor) Decompress(src io.Reader) (io.ReadCloser, error) {
@@ -93,9 +113,11 @@ func (sd *StoredDecompressor) Decompress(src io.Reader) (io.ReadCloser, error) {
 	return io.NopCloser(src), nil
 }
 
-// DeflateDecompressor implements the "Deflate" method
+// DeflateDecompressor implements the "Deflate" method.
 type DeflateDecompressor struct{}
 
 func (dd *DeflateDecompressor) Decompress(src io.Reader) (io.ReadCloser, error) {
+	// flate.NewReader returns an io.ReadCloser.
+	// The Close() method of the returned reader does not close the underlying src.
 	return flate.NewReader(src), nil
 }

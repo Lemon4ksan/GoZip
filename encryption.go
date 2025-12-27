@@ -18,7 +18,7 @@ import (
 	"io"
 )
 
-// EncryptionMethod represents the encryption algorithm used for file protection
+// EncryptionMethod represents the encryption algorithm used for file protection.
 type EncryptionMethod uint16
 
 // Supported encryption methods
@@ -28,19 +28,22 @@ const (
 	AES256       EncryptionMethod = 2 // Modern AES256 encryption
 )
 
+// zipCryptoWriter implements the legacy PKWARE encryption.
 type zipCryptoWriter struct {
 	dest   io.Writer
 	cipher *zipCipher
 }
 
-func NewZipCryptoWriter(dest io.Writer, password string, checkByte byte) (io.WriteCloser, error) {
+func newZipCryptoWriter(dest io.Writer, password string, checkByte byte) (io.WriteCloser, error) {
 	cipher := newZipCipher(password)
 
+	// Write the encryption header (12 bytes)
 	header := make([]byte, 12)
 	if _, err := rand.Read(header); err != nil {
 		return nil, fmt.Errorf("crypto rand failed: %w", err)
 	}
 
+	// The last byte of the header is used as a check byte (CRC or ModTime)
 	header[11] = checkByte
 	cipher.Encrypt(header)
 
@@ -59,6 +62,7 @@ func (w *zipCryptoWriter) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 
+	// Encrypt in place (on a copy to allow reusing input buffer)
 	buf := make([]byte, len(p))
 	copy(buf, p)
 
@@ -79,7 +83,7 @@ type zipCryptoReader struct {
 	cipher *zipCipher
 }
 
-func NewZipCryptoReader(src io.Reader, password string, flags uint16, crc32Val uint32, modTime uint16) (io.Reader, error) {
+func newZipCryptoReader(src io.Reader, password string, flags uint16, crc32Val uint32, modTime uint16) (io.Reader, error) {
 	cipher := newZipCipher(password)
 
 	header := make([]byte, 12)
@@ -88,8 +92,10 @@ func NewZipCryptoReader(src io.Reader, password string, flags uint16, crc32Val u
 	}
 	cipher.Decrypt(header)
 
+	// Verify password
 	var expectedByte byte
 	if flags&0x8 != 0 {
+		// If bit 3 is set, ModTime is used (local header doesn't have CRC)
 		expectedByte = byte(modTime >> 8)
 	} else {
 		expectedByte = byte(crc32Val >> 24)
@@ -115,6 +121,7 @@ func (r *zipCryptoReader) Read(p []byte) (int, error) {
 
 const cipherMagic = 134775813
 
+// zipCipher implements the legacy ZipCrypto algorithm.
 type zipCipher struct {
 	k0, k1, k2 uint32
 }
@@ -165,22 +172,35 @@ func (z *zipCipher) Decrypt(buf []byte) {
 	}
 }
 
+// AES Constants
+const (
+	aes256KeySize  = 32 // 32 bytes = 256 bits
+	aes256SaltSize = 16 // 16 bytes for AES-256
+	aesMacSize     = 10 // HMAC-SHA1 truncated to 10 bytes
+	aesPvvSize     = 2  // Password Verification Value
+)
+
+// aesWriter implements WinZip AES-256 encryption.
 type aesWriter struct {
 	dest   io.Writer
 	stream *winZipCounter
 	mac    hash.Hash
 }
 
-// NewAes256Writer creates a writer that encrypts data using WinZip AES-256
-func NewAes256Writer(dest io.Writer, password string) (io.WriteCloser, error) {
+func newAes256Writer(dest io.Writer, password string) (io.WriteCloser, error) {
 	salt := make([]byte, aes256SaltSize)
-	rand.Read(salt)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, fmt.Errorf("aes rand: %w", err)
+	}
+
 	keys := deriveAesKeys(password, salt)
 
+	// Write Salt
 	if _, err := dest.Write(salt); err != nil {
 		return nil, fmt.Errorf("write salt: %w", err)
 	}
 
+	// Write PVV (Password Verification Value)
 	if _, err := dest.Write(keys.pvv); err != nil {
 		return nil, fmt.Errorf("write pvv: %w", err)
 	}
@@ -201,16 +221,18 @@ func (w *aesWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	// We must encrypt into a new buffer to avoid modifying p
 	buf := make([]byte, len(p))
 	w.stream.XORKeyStream(buf, p)
 
-	// Update HMAC with ENCRYPTED data (Encrypt-then-MAC)
+	// WinZip AES: Encrypt-then-MAC (HMAC is computed on ciphertext)
 	w.mac.Write(buf)
 
 	return w.dest.Write(buf)
 }
 
 func (w *aesWriter) Close() error {
+	// Append the 10-byte authentication code
 	sum := w.mac.Sum(nil)
 	if _, err := w.dest.Write(sum[:aesMacSize]); err != nil {
 		return fmt.Errorf("write auth code: %w", err)
@@ -230,8 +252,10 @@ type aesReader struct {
 	checkOnEOF bool
 }
 
-// NewAes256Reader wraps src which MUST contain [Salt][PVV][EncryptedData][MAC]
-func NewAes256Reader(src io.Reader, password string, compressedSize int64) (io.Reader, error) {
+// newAes256Reader creates a reader that handles WinZip AES decryption.
+// src MUST be positioned at the start of the AES data (Salt).
+// compressedSize is the size of the data segment in the ZIP file (including Salt/PVV/MAC).
+func newAes256Reader(src io.Reader, password string, compressedSize int64) (io.Reader, error) {
 	salt := make([]byte, aes256SaltSize)
 	if _, err := io.ReadFull(src, salt); err != nil {
 		return nil, fmt.Errorf("read salt: %w", err)
@@ -253,12 +277,15 @@ func NewAes256Reader(src io.Reader, password string, compressedSize int64) (io.R
 
 	overhead := int64(aes256SaltSize + aesPvvSize + aesMacSize)
 	if compressedSize < overhead {
-		return nil, errors.New("invalid aes file size")
+		return nil, errors.New("zip: invalid aes file size (too small)")
 	}
+	// The actual encrypted data size
 	dataSize := compressedSize - overhead
 
 	return &aesReader{
-		limitR:     io.LimitReader(src, dataSize),
+		// limitR reads exactly the encrypted payload
+		limitR: io.LimitReader(src, dataSize),
+		// macSrc is the underlying reader, used to read the MAC after payload
 		macSrc:     src,
 		stream:     newWinZipCounter(block),
 		mac:        hmac.New(sha1.New, keys.macKey),
@@ -269,58 +296,44 @@ func NewAes256Reader(src io.Reader, password string, compressedSize int64) (io.R
 func (r *aesReader) Read(p []byte) (int, error) {
 	n, err := r.limitR.Read(p)
 	if n > 0 {
+		// Update MAC with the bytes read (which are Ciphertext)
 		r.mac.Write(p[:n])
+		// Decrypt in place
 		r.stream.XORKeyStream(p[:n], p[:n])
 	}
 
+	// If we hit EOF of the payload, verify the MAC immediately
 	if err == io.EOF && r.checkOnEOF {
 		expected := make([]byte, aesMacSize)
+		// Read the MAC from the remaining bytes in source
 		if _, macErr := io.ReadFull(r.macSrc, expected); macErr != nil {
 			return n, fmt.Errorf("read auth mac: %w", macErr)
 		}
 
 		calculated := r.mac.Sum(nil)[:aesMacSize]
 		if !bytes.Equal(calculated, expected) {
-			return n, errors.New("aes authentication failed")
+			return n, errors.New("zip: aes authentication failed")
 		}
+		// Verification successful
 		return n, io.EOF
 	}
 
 	return n, err
 }
 
-// VerifyMAC checks the authentication code.
-// It MUST be called after all data is read.
-func (r *aesReader) CheckMAC(expectedMac []byte) error {
-	calculated := r.mac.Sum(nil)[:aesMacSize]
-	if !bytes.Equal(calculated, expectedMac) {
-		return fmt.Errorf("hmac mismatch: corrupted data")
-	}
-	return nil
-}
-
-const (
-	aes256KeySize  = 32 // 32 bytes = 256 bits
-	aes256SaltSize = 16 // 16 bytes for AES-256
-	aesMacSize     = 10 // HMAC-SHA1 truncated to 10 bytes
-	aesPvvSize     = 2  // Password Verification Value
-)
-
-// aesKeys holds derived keys
+// aesKeys holds keys derived from the password.
 type aesKeys struct {
 	encKey []byte // AES encryption key
 	macKey []byte // HMAC signing key
 	pvv    []byte // Password verification value
 }
 
-// deriveAesKeys generates keys using PBKDF2
+// deriveAesKeys generates keys using PBKDF2 (RFC 2898)
 func deriveAesKeys(password string, salt []byte) aesKeys {
-	// WinZip AES-256 needs:
-	// - 32 bytes for AES Key
-	// - 32 bytes for HMAC Key
-	// - 2 bytes for Password Verification Value
-	totalLen := 2*aes256KeySize + aesPvvSize
-	dk := key([]byte(password), salt, 1000, totalLen, sha1.New)
+	// WinZip AES-256 uses 1000 iterations of PBKDF2-HMAC-SHA1
+	// Need: 32 (AES) + 32 (HMAC) + 2 (PVV) = 66 bytes
+	const keyLen = 2*aes256KeySize + aesPvvSize
+	dk := pbkdf2([]byte(password), salt, 1000, keyLen, sha1.New)
 
 	return aesKeys{
 		encKey: dk[:aes256KeySize],
@@ -330,7 +343,8 @@ func deriveAesKeys(password string, salt []byte) aesKeys {
 }
 
 // winZipCounter implements cipher.Stream for WinZip AES-CTR mode.
-// Standard Go cipher.NewCTR uses BigEndian increment, but WinZip requires LittleEndian.
+// Note: WinZip uses Little Endian increment for the 128-bit counter,
+// whereas standard Go cipher.NewCTR uses Big Endian.
 type winZipCounter struct {
 	block   cipher.Block
 	counter [16]byte
@@ -339,25 +353,25 @@ type winZipCounter struct {
 }
 
 func newWinZipCounter(block cipher.Block) *winZipCounter {
-	// Counter starts at 1
 	c := &winZipCounter{
 		block:  block,
 		buffer: make([]byte, aes.BlockSize),
 	}
-	c.counter[0] = 1
+	c.counter[0] = 1 // Initial counter value
 	return c
 }
 
 func (c *winZipCounter) XORKeyStream(dst, src []byte) {
 	for i := range src {
 		if c.pos == 0 {
-			// Encrypt counter to generate keystream
+			// Encrypt counter to generate keystream block
 			c.block.Encrypt(c.buffer[:], c.counter[:])
+
 			// Increment counter (Little Endian 128-bit)
-			for j := range aes256SaltSize {
+			for j := 0; j < aes.BlockSize; j++ {
 				c.counter[j]++
 				if c.counter[j] != 0 {
-					break
+					break // No carry, stop
 				}
 			}
 		}
@@ -366,11 +380,8 @@ func (c *winZipCounter) XORKeyStream(dst, src []byte) {
 	}
 }
 
-// key derives a key from the password, salt and iteration count, returning a
-// []byte of length keylen that can be used as cryptographic key. The key is
-// derived based on the method described as PBKDF2 with the HMAC variant using
-// the supplied hash function.
-func key(password, salt []byte, iter, keyLen int, h func() hash.Hash) []byte {
+// pbkdf2 implements PBKDF2 with the HMAC variant using the supplied hash function.
+func pbkdf2(password, salt []byte, iter, keyLen int, h func() hash.Hash) []byte {
 	prf := hmac.New(h, password)
 	hashLen := prf.Size()
 	numBlocks := (keyLen + hashLen - 1) / hashLen
@@ -378,10 +389,9 @@ func key(password, salt []byte, iter, keyLen int, h func() hash.Hash) []byte {
 	var buf [4]byte
 	dk := make([]byte, 0, numBlocks*hashLen)
 	U := make([]byte, hashLen)
+
 	for block := 1; block <= numBlocks; block++ {
-		// N.B.: || means concatenation, ^ means XOR
-		// for each block T_i = U_1 ^ U_2 ^ ... ^ U_iter
-		// U_1 = PRF(password, salt || uint(i))
+		// U_1 = PRF(password, salt || INT_32_BE(i))
 		prf.Reset()
 		prf.Write(salt)
 		buf[0] = byte(block >> 24)
@@ -390,6 +400,7 @@ func key(password, salt []byte, iter, keyLen int, h func() hash.Hash) []byte {
 		buf[3] = byte(block)
 		prf.Write(buf[:4])
 		dk = prf.Sum(dk)
+
 		T := dk[len(dk)-hashLen:]
 		copy(U, T)
 
