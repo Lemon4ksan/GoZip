@@ -9,14 +9,14 @@ Designed for high-load applications, GoZip focuses on **concurrency**, **memory 
 
 ## ⚡ Performance Benchmarks
 
-GoZip is significantly faster than the standard `archive/zip` library in parallel mode, scaling linearly with CPU cores.
+GoZip achieves performance parity with the standard library in sequential mode while offering near-linear scalability in parallel mode.
 
 | Scenario | Standard Lib | GoZip (Sequential) | GoZip (Parallel 12 workers) |
 | :--- | :--- | :--- | :--- |
-**1000 Small Files (1KB)** | 20.5 ms | 390 ms* | **8.2 ms (2.5x faster)** |
-**10 Medium Files (10MB)** | 1.58 s | 2.20 s | **0.25 s (6.3x faster)** |
+| **1000 Small Files (1KB)** | 20 ms | 20 ms | **7.3 ms (2.8x faster)** |
+| **10 Medium Files (10MB)** | 1.60 s | 1.57 s | **0.25 s (6.4x faster)** |
 
-*\* Sequential mode prioritizes safety (path normalization, duplicate checks) and low memory footprint over raw speed for micro-files.*
+*Benchmarks run on **Intel Core i5-12400F** (6 cores, 12 threads).*
 
 ## 🚀 Key Features
 
@@ -69,8 +69,8 @@ func main() {
     out, _ := os.Create("backup.zip")
     defer out.Close()
 
-    // Write sequentially
-    if err := archive.Write(out); err != nil {
+    // Write sequentially to the output file
+    if _, err := archive.WriteTo(out); err != nil {
         panic(err)
     }
 }
@@ -78,7 +78,7 @@ func main() {
 
 ### 2. Parallel Archiving (High Speed) ⚡
 
-Use `WriteParallel` to utilize multiple CPU cores.
+Use `WriteToParallel` to utilize multiple CPU cores.
 
 ```go
 func main() {
@@ -89,7 +89,7 @@ func main() {
     defer out.Close()
 
     // Use all available CPU cores
-    err := archive.WriteParallel(out, runtime.NumCPU())
+    _, err := archive.WriteToParallel(out, runtime.NumCPU())
     if err != nil {
         panic(err)
     }
@@ -109,7 +109,7 @@ func main() {
     defer f.Close()
 
     // Parse structure
-    if err := archive.ReadFile(f); err != nil {
+    if err := archive.LoadFromFile(f); err != nil {
         panic(err)
     }
 
@@ -118,7 +118,7 @@ func main() {
     archive.RemoveDir("temp_cache") // Recursive removal
 
     // 2. Rename/Move files
-    if file := archive.GetFile("images/old_logo.png"); file != nil {
+    if file, err := archive.File("images/old_logo.png"); err == nil {
         // Move to new folder and rename
         archive.Move(file, "assets/graphics")
         archive.Rename(file, "new_logo.png")
@@ -132,7 +132,7 @@ func main() {
     defer out.Close()
 
     // Zero-copy optimization: unaltered files are copied directly without re-compression
-    archive.Write(out)
+    archive.WriteTo(out)
 }
 ```
 
@@ -145,7 +145,7 @@ func main() {
     archive := gozip.NewZip()
     f, _ := os.Open("huge_backup.zip")
     defer f.Close()
-    archive.ReadFile(f)
+    archive.LoadFromFile(f)
 
     // Create a context with a 30-second timeout
     ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -180,7 +180,7 @@ func main() {
     archive.AddFromPath("secret.pdf")
 
     out, _ := os.Create("secure.zip")
-    archive.Write(out)
+    archive.WriteTo(out)
 }
 ```
 
@@ -198,7 +198,7 @@ func main() {
     })
 
     f, _ := os.Open("old_dos_archive.zip")
-    archive.ReadFile(f)
+    archive.LoadFromFile(f)
 
     // Filenames are now correctly converted to UTF-8
     archive.Extract("output")
