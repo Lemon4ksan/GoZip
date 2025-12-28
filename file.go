@@ -92,7 +92,7 @@ func newFileFromOS(f *os.File) (*File, error) {
 		isDir:            stat.IsDir(),
 		mode:             stat.Mode(),
 		metadata:         sys.GetFileMetadata(stat),
-		hostSystem:       sys.GetHostSystem(f.Fd()),
+		hostSystem:       sys.DefaultHostSystem,
 		extraField:       make(map[uint16][]byte),
 		openFunc: func() (io.ReadCloser, error) {
 			// NopCloser to prevent the caller from closing the original file handle
@@ -103,35 +103,47 @@ func newFileFromOS(f *os.File) (*File, error) {
 
 // newFileFromPath creates a File object by opening the file at the given path.
 func newFileFromPath(filePath string) (*File, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	stat, err := f.Stat()
+	info, err := os.Lstat(filePath)
 	if err != nil {
 		return nil, err
 	}
 
 	var uncompressedSize int64
-	if !stat.IsDir() {
-		uncompressedSize = stat.Size()
+	var isSymlink = info.Mode()&fs.ModeSymlink != 0
+	var linkTarget string
+
+	if isSymlink {
+		linkTarget, err = os.Readlink(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("read link: %w", err)
+		}
+		uncompressedSize = int64(len(linkTarget))
+	} else if !info.IsDir() {
+		uncompressedSize = info.Size()
 	}
 
-	return &File{
-		name:             stat.Name(),
+	f := &File{
+		name:             info.Name(),
 		uncompressedSize: uncompressedSize,
-		modTime:          stat.ModTime(),
-		isDir:            stat.IsDir(),
-		mode:             stat.Mode(),
-		metadata:         sys.GetFileMetadata(stat),
-		hostSystem:       sys.GetHostSystem(f.Fd()),
+		modTime:          info.ModTime(),
+		isDir:            info.IsDir(),
+		mode:             info.Mode(),
+		metadata:         sys.GetFileMetadata(info),
+		hostSystem:       sys.DefaultHostSystem,
 		extraField:       make(map[uint16][]byte),
-		openFunc: func() (io.ReadCloser, error) {
+	}
+
+	if isSymlink {
+		f.openFunc = func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(linkTarget)), nil
+		}
+	} else if !f.isDir {
+		f.openFunc = func() (io.ReadCloser, error) {
 			return os.Open(filePath)
-		},
-	}, nil
+		}
+	}
+
+	return f, nil
 }
 
 // newFileFromReader creates a File object from an arbitrary [io.Reader] source.
@@ -151,7 +163,7 @@ func newFileFromReader(src io.Reader, name string, size int64) (*File, error) {
 		mode:             0644,
 		uncompressedSize: size,
 		modTime:          time.Now(),
-		hostSystem:       sys.GetHostSystemByOS(),
+		hostSystem:       sys.DefaultHostSystem,
 		extraField:       make(map[uint16][]byte),
 		openFunc: func() (io.ReadCloser, error) {
 			return io.NopCloser(src), nil
@@ -169,7 +181,7 @@ func newDirectoryFile(name string) (*File, error) {
 		name:       name,
 		isDir:      true,
 		mode:       0755 | fs.ModeDir,
-		hostSystem: sys.GetHostSystemByOS(),
+		hostSystem: sys.DefaultHostSystem,
 		modTime:    time.Now(),
 		extraField: make(map[uint16][]byte),
 	}, nil

@@ -11,21 +11,15 @@ import (
 	"syscall"
 )
 
+const DefaultHostSystem = HostSystemFAT
+
 func GetFileMetadata(stat os.FileInfo) map[string]interface{} {
 	metadata := make(map[string]interface{})
 	if s, ok := stat.Sys().(*syscall.Win32FileAttributeData); ok {
-		metadata["LastWriteTime"] = uint64(s.LastWriteTime.Nanoseconds()/100) + 116444736000000000
-		metadata["LastAccessTime"] = uint64(s.LastAccessTime.Nanoseconds()/100) + 116444736000000000
-		metadata["CreationTime"] = uint64(s.CreationTime.Nanoseconds()/100) + 116444736000000000
+		metadata["LastWriteTime"] = uint64(s.LastWriteTime.HighDateTime)<<32 | uint64(s.LastWriteTime.LowDateTime)
+		metadata["LastAccessTime"] = uint64(s.LastAccessTime.HighDateTime)<<32 | uint64(s.LastAccessTime.LowDateTime)
+		metadata["CreationTime"] = uint64(s.CreationTime.HighDateTime)<<32 | uint64(s.CreationTime.LowDateTime)
 		metadata["FileAttributes"] = s.FileAttributes
 	}
 	return metadata
-}
-
-func GetHostSystem(_ uintptr) HostSystem {
-	return GetHostSystemByOS()
-}
-
-func GetHostSystemByOS() HostSystem {
-	return HostSystemFAT
 }

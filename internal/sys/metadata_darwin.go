@@ -17,12 +17,9 @@ func GetFileMetadata(stat os.FileInfo) map[string]interface{} {
 		return nil
 	}
 
-	meta := map[string]interface{}{
+	return map[string]interface{}{
 		"LastAccessTime": unixNanoToWinFiletime(int64(s.Atimespec.Sec), int64(s.Atimespec.Nsec)),
 		"LastWriteTime":  unixNanoToWinFiletime(int64(s.Mtimespec.Sec), int64(s.Mtimespec.Nsec)),
+		"CreationTime":   unixNanoToWinFiletime(int64(s.Birthtimespec.Sec), int64(s.Birthtimespec.Nsec)),
 	}
-
-	meta["CreationTime"] = unixNanoToWinFiletime(int64(s.Birthtimespec.Sec), int64(s.Birthtimespec.Nsec))
-
-	return meta
 }

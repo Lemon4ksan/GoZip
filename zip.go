@@ -553,7 +553,7 @@ func (z *Zip) AddOSFile(f *os.File, options ...AddOption) error {
 }
 
 // AddFromPath adds a file from the local filesystem to the archive.
-// Opens, reads, and closes the file automatically.
+// Opens, reads, and closes the file automatically. Symlinks aren't followed.
 func (z *Zip) AddFromPath(path string, options ...AddOption) error {
 	fileEntry, err := newFileFromPath(path)
 	if err != nil {
