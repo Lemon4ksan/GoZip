@@ -122,17 +122,18 @@ func TestNewFileFromCentralDir_Zip64(t *testing.T) {
 		CompressedSize:    math.MaxUint32,
 		LocalHeaderOffset: math.MaxUint32,
 		Filename:          "large_file.dat",
-		ExtraField:        make(map[uint16][]byte),
+		ExtraField:        make([]byte, 0),
 	}
 
-	// Construct the Zip64 Extra Field payload (WITHOUT Tag/Size header)
+	// Construct the Zip64 Extra Field payload
 	// The map value in internal.CentralDirectory stores only the data payload.
 	extraPayload := new(bytes.Buffer)
+	binary.Write(extraPayload, binary.LittleEndian, []byte{0x01, 0x00, 0x18, 0x00})
 	binary.Write(extraPayload, binary.LittleEndian, uint64(5000000000)) // Real Uncompressed > 4GB
 	binary.Write(extraPayload, binary.LittleEndian, uint64(4000000000)) // Real Compressed
 	binary.Write(extraPayload, binary.LittleEndian, uint64(1000000000)) // Real Offset
 
-	cd.ExtraField[Zip64ExtraFieldTag] = extraPayload.Bytes()
+	cd.ExtraField = extraPayload.Bytes()
 
 	zr := &zipReader{}
 	f := zr.newFileFromCentralDir(cd)

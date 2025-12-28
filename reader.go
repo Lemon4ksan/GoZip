@@ -232,62 +232,60 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 		filename = strings.TrimSuffix(filename, "/")
 	}
 
-	uncompressedSize := uint64(entry.UncompressedSize)
-	compressedSize := uint64(entry.CompressedSize)
-	localHeaderOffset := uint64(entry.LocalHeaderOffset)
-
-	// Process ZIP64 Extra Field if present
-	if zip64Data, ok := entry.ExtraField[Zip64ExtraFieldTag]; ok {
-		pos := 0
-
-		if uncompressedSize == math.MaxUint32 {
-			if len(zip64Data) >= pos+8 {
-				uncompressedSize = binary.LittleEndian.Uint64(zip64Data[pos : pos+8])
-				pos += 8
-			}
-		}
-		if compressedSize == math.MaxUint32 {
-			if len(zip64Data) >= pos+8 {
-				compressedSize = binary.LittleEndian.Uint64(zip64Data[pos : pos+8])
-				pos += 8
-			}
-		}
-		if localHeaderOffset == math.MaxUint32 {
-			if len(zip64Data) >= pos+8 {
-				localHeaderOffset = binary.LittleEndian.Uint64(zip64Data[pos : pos+8])
-				pos += 8
-			}
-		}
-	}
-
-	var encryptionMethod EncryptionMethod
-	compressionMethod := entry.CompressionMethod
-	switch {
-	case entry.CompressionMethod == winZipAESMarker:
-		if extraField, ok := entry.ExtraField[AESEncryptionTag]; ok && len(extraField) >= 11 {
-			compressionMethod = binary.LittleEndian.Uint16(extraField[9:11])
-			encryptionMethod = AES256
-		}
-	case (entry.GeneralPurposeBitFlag & 0x1) != 0:
-		encryptionMethod = ZipCrypto
-	}
-
 	f := &File{
 		name:              filename,
 		isDir:             isDir,
 		mode:              parseFileExternalAttributes(entry),
-		uncompressedSize:  int64(uncompressedSize),
-		compressedSize:    int64(compressedSize),
+		uncompressedSize:  int64(entry.UncompressedSize),
+		compressedSize:    int64(entry.CompressedSize),
 		crc32:             entry.CRC32,
-		localHeaderOffset: int64(localHeaderOffset),
+		localHeaderOffset: int64(entry.LocalHeaderOffset),
 		hostSystem:        sys.HostSystem(entry.VersionMadeBy >> 8),
 		modTime:           msDosToTime(entry.LastModFileDate, entry.LastModFileTime),
-		extraField:        entry.ExtraField,
-		config: FileConfig{
-			CompressionMethod: CompressionMethod(compressionMethod),
-			EncryptionMethod:  encryptionMethod,
-			Comment:           comment,
-		},
+		extraFieldRaw:     entry.ExtraField,
+	}
+
+	var encryptionMethod EncryptionMethod
+	compressionMethod := entry.CompressionMethod
+
+	payload := entry.ExtraField
+	for offset := 0; offset < len(entry.ExtraField); {
+		if offset+4 > len(entry.ExtraField) {
+			break
+		}
+
+		tag := binary.LittleEndian.Uint16(entry.ExtraField[offset : offset+2])
+		size := int(binary.LittleEndian.Uint16(entry.ExtraField[offset+2 : offset+4]))
+
+		offset += 4
+		if offset+size > len(entry.ExtraField) {
+			break
+		}
+
+		data := payload[offset : offset+size]
+
+		switch tag {
+		case Zip64ExtraFieldTag:
+			zr.parseZip64(f, data, entry)
+
+		case AESEncryptionTag:
+			if len(data) >= 7 {
+				compressionMethod = binary.LittleEndian.Uint16(data[5:7])
+				encryptionMethod = AES256
+			}
+		}
+
+		offset += size
+	}
+
+	if (entry.GeneralPurposeBitFlag&0x1) != 0 && encryptionMethod == NotEncrypted {
+		encryptionMethod = ZipCrypto
+	}
+
+	f.config = FileConfig{
+		CompressionMethod: CompressionMethod(compressionMethod),
+		EncryptionMethod:  encryptionMethod,
+		Comment:           comment,
 	}
 	f.srcConfig = f.config
 
@@ -393,6 +391,29 @@ func (zr *zipReader) verifySignature(r io.Reader, s uint32) bool {
 		return false
 	}
 	return binary.LittleEndian.Uint32(buf[:]) == s
+}
+
+func (zr *zipReader) parseZip64(f *File, data []byte, entry internal.CentralDirectory) {
+	pos := 0
+
+	if entry.UncompressedSize == math.MaxUint32 {
+		if len(data) >= pos+8 {
+			f.uncompressedSize = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
+			pos += 8
+		}
+	}
+	if entry.CompressedSize == math.MaxUint32 {
+		if len(data) >= pos+8 {
+			f.compressedSize = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
+			pos += 8
+		}
+	}
+	if entry.LocalHeaderOffset == math.MaxUint32 {
+		if len(data) >= pos+8 {
+			f.localHeaderOffset = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
+			pos += 8
+		}
+	}
 }
 
 func parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {

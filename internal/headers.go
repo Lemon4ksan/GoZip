@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"slices"
 )
 
 // Each record type must be identified using a header signature that identifies the record type.
@@ -40,7 +39,6 @@ type LocalFileHeader struct {
 }
 
 func (h LocalFileHeader) Encode() []byte {
-	// Fixed size (30 bytes) + variable filename length
 	size := 30 + h.FilenameLength + h.ExtraFieldLength
 	buf := make([]byte, size)
 	
@@ -80,7 +78,7 @@ type CentralDirectory struct {
 	ExternalFileAttributes uint32
 	LocalHeaderOffset      uint32
 	Filename               string
-	ExtraField             map[uint16][]byte
+	ExtraField             []byte
 	Comment                string
 }
 
@@ -118,12 +116,11 @@ func ReadCentralDirEntry(src io.Reader) (CentralDirectory, error) {
 	}
 
 	if entry.ExtraFieldLength > 0 {
-		extraField := make([]byte, entry.ExtraFieldLength)
-		if _, err := io.ReadFull(src, extraField); err != nil {
-			return CentralDirectory{}, fmt.Errorf("read extra field: %w", err)
-		}
-		entry.ExtraField = parseExtraField(extraField)
-	}
+        entry.ExtraField = make([]byte, entry.ExtraFieldLength)
+        if _, err := io.ReadFull(src, entry.ExtraField); err != nil {
+            return CentralDirectory{}, fmt.Errorf("read extra field: %w", err)
+        }
+    }
 
 	if entry.FileCommentLength > 0 {
 		comment := make([]byte, entry.FileCommentLength)
@@ -161,13 +158,7 @@ func (d CentralDirectory) Encode() []byte {
 	offset := 46
 
 	offset += copy(buf[offset:], d.Filename)
-
-	// Determine deterministic order for extra fields
-	sortedFields := getSortedExtraField(d.ExtraField)
-	for _, entry := range sortedFields {
-		offset += copy(buf[offset:], entry)
-	}
-
+	offset += copy(buf[offset:], d.ExtraField)
 	copy(buf[offset:], d.Comment)
 
 	return buf
@@ -301,45 +292,4 @@ func EncodeZip64EndOfCentralDirLocator(endOfCentralDirOffset uint64) []byte {
 	binary.LittleEndian.PutUint32(buf[16:20], 1)
 
 	return buf
-}
-
-// getSortedExtraField returns a sorted slice of extra fields for deterministic writes.
-func getSortedExtraField(extraField map[uint16][]byte) [][]byte {
-	if len(extraField) == 0 {
-		return nil
-	}
-	keys := make([]uint16, 0, len(extraField))
-	for key := range extraField {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-
-	fields := make([][]byte, len(extraField))
-	for i, key := range keys {
-		fields[i] = extraField[key]
-	}
-	return fields
-}
-
-// parseExtraField converts raw extra field bytes into a map keyed by tag IDs.
-func parseExtraField(extraField []byte) map[uint16][]byte {
-	m := make(map[uint16][]byte)
-
-	for offset := 0; offset < len(extraField); {
-		if offset+4 > len(extraField) {
-			break
-		}
-
-		tag := binary.LittleEndian.Uint16(extraField[offset : offset+2])
-		size := int(binary.LittleEndian.Uint16(extraField[offset+2 : offset+4]))
-
-		offset += 4
-		if offset+size > len(extraField) {
-			break
-		}
-
-		m[tag] = extraField[offset-4 : offset+size]
-		offset += size
-	}
-	return m
 }

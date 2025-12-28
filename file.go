@@ -11,7 +11,9 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lemon4ksan/gozip/internal"
@@ -64,9 +66,11 @@ type File struct {
 	localHeaderOffset int64          // Byte offset of this file's local header within archive
 	hostSystem        sys.HostSystem // Operating system that created the file (for attribute mapping)
 
-	modTime    time.Time              // File modification time (best available precision)
-	metadata   map[string]interface{} // Platform-specific metadata (NTFS timestamps, etc.)
-	extraField map[uint16][]byte      // ZIP extra fields for extended functionality
+	modTime        time.Time              // File modification time (best available precision)
+	metadata       map[string]interface{} // Platform-specific metadata (NTFS timestamps, etc.)
+	extraField     map[uint16][]byte      // ZIP extra fields for extended functionality
+	extraFieldRaw  []byte                 // Raw extra field data
+	extraParseOnce sync.Once              // Sync for map initialization
 }
 
 // newFileFromOS creates a File object from an already opened [os.File] handle.
@@ -245,10 +249,17 @@ func (f *File) OpenWithPassword(pwd string) (io.ReadCloser, error) {
 }
 
 // HasExtraField checks whether an extra field with the specified tag exists.
-func (f *File) HasExtraField(tag uint16) bool { _, ok := f.extraField[tag]; return ok }
+func (f *File) HasExtraField(tag uint16) bool {
+	f.ensureExtraParsed()
+	_, ok := f.extraField[tag]
+	return ok
+}
 
 // GetExtraField retrieves the raw bytes of an extra field by its tag ID.
-func (f *File) GetExtraField(tag uint16) []byte { return f.extraField[tag] }
+func (f *File) GetExtraField(tag uint16) []byte {
+	f.ensureExtraParsed()
+	return f.extraField[tag]
+}
 
 // SetConfig applies a FileConfig to this file, overriding individual properties.
 func (f *File) SetConfig(config FileConfig) {
@@ -271,6 +282,7 @@ func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) {
 // SetExtraField adds or replaces an extra field entry for this file.
 // Returns an error if adding the field would exceed the maximum extra field length.
 func (f *File) SetExtraField(tag uint16, data []byte) error {
+	f.ensureExtraParsed()
 	currentLen := f.getExtraFieldLength()
 
 	// If replacing, subtract the size of the old field
@@ -282,6 +294,8 @@ func (f *File) SetExtraField(tag uint16, data []byte) error {
 		return ErrExtraFieldTooLong
 	}
 	f.extraField[tag] = data
+	f.extraFieldRaw = nil
+
 	return nil
 }
 
@@ -294,6 +308,9 @@ func (f *File) RequiresZip64() bool {
 
 // getExtraFieldLength calculates the total size of all extra field entries.
 func (f *File) getExtraFieldLength() int {
+	if f.extraField == nil {
+		return len(f.extraFieldRaw)
+	}
 	var size int
 	for _, entry := range f.extraField {
 		size += len(entry)
@@ -327,6 +344,19 @@ func (f *File) shouldCopyRaw() bool {
 		}
 	}
 	return true
+}
+
+// ensureExtraParsed ensures that extraFiled is initialized and parsed.
+func (f *File) ensureExtraParsed() {
+	f.extraParseOnce.Do(func() {
+		if f.extraField == nil {
+			if len(f.extraFieldRaw) > 0 {
+				f.extraField = parseExtraField(f.extraFieldRaw)
+			} else {
+				f.extraField = make(map[uint16][]byte)
+			}
+		}
+	})
 }
 
 // zipHeaders is responsible for generating ZIP format headers from File metadata.
@@ -364,6 +394,12 @@ func (zh *zipHeaders) LocalHeader() internal.LocalFileHeader {
 func (zh *zipHeaders) CentralDirEntry() internal.CentralDirectory {
 	dosDate, dosTime := timeToMsDos(zh.file.modTime)
 	filename := zh.file.getFilename()
+	var extraField []byte
+	if zh.file.extraField == nil {
+		extraField = zh.file.extraFieldRaw
+	} else {
+		extraField = zh.buildExtraFieldBytes()
+	}
 
 	return internal.CentralDirectory{
 		VersionMadeBy:          zh.getVersionMadeBy(),
@@ -376,14 +412,14 @@ func (zh *zipHeaders) CentralDirEntry() internal.CentralDirectory {
 		CompressedSize:         uint32(min(math.MaxUint32, zh.file.compressedSize)),
 		UncompressedSize:       uint32(min(math.MaxUint32, zh.file.uncompressedSize)),
 		FilenameLength:         uint16(len(filename)),
-		ExtraFieldLength:       uint16(zh.file.getExtraFieldLength()),
+		ExtraFieldLength:       uint16(len(extraField)),
 		FileCommentLength:      uint16(len(zh.file.config.Comment)),
 		DiskNumberStart:        0,
 		InternalFileAttributes: 0,
 		ExternalFileAttributes: zh.getExternalFileAttributes(),
 		LocalHeaderOffset:      uint32(min(math.MaxUint32, zh.file.localHeaderOffset)),
 		Filename:               filename,
-		ExtraField:             zh.file.extraField,
+		ExtraField:             extraField,
 		Comment:                zh.file.config.Comment,
 	}
 }
@@ -514,14 +550,64 @@ func (zh *zipHeaders) buildLocalExtraData() []byte {
 	return buf
 }
 
-func encodeZip64LocalExtraField(f *File) []byte {
-	// Fixed size: Tag(2) + Size(2) + Uncompressed(8) + Compressed(8) = 20 bytes
-	data := make([]byte, 20)
+func (zh *zipHeaders) buildExtraFieldBytes() []byte {
+	if zh.file.extraField == nil {
+		return zh.file.extraFieldRaw
+	}
+	var buf []byte
+	sorted := getSortedExtraField(zh.file.extraField)
+	for _, b := range sorted {
+		buf = append(buf, b...)
+	}
+	return buf
+}
 
+func encodeZip64LocalExtraField(f *File) []byte {
+	var data [20]byte
 	binary.LittleEndian.PutUint16(data[0:2], Zip64ExtraFieldTag)
 	binary.LittleEndian.PutUint16(data[2:4], 16) // Size of payload
 	binary.LittleEndian.PutUint64(data[4:12], uint64(f.uncompressedSize))
 	binary.LittleEndian.PutUint64(data[12:20], uint64(f.compressedSize))
+	return data[:]
+}
 
-	return data
+// getSortedExtraField returns a sorted slice of extra fields for deterministic writes.
+func getSortedExtraField(extraField map[uint16][]byte) [][]byte {
+	if len(extraField) == 0 {
+		return nil
+	}
+	keys := make([]uint16, 0, len(extraField))
+	for key := range extraField {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	fields := make([][]byte, len(extraField))
+	for i, key := range keys {
+		fields[i] = extraField[key]
+	}
+	return fields
+}
+
+// parseExtraField converts raw extra field bytes into a map keyed by tag IDs.
+func parseExtraField(extraField []byte) map[uint16][]byte {
+	m := make(map[uint16][]byte)
+
+	for offset := 0; offset < len(extraField); {
+		if offset+4 > len(extraField) {
+			break
+		}
+
+		tag := binary.LittleEndian.Uint16(extraField[offset : offset+2])
+		size := int(binary.LittleEndian.Uint16(extraField[offset+2 : offset+4]))
+
+		offset += 4
+		if offset+size > len(extraField) {
+			break
+		}
+
+		m[tag] = extraField[offset-4 : offset+size]
+		offset += size
+	}
+	return m
 }
