@@ -50,16 +50,16 @@ type File struct {
 	mode  fs.FileMode // Unix-style file permissions and type bits
 	flags uint16      // Internal flags state
 
-	openFunc   func() (io.ReadCloser, error)     // Factory function for reading original content
-	sourceFunc func() (*io.SectionReader, error) // Factory function for reading uncompressed content
+	openFunc func() (io.ReadCloser, error)     // Factory function for reading decompressed content
+	srcFunc  func() (*io.SectionReader, error) // Factory function for reading original content
 
 	uncompressedSize int64  // Size of original content before compression in bytes
 	compressedSize   int64  // Size of compressed data within archive in bytes
 	crc32            uint32 // CRC-32 checksum of uncompressed data
 
 	// Per-file configuration overriding archive defaults
-	config       FileConfig
-	sourceConfig FileConfig
+	config    FileConfig
+	srcConfig FileConfig
 
 	localHeaderOffset int64          // Byte offset of this file's local header within archive
 	hostSystem        sys.HostSystem // Operating system that created the file (for attribute mapping)
@@ -225,6 +225,13 @@ func (f *File) FsTime() (mtime, atime, ctime time.Time) {
 // Open returns a ReadCloser for reading the original, uncompressed file content.
 func (f *File) Open() (io.ReadCloser, error) { return f.openFunc() }
 
+// Open returns a ReadCloser object for reading the original,
+// uncompressed file content using the specified password.
+func (f *File) OpenWithPassword(pwd string) (io.ReadCloser, error) {
+	f.config.Password = pwd
+	return f.openFunc()
+}
+
 // HasExtraField checks whether an extra field with the specified tag exists.
 func (f *File) HasExtraField(tag uint16) bool { _, ok := f.extraField[tag]; return ok }
 
@@ -233,9 +240,6 @@ func (f *File) GetExtraField(tag uint16) []byte { return f.extraField[tag] }
 
 // SetConfig applies a FileConfig to this file, overriding individual properties.
 func (f *File) SetConfig(config FileConfig) {
-	if config.Name != "" {
-		f.name = config.Name
-	}
 	if !f.isDir {
 		f.config.CompressionMethod = config.CompressionMethod
 		f.config.CompressionLevel = config.CompressionLevel
@@ -246,8 +250,9 @@ func (f *File) SetConfig(config FileConfig) {
 }
 
 // SetOpenFunc replaces the internal function used to open the file's content.
+// Note that internal file sizes will be updated only after the archive is written.
 func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) {
-	f.sourceFunc = nil
+	f.srcFunc = nil
 	f.openFunc = openFunc
 }
 
@@ -294,18 +299,18 @@ func (f *File) getFilename() string {
 
 // shouldCopyRaw checks if we can optimize by copying raw compressed data directly.
 func (f *File) shouldCopyRaw() bool {
-	if f.sourceFunc == nil {
+	if f.srcFunc == nil {
 		return false
 	}
 	// Configuration must match exactly to allow raw copy
-	if f.config.CompressionMethod != f.sourceConfig.CompressionMethod {
+	if f.config.CompressionMethod != f.srcConfig.CompressionMethod {
 		return false
 	}
-	if f.config.EncryptionMethod != f.sourceConfig.EncryptionMethod {
+	if f.config.EncryptionMethod != f.srcConfig.EncryptionMethod {
 		return false
 	}
 	if f.config.EncryptionMethod != NotEncrypted {
-		if f.config.Password != f.sourceConfig.Password {
+		if f.config.Password != f.srcConfig.Password {
 			return false
 		}
 	}

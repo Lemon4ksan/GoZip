@@ -285,12 +285,11 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 		extraField:        entry.ExtraField,
 		config: FileConfig{
 			CompressionMethod: CompressionMethod(compressionMethod),
-			Name:              filename,
-			Comment:           comment,
 			EncryptionMethod:  encryptionMethod,
+			Comment:           comment,
 		},
 	}
-	f.sourceConfig = f.config
+	f.srcConfig = f.config
 
 	// openFunc prepares the file for decompression
 	f.openFunc = func() (io.ReadCloser, error) {
@@ -298,7 +297,7 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 	}
 
 	// sourceFunc extracts the raw compressed data (e.g., for optimized copying)
-	f.sourceFunc = func() (*io.SectionReader, error) {
+	f.srcFunc = func() (*io.SectionReader, error) {
 		// We must read the Local Header to find the exact data offset, as
 		// extra fields in Local Header may differ from Central Directory.
 		headerReader := io.NewSectionReader(zr.src, f.localHeaderOffset, localHeaderLen)

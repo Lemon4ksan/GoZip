@@ -190,17 +190,17 @@ func (zw *zipWriter) writeDataDescriptor(file *File) error {
 	if _, err := zw.dest.Write(buf); err != nil {
 		return fmt.Errorf("write data descriptor: %w", err)
 	}
-	
+
 	// Track offset for Central Directory (though usually CD offset calculation handles this)
 	zw.headerOffset += int64(len(buf))
-	
+
 	return nil
 }
 
 // encodeAndUpdateFile runs the compression/encryption pipeline.
 func (zw *zipWriter) encodeAndUpdateFile(file *File, writer io.Writer) error {
 	if file.shouldCopyRaw() {
-		src, err := file.sourceFunc()
+		src, err := file.srcFunc()
 		if err != nil {
 			return err
 		}
@@ -289,7 +289,7 @@ func (zw *zipWriter) encodeWithSeeker(src io.ReadSeeker, dest io.Writer, cfg Fil
 	}
 
 	counter := &byteCountWriter{dest: dest}
-	
+
 	encryptor, err := zw.createEncryptor(counter, cfg, stats.crc32)
 	if err != nil {
 		return stats, err
@@ -587,14 +587,14 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 				// We MUST populate all results channels.
 			case inflightSem <- struct{}{}:
 			}
-			
+
 			// If context is dead, fast-path the result
 			if ctx.Err() != nil {
 				results[i] <- zipResult{file: f, err: ctx.Err()}
 				close(results[i])
 				continue
 			}
-			
+
 			wg.Add(1)
 			go func(idx int, f *File) {
 				defer wg.Done()
@@ -617,7 +617,7 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 			}(i, f)
 		}
 	}()
-	// We cheat slightly: we don't wg.Wait() the spawner because the writer loop 
+	// We cheat slightly: we don't wg.Wait() the spawner because the writer loop
 	// knows exactly how many files to expect (len(files)).
 
 	for _, resultChan := range results {
@@ -694,7 +694,7 @@ func (pzw *parallelZipWriter) compressFile(ctx context.Context, file *File) (io.
 	}
 
 	if file.shouldCopyRaw() {
-		src, err := file.sourceFunc()
+		src, err := file.srcFunc()
 		if err != nil {
 			cleanup()
 			return nil, err

@@ -33,7 +33,7 @@ func TestRoundTrip_Sequential(t *testing.T) {
 		"hello.txt":       "Hello World",
 		"dir/":            "",
 		"dir/nested.json": "{}",
-		"images/":          "",
+		"images/":         "",
 		"images/logo.png": string([]byte{0x89, 0x50, 0x4E, 0x47}),
 	}
 
@@ -76,7 +76,7 @@ func TestRoundTrip_Parallel(t *testing.T) {
 func TestRoundTrip_AES256(t *testing.T) {
 	password := "secure_pass"
 	buf := new(bytes.Buffer)
-	
+
 	archive := gozip.NewZip()
 	archive.SetConfig(gozip.ZipConfig{
 		EncryptionMethod: gozip.AES256,
@@ -93,7 +93,7 @@ func TestRoundTrip_AES256(t *testing.T) {
 
 	readArchive := gozip.NewZip()
 	readArchive.SetConfig(gozip.ZipConfig{Password: password})
-	
+
 	if err := readArchive.Load(bytes.NewReader(buf.Bytes()), int64(buf.Len())); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestRoundTrip_AES256(t *testing.T) {
 	if err != nil {
 		t.Fatalf("File not found: %v", err)
 	}
-	
+
 	rc, err := f.Open()
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -145,7 +145,7 @@ func verifyZipContent(t *testing.T, data []byte, expectedFiles map[string]string
 		if err != nil {
 			t.Fatalf("std lib f.Open(%s): %v", f.Name, err)
 		}
-		
+
 		got, err := io.ReadAll(rc)
 		rc.Close()
 		if err != nil {

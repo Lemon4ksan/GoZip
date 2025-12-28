@@ -88,19 +88,19 @@ type ZipConfig struct {
 	// 0 = Store (no compression), 9 = Best compression.
 	CompressionLevel int
 
-	// Password is the default credentials for encrypting the archive.
-	Password string
-
 	// EncryptionMethod is the default encryption algorithm.
 	// Recommended: AES256.
 	EncryptionMethod EncryptionMethod
 
-	// FileSortStrategy defines the order of files in the written archive.
-	// Optimization strategies: Name (standard), Size (packing), or Directory (streaming).
-	FileSortStrategy FileSortStrategy
+	// Password is the default credentials for encrypting the archive.
+	Password string
 
 	// Comment is the archive-level comment (max 65535 bytes).
 	Comment string
+
+	// FileSortStrategy defines the order of files in the written archive.
+	// Optimization strategies: Name (standard), Size (packing), or Directory (streaming).
+	FileSortStrategy FileSortStrategy
 
 	// TextEncoding handles filename decoding for non-UTF8 legacy archives.
 	// Default: CP437 (IBM PC).
@@ -115,20 +115,17 @@ type ZipConfig struct {
 // FileConfig defines configuration specific to a single archive entry.
 // It overrides the global ZipConfig.
 type FileConfig struct {
-	// Name is the internal path in the ZIP. Forward slashes are enforced.
-	Name string
-
-	// Password overrides the global archive password for this file.
-	Password string
-
 	// CompressionMethod overrides the global default.
 	CompressionMethod CompressionMethod
+
+	// CompressionLevel overrides the global default.
+	CompressionLevel int
 
 	// EncryptionMethod overrides the global default.
 	EncryptionMethod EncryptionMethod
 
-	// CompressionLevel overrides the global default.
-	CompressionLevel int
+	// Password overrides the global archive password for this file.
+	Password string
 
 	// Comment is a file-specific comment (max 65535 bytes).
 	Comment string
@@ -166,6 +163,17 @@ func WithEncryption(e EncryptionMethod, pwd string) AddOption {
 	}
 }
 
+// WithPassword sets the encryption password for a specific file.
+// If no encryption method is specified, it defaults to AES256.
+// Ignored for directories.
+func WithPassword(pwd string) AddOption {
+	return func(f *File) {
+		if !f.isDir {
+			f.config.Password = pwd
+		}
+	}
+}
+
 // WithName overrides the destination filename within the archive.
 // The name is automatically normalized to use forward slashes.
 func WithName(name string) AddOption {
@@ -177,7 +185,7 @@ func WithName(name string) AddOption {
 }
 
 // WithPath prepends a directory path to the file's name.
-// Useful for placing files into folders without modifying their base name.
+// The path is automatically normalized to use forward slashes.
 func WithPath(p string) AddOption {
 	return func(f *File) {
 		if p != "" && p != "." {
@@ -246,6 +254,11 @@ func WithoutDir(path string) ExtractOption {
 	}
 }
 
+// CompressorFactory creates a Compressor instance for a specific compression level.
+// The level parameter is typically 0-9, but interpretations vary by algorithm.
+// Implementations should normalize invalid levels to defaults.
+type CompressorFactory func(level int) Compressor
+
 // Compressor transforms raw data into compressed data.
 type Compressor interface {
 	// Compress reads from src and writes compressed data to dest.
@@ -281,7 +294,7 @@ type Zip struct {
 }
 
 // NewZip creates a ready-to-use empty ZIP archive.
-// Default support includes Store (NoCompression) and Deflate.
+// Default support includes Store (No Compression) and Deflate.
 func NewZip() *Zip {
 	return &Zip{
 		files:         make([]*File, 0),
@@ -320,14 +333,9 @@ func (z *Zip) RegisterDecompressor(method CompressionMethod, d Decompressor) {
 }
 
 // Files returns a copy of the list of files in the archive.
-// The slice is a copy, so appending to it will not affect the archive.
-// WARNING: Do not modify the 'Name' field of the returned Files directly,
-// as this will desynchronize the internal lookup cache. Use Rename() instead.
 func (z *Zip) Files() []*File {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
-
-	// Return a copy to prevent slice manipulation from affecting internal state
 	result := make([]*File, len(z.files))
 	copy(result, z.files)
 	return result
@@ -347,12 +355,7 @@ func (z *Zip) File(name string) (*File, error) {
 	}
 
 	for _, f := range z.files {
-		target := searchName
-		if f.isDir {
-			target += "/"
-		}
-
-		if f.getFilename() == target {
+		if f.name == searchName {
 			return f, nil
 		}
 	}
@@ -539,8 +542,8 @@ func (z *Zip) Move(file *File, newPath string) error {
 	return nil
 }
 
-// AddOSFile adds an open *os.File to the archive.
-// Uses the file's current read position and native OS metadata.
+// AddOSFile adds an open *os.File to the archive. Uses native OS metadata.
+// The whole file content will be added using io.SectionReader.
 func (z *Zip) AddOSFile(f *os.File, options ...AddOption) error {
 	fileEntry, err := newFileFromOS(f)
 	if err != nil {
@@ -863,7 +866,7 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 	files = sortAlphabetical(files)
 	z.mu.RUnlock()
 
-	callback := func (f *File, err error) {
+	callback := func(f *File, err error) {
 		if z.config.OnFileProcessed != nil {
 			z.config.OnFileProcessed(f, err)
 		}
@@ -933,7 +936,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 	files = sortAlphabetical(files)
 	z.mu.RUnlock()
 
-	callback := func (f *File, err error) {
+	callback := func(f *File, err error) {
 		if z.config.OnFileProcessed != nil {
 			z.config.OnFileProcessed(f, err)
 		}
@@ -1052,9 +1055,15 @@ func (z *Zip) addEntry(f *File, options []AddOption) error {
 		f.config.EncryptionMethod = z.config.EncryptionMethod
 		f.config.Password = z.config.Password
 	}
+
 	for _, opt := range options {
 		opt(f)
 	}
+
+	if f.config.Password != "" && f.config.EncryptionMethod == NotEncrypted {
+		f.config.EncryptionMethod = AES256
+	}
+
 	f.name = strings.TrimPrefix(path.Clean(strings.ReplaceAll(f.name, "\\", "/")), "/")
 
 	if len(f.name)+1 > math.MaxUint16 {
