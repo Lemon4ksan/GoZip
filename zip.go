@@ -857,9 +857,10 @@ func (z *Zip) Extract(path string, options ...ExtractOption) error {
 func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...ExtractOption) error {
 	path = filepath.Clean(path)
 	var errs []error
+	var dirsToRestore []*File 
 
 	z.mu.RLock()
-	files := z.Files() // Use public getter to get a copy
+	files := z.Files()
 	for _, opt := range options {
 		files = opt(files)
 	}
@@ -891,10 +892,18 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 		}
 
 		if f.isDir {
-			err := os.Mkdir(fpath, 0755)
+			err := os.MkdirAll(fpath, 0755)
 			if err != nil {
 				errs = append(errs, err)
+			} else {
+				dirsToRestore = append(dirsToRestore, f)
 			}
+			callback(f, err)
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(fpath), 0755); err != nil {
+			errs = append(errs, fmt.Errorf("create dir for %s: %w", f.name, err))
 			callback(f, err)
 			continue
 		}
@@ -912,6 +921,12 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...Ex
 		callback(f, err)
 	}
 
+	for i := len(dirsToRestore) - 1; i >= 0; i-- {
+		d := dirsToRestore[i]
+		dPath := filepath.Join(path, d.name)
+		os.Chtimes(dPath, time.Now(), d.modTime)
+	}
+
 	return errors.Join(errs...)
 }
 
@@ -925,6 +940,7 @@ func (z *Zip) ExtractParallel(path string, workers int, options ...ExtractOption
 func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, workers int, options ...ExtractOption) error {
 	var errs []error
 	var filesToExtract []*File
+	var dirsToRestore []*File 
 	dirsToCreate := make(map[string]*File)
 	path = filepath.Clean(path)
 
@@ -956,6 +972,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 
 		if f.isDir {
 			dirsToCreate[fpath] = f
+			dirsToRestore = append(dirsToRestore, f)
 			continue
 		}
 
@@ -1015,6 +1032,12 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 Finish:
 	wg.Wait()
 	close(errChan)
+
+	for i := len(dirsToRestore) - 1; i >= 0; i-- {
+		d := dirsToRestore[i]
+		dPath := filepath.Join(path, d.name)
+		os.Chtimes(dPath, time.Now(), d.modTime)
+	}
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1141,8 +1164,6 @@ func (z *Zip) extractFile(ctx context.Context, f *File, path string) error {
 	}
 	defer src.Close()
 
-	reader := &contextReader{ctx: ctx, r: src}
-
 	dst, err := os.Create(path)
 	if err != nil {
 		return err
@@ -1153,14 +1174,14 @@ func (z *Zip) extractFile(ctx context.Context, f *File, path string) error {
 		if err := dst.Truncate(f.uncompressedSize); err != nil {
 			return err
 		}
-	}
 
-	bufPtr := z.bufferPool.Get().(*[]byte)
-	_, err = io.CopyBuffer(dst, reader, *bufPtr)
-	z.bufferPool.Put(bufPtr)
+		bufPtr := z.bufferPool.Get().(*[]byte)
+		_, err = io.CopyBuffer(dst, &contextReader{ctx: ctx, r: src}, *bufPtr)
+		z.bufferPool.Put(bufPtr)
 
-	if err != nil {
-		return err
+		if err != nil {
+			return err
+		}
 	}
 
 	perm := f.mode & fs.ModePerm
