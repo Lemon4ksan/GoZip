@@ -468,7 +468,7 @@ func (zh *zipHeaders) getFileBitFlag() uint16 {
 		flag |= 0x1
 	}
 
-	if zh.file.config.CompressionMethod == Deflate {
+	if zh.file.config.CompressionMethod == Deflate && zh.file.uncompressedSize != 0 {
 		flag |= zh.getCompressionLevelBits()
 	}
 
@@ -482,6 +482,9 @@ func (zh *zipHeaders) getFileBitFlag() uint16 {
 }
 
 func (zh *zipHeaders) getCompressionMethod() uint16 {
+	if zh.file.uncompressedSize == 0 {
+		return uint16(Store)
+	}
 	if zh.file.config.EncryptionMethod == AES256 {
 		return winZipAESMarker
 	}
