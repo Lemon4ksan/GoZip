@@ -286,7 +286,7 @@ type decompressorsMap map[CompressionMethod]Decompressor
 type Zip struct {
 	mu            sync.RWMutex     // Guards files, fileCache, and config
 	config        ZipConfig        // Global settings
-	files         []*File          // Ordered list of entries
+	files         []*File          // List of parsed entries
 	fileCache     map[string]bool  // Lookup map for existence checks (normalized paths)
 	factories     factoriesMap     // Factories for creating new compressors (Method -> Factory)
 	decompressors decompressorsMap // Registered decompression codecs
@@ -330,6 +330,11 @@ func (z *Zip) RegisterDecompressor(method CompressionMethod, d Decompressor) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.decompressors[method] = d
+}
+
+// FS returns fs.FS for reading archive content.
+func (z *Zip) FS() fs.FS {
+	return &zipFS{z: z}
 }
 
 // Files returns a copy of the list of files in the archive.
@@ -601,6 +606,39 @@ func (z *Zip) AddFromDir(path string, options ...AddOption) error {
 		return errors.Join(errs...)
 	}
 	return nil
+}
+
+// AddFS adds files from an fs.FS (e.g., embed.FS, os.DirFS) to the archive.
+// It recursively walks the file system and adds all entries.
+func (z *Zip) AddFS(fileSystem fs.FS, options ...AddOption) error {
+	return fs.WalkDir(fileSystem, ".", func(filePath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if filePath == "." {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+
+		pathOpt := WithPath(path.Dir(filePath))
+
+		fileOpts := append([]AddOption{pathOpt}, options...)
+
+		if d.IsDir() {
+			return z.Mkdir(filePath, fileOpts...)
+		}
+
+		fileEntry, err := newFileFromFS(fileSystem, filePath, info)
+		if err != nil {
+			return err
+		}
+		
+		return z.addEntry(fileEntry, fileOpts)
+	})
 }
 
 // AddReader streams content from an io.Reader into the archive.

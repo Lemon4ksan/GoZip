@@ -191,6 +191,22 @@ func newDirectoryFile(name string) (*File, error) {
 	}, nil
 }
 
+// newFileFromFS creates a File object from an fs.FS entry.
+func newFileFromFS(fs fs.FS, filePath string, info fs.FileInfo) (*File, error) {
+	return &File{
+		name:             filePath,
+		uncompressedSize: info.Size(),
+		modTime:          info.ModTime(),
+		isDir:            false,
+		mode:             info.Mode(),
+		hostSystem:       sys.DefaultHostSystem,
+		extraField:       make(map[uint16][]byte),
+		openFunc: func() (io.ReadCloser, error) {
+			return fs.Open(filePath)
+		},
+	}, nil
+}
+
 // Name returns the file's path within the ZIP archive.
 func (f *File) Name() string { return f.name }
 
