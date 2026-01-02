@@ -30,10 +30,11 @@
 // using the [fs.FS] interface. This allows seamless integration with Go's standard
 // filesystem APIs, such as [io/fs] and [path/filepath].
 // Example:
-//   archive := gozip.NewZip()
-//   // ... add files to the archive ...
-//   fsys := archive.FS()
-//   data, _ := fs.ReadFile(fsys, "file.txt")
+//
+//	archive := gozip.NewZip()
+//	// ... add files to the archive ...
+//	fsys := archive.FS()
+//	data, _ := fs.ReadFile(fsys, "file.txt")
 //
 // # Basic Usage
 //

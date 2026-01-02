@@ -214,7 +214,7 @@ func init() {
 
 	w := gozip.NewZip()
 	content := strings.Repeat("A regular repeating string for compression testing. ", 20) // ~1KB
-	
+
 	for i := range readFileCount {
 		name := fmt.Sprintf("folder_%d/file_%d.txt", i%10, i)
 		w.AddString(content, name)
@@ -224,11 +224,11 @@ func init() {
 		panic(err)
 	}
 	f.Close()
-	
+
 	stat, _ := os.Stat(testZipPath)
 	testZipSize = stat.Size()
-	fmt.Printf("Benchmark: Generated %s (%d files, %.2f MB)\n", 
-	testZipPath, readFileCount, float64(testZipSize)/1024/1024)
+	fmt.Printf("Benchmark: Generated %s (%d files, %.2f MB)\n",
+		testZipPath, readFileCount, float64(testZipSize)/1024/1024)
 }
 
 func generateFiles(count, size int) []testFile {
@@ -381,7 +381,6 @@ func BenchmarkReadSeq_StdLib(b *testing.B) {
 	}
 	defer r.Close()
 
-	
 	for b.Loop() {
 		for _, f := range r.File {
 			rc, err := f.Open()
