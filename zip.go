@@ -795,7 +795,7 @@ func (z *Zip) WriteTo(dest io.Writer) (int64, error) {
 	return z.WriteToWithContext(context.Background(), dest)
 }
 
-// WriteToWithContext writes the archive with context cancellation support.
+// WriteToWithContext writes the archive with context support.
 // Returns the number of bytes written and any error encountered.
 func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer) (int64, error) {
 	z.mu.RLock()
@@ -877,7 +877,9 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 	if err != nil {
 		return err
 	}
-	z.config.Comment = endDir.Comment
+	if endDir.Comment != "" {
+		z.config.Comment = endDir.Comment
+	}
 
 	files, err := reader.ReadFiles(ctx, endDir)
 	if err != nil {
@@ -895,11 +897,16 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 
 // LoadFromFile parses a ZIP from a local os.File.
 func (z *Zip) LoadFromFile(f *os.File) error {
+	return z.LoadFromFileWithContext(context.Background(), f)
+}
+
+// LoadFromFile parses a ZIP from a local os.File with context support.
+func (z *Zip) LoadFromFileWithContext(ctx context.Context, f *os.File) error {
 	stat, err := f.Stat()
 	if err != nil {
 		return err
 	}
-	return z.Load(f, stat.Size())
+	return z.LoadWithContext(ctx, f, stat.Size())
 }
 
 // Extract extracts files to the destination directory.
@@ -910,7 +917,7 @@ func (z *Zip) Extract(path string, options ...ExtractOption) error {
 	return z.ExtractWithContext(context.Background(), path, options...)
 }
 
-// ExtractWithContext extracts files with context cancellation support.
+// ExtractWithContext extracts files with context support.
 func (z *Zip) ExtractWithContext(ctx context.Context, path string, options ...ExtractOption) error {
 	path = filepath.Clean(path)
 	var errs []error
@@ -993,7 +1000,7 @@ func (z *Zip) ExtractParallel(path string, workers int, options ...ExtractOption
 	return z.ExtractParallelWithContext(context.Background(), path, workers, options...)
 }
 
-// ExtractParallelWithContext extracts files concurrently.
+// ExtractParallelWithContext extracts files concurrently with context support.
 func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, workers int, options ...ExtractOption) error {
 	var errs []error
 	var filesToExtract []*File
