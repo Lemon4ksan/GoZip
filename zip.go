@@ -861,6 +861,7 @@ func (z *Zip) WriteToParallelWithContext(ctx context.Context, dest io.Writer, ma
 
 // Load parses an existing ZIP archive from the reader and appends its entries to this struct.
 // It does not load file contents into memory, only the directory structure.
+// Loaded files will have the current config password.
 func (z *Zip) Load(src io.ReaderAt, size int64) error {
 	return z.LoadWithContext(context.Background(), src, size)
 }
@@ -872,7 +873,13 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 	}
 
 	reader := newZipReader(src, size, z.decompressors, z.config)
-	files, err := reader.ReadFiles(ctx)
+	endDir, err := reader.FindAndReadEndOfCentralDir(ctx)
+	if err != nil {
+		return err
+	}
+	z.config.Comment = endDir.Comment
+
+	files, err := reader.ReadFiles(ctx, endDir)
 	if err != nil {
 		return err
 	}
@@ -897,6 +904,8 @@ func (z *Zip) LoadFromFile(f *os.File) error {
 
 // Extract extracts files to the destination directory.
 // Includes Zip Slip protection to ensure files stay within the target path.
+// If the file is encrypted and the password does not match, it will be reset
+// so that it can be replaced with a new zip config password in the next attempt.
 func (z *Zip) Extract(path string, options ...ExtractOption) error {
 	return z.ExtractWithContext(context.Background(), path, options...)
 }

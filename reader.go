@@ -29,9 +29,10 @@ const (
 // zipReader handles low-level reading of ZIP archive structure.
 type zipReader struct {
 	mu              sync.RWMutex
-	src             io.ReaderAt         // Source stream for reading archive data
-	fileSize        int64               // Total size of the archive
-	decompressors   decompressorsMap    // Registry of available compressors
+	src             io.ReaderAt      // Source stream for reading archive data
+	fileSize        int64            // Total size of the archive
+	decompressors   decompressorsMap // Registry of available compressors
+	password        string
 	textEncoder     func(string) string // Filename and comment encoder
 	onFileProcessed func(*File, error)  // Callback after reading
 }
@@ -53,6 +54,7 @@ func newZipReader(src io.ReaderAt, size int64, decompressors decompressorsMap, c
 		src:             src,
 		fileSize:        size,
 		decompressors:   decompressors,
+		password:        config.Password,
 		textEncoder:     config.TextEncoding,
 		onFileProcessed: config.OnFileProcessed,
 	}
@@ -61,28 +63,21 @@ func newZipReader(src io.ReaderAt, size int64, decompressors decompressorsMap, c
 // ReadFiles reads the ZIP archive and returns a list of files stored within it.
 // It automatically handles both standard and ZIP64 format archives.
 // Context is used to cancel the scanning process.
-func (zr *zipReader) ReadFiles(ctx context.Context) ([]*File, error) {
-	endDir, err := zr.findAndReadEndOfCentralDir(ctx)
-	if err != nil {
-		return nil, err
-	}
-	centralDirOffset, entriesNum := int64(endDir.CentralDirOffset), int64(endDir.TotalNumberOfEntries)
-
-	// Check for ZIP64 markers
-	if centralDirOffset == math.MaxUint32 || entriesNum == math.MaxUint16 {
-		zip64EndDir, err := zr.findAndReadZip64EndOfCentralDir(ctx, endDir.CommentLength)
+func (zr *zipReader) ReadFiles(ctx context.Context, endDir internal.EndOfCentralDirectory) ([]*File, error) {
+	if endDir.CentralDirOffset == math.MaxUint32 || endDir.TotalNumberOfEntries == math.MaxUint16 {
+		zip64EndDir, err := zr.findAndReadZip64EndOfCentralDir(endDir.CommentLength)
 		if err != nil {
 			return nil, err
 		}
-		centralDirOffset, entriesNum = int64(zip64EndDir.CentralDirOffset), int64(zip64EndDir.TotalNumberOfEntries)
+		return zr.readCentralDir(ctx, zip64EndDir.CentralDirOffset, zip64EndDir.TotalNumberOfEntries)
 	}
 
-	return zr.readCentralDir(ctx, centralDirOffset, entriesNum)
+	return zr.readCentralDir(ctx, uint64(endDir.CentralDirOffset), uint64(endDir.TotalNumberOfEntries))
 }
 
-// findAndReadEndOfCentralDir scans for the End of Central Directory record and reads it.
+// FindAndReadEndOfCentralDir scans for the End of Central Directory record and reads it.
 // Checks context cancellation during the scan loop.
-func (zr *zipReader) findAndReadEndOfCentralDir(ctx context.Context) (internal.EndOfCentralDirectory, error) {
+func (zr *zipReader) FindAndReadEndOfCentralDir(ctx context.Context) (internal.EndOfCentralDirectory, error) {
 	var end internal.EndOfCentralDirectory
 
 	if zr.fileSize < directoryEndLen {
@@ -149,12 +144,8 @@ func (zr *zipReader) findAndReadEndOfCentralDir(ctx context.Context) (internal.E
 }
 
 // findAndReadZip64EndOfCentralDir scans for the Zip64 End of Central Directory record.
-func (zr *zipReader) findAndReadZip64EndOfCentralDir(ctx context.Context, commentLength uint16) (internal.Zip64EndOfCentralDirectory, error) {
+func (zr *zipReader) findAndReadZip64EndOfCentralDir(commentLength uint16) (internal.Zip64EndOfCentralDirectory, error) {
 	var zip64End internal.Zip64EndOfCentralDirectory
-
-	if err := ctx.Err(); err != nil {
-		return zip64End, err
-	}
 
 	// Logic: EOCD (22+comment) -> Zip64 Locator (20) -> Zip64 EOCD
 	zip64locatorOffset := zr.fileSize - int64(directoryEndLen+commentLength) - zip64LocatorLen
@@ -186,7 +177,7 @@ func (zr *zipReader) findAndReadZip64EndOfCentralDir(ctx context.Context, commen
 }
 
 // readCentralDir reads the central directory entries starting at the specified offset.
-func (zr *zipReader) readCentralDir(ctx context.Context, offset int64, entries int64) ([]*File, error) {
+func (zr *zipReader) readCentralDir(ctx context.Context, offset uint64, entries uint64) ([]*File, error) {
 	// Cap initial allocation to avoid OOM on malformed files claiming huge entry counts
 	safeCap := entries
 	if safeCap > 1024*1024 {
@@ -194,7 +185,7 @@ func (zr *zipReader) readCentralDir(ctx context.Context, offset int64, entries i
 	}
 	files := make([]*File, 0, safeCap)
 
-	cdReader := io.NewSectionReader(zr.src, offset, zr.fileSize-offset)
+	cdReader := io.NewSectionReader(zr.src, int64(offset), zr.fileSize-int64(offset))
 
 	for i := range entries {
 		if err := ctx.Err(); err != nil {
@@ -285,6 +276,7 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 	f.config = FileConfig{
 		CompressionMethod: CompressionMethod(compressionMethod),
 		EncryptionMethod:  encryptionMethod,
+		Password:          zr.password,
 		Comment:           comment,
 	}
 	f.srcConfig = f.config
