@@ -492,7 +492,7 @@ func (z *Zip) Remove(name string) error {
 
 	cleanName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
 	dirPrefix := cleanName + "/"
-	
+
 	newFiles := make([]*File, 0, len(z.files))
 	deletedCount := 0
 
@@ -788,7 +788,17 @@ func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer) (int64, er
 	z.mu.RUnlock()
 
 	counter := &byteCountWriter{dest: dest}
-	writer := newZipWriter(z.config, z.factories, counter)
+
+	var writerDest io.Writer = counter
+
+	if seeker, ok := dest.(io.WriteSeeker); ok {
+		writerDest = &byteCountWriteSeeker{
+			byteCountWriter: counter,
+			seeker:          seeker,
+		}
+	}
+
+	writer := newZipWriter(z.config, z.factories, writerDest)
 
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {

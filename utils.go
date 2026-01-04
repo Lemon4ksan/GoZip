@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// byteCountWriter counts bytes written to a writer
+// byteCountWriter counts bytes written to a writer.
 type byteCountWriter struct {
 	dest         io.Writer
 	bytesWritten int64
@@ -20,6 +20,16 @@ func (w *byteCountWriter) Write(p []byte) (int, error) {
 	n, err := w.dest.Write(p)
 	w.bytesWritten += int64(n)
 	return n, err
+}
+
+// byteCountWriteSeeker is an extension of byteCountWriter that supports seeking.
+type byteCountWriteSeeker struct {
+	*byteCountWriter
+	seeker io.WriteSeeker
+}
+
+func (w *byteCountWriteSeeker) Seek(offset int64, whence int) (int64, error) {
+	return w.seeker.Seek(offset, whence)
 }
 
 // contextReader wraps an io.Reader to make it respect context cancellation.
