@@ -47,7 +47,7 @@
 //	f, _ := os.Create("output.zip")
 //	archive.WriteTo(f)
 //
-// Creating an archive in parallel (faster for many files):
+// Creating an archive in parallel (faster for multiple files):
 //
 //	// compress using 8 workers
 //	archive.WriteToParallel(f, 8)
@@ -59,12 +59,16 @@
 //	archive.LoadFromFile(src)
 //
 //	// Add new files, remove old ones, rename entries...
-//	archive.RemoveFile("obsolete.log")
-//	archive.AddBytes([]byte("data"), "new.log")
+//	archive.Remove("logs/obsolete.log")
+//	archive.AddBytes([]byte{0x10, 0x20}, "data/sensitive.bin", WithPassword("pass"))
+//	archive.Rename("dir/old", "new") // -> dir/new
 //
 //	// Save changes to a new writer
 //	dest, _ := os.Create("new.zip")
 //	archive.WriteTo(dest)
+//
+//	// Close source after the work is done
+//	src.Close()
 package gozip
 
 import (
@@ -109,7 +113,6 @@ type ZipConfig struct {
 	Comment string
 
 	// FileSortStrategy defines the order of files in the written archive.
-	// Optimization strategies: Name (standard), Size (packing), or Directory (streaming).
 	FileSortStrategy FileSortStrategy
 
 	// TextEncoding handles filename decoding for non-UTF8 legacy archives.
@@ -472,75 +475,43 @@ func (z *Zip) Mkdir(name string, options ...AddOption) error {
 	return z.addEntry(dirEntry, options)
 }
 
-// RemoveFile deletes a single entry (file or empty directory).
-// To delete a directory and its contents, use RemoveDir.
-func (z *Zip) RemoveFile(name string) error {
-	z.mu.Lock()
-	defer z.mu.Unlock()
-
-	searchName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
-
-	isDir := z.fileCache[searchName+"/"]
-	if !z.fileCache[searchName] && !isDir {
-		return fmt.Errorf("%w: %s", ErrFileNotFound, name)
-	}
-
-	idx := -1
-	for i, f := range z.files {
-		target := searchName
-		if f.isDir {
-			target += "/"
-		}
-
-		if f.getFilename() == target {
-			idx = i
-			break
-		}
-	}
-
-	if idx == -1 {
-		return fmt.Errorf("%w: %s", ErrFileNotFound, name)
-	}
-
-	z.files = append(z.files[:idx], z.files[idx+1:]...)
-	if isDir {
-		delete(z.fileCache, searchName+"/")
-	} else {
-		delete(z.fileCache, searchName)
-	}
-
-	return nil
-}
-
-// RemoveDir deletes a directory entry AND all its contents recursively.
-// If name is empty or ".", the archive is cleared.
-func (z *Zip) RemoveDir(name string) error {
+// Remove removes a file or directory from the archive. Empty string or "." means to delete all files.
+// If the target is a directory, it recursively removes all files and subdirectories inside it.
+// Returns error if no file were deleted.
+func (z *Zip) Remove(name string) error {
 	if name == "" || name == "." {
+		z.mu.Lock()
 		z.files = make([]*File, 0)
 		z.fileCache = make(map[string]bool)
+		z.mu.Unlock()
 		return nil
 	}
 
-	searchName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
-	if !strings.HasSuffix(searchName, "/") {
-		searchName += "/"
-	}
+	z.mu.Lock()
+	defer z.mu.Unlock()
 
+	cleanName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
+	dirPrefix := cleanName + "/"
+	
 	newFiles := make([]*File, 0, len(z.files))
 	deletedCount := 0
 
 	for _, f := range z.files {
-		fileName := f.getFilename()
-		if strings.HasPrefix(fileName, searchName) {
-			delete(z.fileCache, fileName)
+		fName := f.getFilename()
+		isExactMatch := fName == cleanName || fName == dirPrefix
+		isChild := strings.HasPrefix(fName, dirPrefix)
+
+		if isExactMatch || isChild {
+			delete(z.fileCache, fName)
 			deletedCount++
 			continue
 		}
+
 		newFiles = append(newFiles, f)
 	}
 
 	if deletedCount == 0 {
-		return fmt.Errorf("%w: %s", ErrFileNotFound, strings.TrimSuffix(searchName, "/"))
+		return fmt.Errorf("%w: %s", ErrFileNotFound, name)
 	}
 
 	z.files = newFiles
@@ -548,22 +519,27 @@ func (z *Zip) RemoveDir(name string) error {
 }
 
 // Rename changes a file's name while preserving its directory location.
-// e.g., "logs/old.txt" -> "logs/new.txt".
+// e.g., "logs/old.txt", "add/new.txt" -> "logs/add/new.txt".
 // If the target is a directory, all children are recursively renamed.
-func (z *Zip) Rename(file *File, newName string) error {
-	if newName == "" {
+func (z *Zip) Rename(old, new string) error {
+	if new == "" {
 		return fmt.Errorf("%w: new name cannot be empty", ErrFileEntry)
+	}
+
+	file, err := z.File(old)
+	if err != nil {
+		return err
 	}
 
 	z.mu.Lock()
 	defer z.mu.Unlock()
 
-	parentDir := path.Dir(file.name)
-	if parentDir == "." {
-		parentDir = ""
+	parent := path.Dir(file.name)
+	if parent == "." {
+		parent = ""
 	}
 
-	fullPath := path.Join(parentDir, newName)
+	fullPath := path.Join(parent, new)
 	fullPath = strings.TrimPrefix(path.Clean(strings.ReplaceAll(fullPath, "\\", "/")), "/")
 
 	if fullPath == file.name {
@@ -576,6 +552,10 @@ func (z *Zip) Rename(file *File, newName string) error {
 
 	if len(fullPath)+1 > math.MaxUint16 {
 		return fmt.Errorf("%w: %s (%d bytes)", ErrFilenameTooLong, fullPath, len(fullPath))
+	}
+
+	if err := z.createMissingDirs(fullPath); err != nil {
+		return err
 	}
 
 	if !file.isDir {
@@ -612,7 +592,12 @@ func (z *Zip) Rename(file *File, newName string) error {
 // Move changes the directory location of a file while preserving its base name.
 // e.g., "docs/file.txt" -> "backup/docs/file.txt".
 // Directories are moved recursively. Missing parent directories are created automatically.
-func (z *Zip) Move(file *File, newPath string) error {
+func (z *Zip) Move(old, new string) error {
+	file, err := z.File(old)
+	if err != nil {
+		return err
+	}
+
 	z.mu.Lock()
 	defer z.mu.Unlock()
 
@@ -624,7 +609,7 @@ func (z *Zip) Move(file *File, newPath string) error {
 		baseName = path.Base(baseName)
 	}
 
-	fullPath := path.Join(newPath, baseName)
+	fullPath := path.Join(new, baseName)
 	fullPath = strings.TrimPrefix(path.Clean(strings.ReplaceAll(fullPath, "\\", "/")), "/")
 
 	if fullPath == file.name {
@@ -640,7 +625,7 @@ func (z *Zip) Move(file *File, newPath string) error {
 	}
 
 	// Ensure destination directory exists
-	if !z.fileCache[newPath] || !z.fileCache[newPath+"/"] {
+	if !z.fileCache[new] || !z.fileCache[new+"/"] {
 		z.createMissingDirs(fullPath)
 	}
 
@@ -877,7 +862,7 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 	if err != nil {
 		return err
 	}
-	if endDir.Comment != "" {
+	if z.config.Comment == "" {
 		z.config.Comment = endDir.Comment
 	}
 
