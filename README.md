@@ -18,13 +18,15 @@ GoZip achieves performance parity with the standard library in sequential mode w
 
 *Benchmarks run on **Intel Core i5-12400F** (6 cores, 12 threads).*
 
+You can speed up the time even further by registering a faster flate implementation. ([`github.com/klauspost/compress/flate`](https://github.com/klauspost/compress) for example)
+
 ## 🚀 Key Features
 
 * **High Performance:** Built-in support for **parallel compression and extraction** using worker pools.
 * **Concurrency Safe:** Optimized for concurrent access using `io.ReaderAt`, allowing wait-free parallel reading.
 * **Smart I/O:** Automatically switches between stream processing and temporary file buffering based on file size and capabilities.
 * **Archive Modification:** Supports renaming, moving, and removing files/directories within an existing archive.
-* **Developer Experience:** Helpers for common tasks: `AddString`, `AddBytes`, `RemoveDir`
+* **Developer Experience:** Helpers for common tasks: `AddString`, `AddBytes`, `AddLazy`, `Find`, `Glob`, `LoadFromFile`.
 * **Context Support:** Full support for `context.Context` (cancellation/timeouts) for all long-running operations.
 * **Security:**
   * **Zip Slip** protection during extraction.
@@ -64,7 +66,7 @@ func main() {
 
     // Add a directory recursively
     // You can override compression per file
-    archive.AddDir("images", gozip.WithCompression(gozip.Deflated, gozip.DeflateFast))
+    archive.AddDir("images", gozip.WithCompression(gozip.Deflated, gozip.DeflateMaximum))
 
     out, _ := os.Create("backup.zip")
     defer out.Close()
@@ -114,17 +116,31 @@ func main() {
     }
 
     // 1. Remove files
-    archive.RemoveFile("secret_config.yaml")
-    archive.RemoveDir("temp_cache") // Recursive removal
+    archive.Remove("secret_config.yaml")
+    archive.Remove("temp_cache") // Recursive removal
 
     // 2. Rename/Move files
     if file, err := archive.File("images/old_logo.png"); err == nil {
-        // Move to new folder and rename
         archive.Move(file, "assets/graphics")
         archive.Rename(file, "new_logo.png")
     }
 
-    // 3. Add new content
+    // 3. Replace a file
+    file := archive.File("data/config.json")
+    archive.Remove(file.Name())
+    archive.AddLazy("data/config.json", func() (io.ReadCloser, error) {
+        rc, err := file.Open()
+        if err != nil {
+            return nil, err
+        }
+        defer rc.Close()
+
+        // Modify original data ...
+
+        return io.NopCloser(bytes.NewReader(processedData)), nil
+    })
+
+    // 4. Add new content
     archive.AddString("Updated at 2025", "meta.txt")
 
     // Save changes to a new file
@@ -281,7 +297,7 @@ Configure individual files using the Option pattern:
 
 * `SortDefault`: Preserves insertion order.
 * `SortAlphabetical`: Sorts by name (A-Z).
-* `SortLargeFilesFirst`: Optimizes **parallel writing**.
+* `SortSizeDescending`: Optimizes parallel writing.
 * `SortZIP64Optimized`: Buckets files by size to optimize Zip64 header overhead.
 
 ## License
