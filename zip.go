@@ -499,18 +499,16 @@ func (z *Zip) Mkdir(name string, options ...AddOption) error {
 
 // Remove removes a file or directory from the archive. Empty string or "." means to delete all files.
 // If the target is a directory, it recursively removes all files and subdirectories inside it.
-// Returns error if no file were deleted.
+// Returns an error if no files were deleted.
 func (z *Zip) Remove(name string) error {
-	if name == "" || name == "." {
-		z.mu.Lock()
-		z.files = make([]*File, 0)
-		z.fileCache = make(map[string]bool)
-		z.mu.Unlock()
-		return nil
-	}
-
 	z.mu.Lock()
 	defer z.mu.Unlock()
+
+	if name == "" || name == "." {
+		z.files = make([]*File, 0)
+		z.fileCache = make(map[string]bool)
+		return nil
+	}
 
 	cleanName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
 	dirPrefix := cleanName + "/"
@@ -612,7 +610,7 @@ func (z *Zip) Rename(old, new string) error {
 }
 
 // Move changes the directory location of a file while preserving its base name.
-// e.g., "docs/file.txt" -> "backup/docs/file.txt".
+// e.g., "docs/file.txt", "backup/docs" -> "backup/docs/file.txt".
 // Directories are moved recursively. Missing parent directories are created automatically.
 func (z *Zip) Move(old, new string) error {
 	file, err := z.File(old)

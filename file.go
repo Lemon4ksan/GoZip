@@ -73,7 +73,7 @@ type File struct {
 	extraParseOnce sync.Once              // Sync for map initialization
 }
 
-// newFileFromOS creates a File object from an already opened [os.File] handle.
+// newFileFromOS creates a File object from an already opened os.File handle.
 func newFileFromOS(f *os.File) (*File, error) {
 	if f == nil {
 		return nil, fmt.Errorf("%w: file cannot be nil", ErrFileEntry)
@@ -112,14 +112,14 @@ func newFileFromPath(filePath string) (*File, error) {
 		return nil, err
 	}
 
+	isSymlink := info.Mode()&fs.ModeSymlink != 0
 	var uncompressedSize int64
-	var isSymlink = info.Mode()&fs.ModeSymlink != 0
 	var linkTarget string
 
 	if isSymlink {
 		linkTarget, err = os.Readlink(filePath)
 		if err != nil {
-			return nil, fmt.Errorf("read link: %w", err)
+			return nil, err
 		}
 		uncompressedSize = int64(len(linkTarget))
 	} else if !info.IsDir() {
@@ -150,7 +150,7 @@ func newFileFromPath(filePath string) (*File, error) {
 	return f, nil
 }
 
-// newFileFromReader creates a File object from an arbitrary [io.Reader] source.
+// newFileFromReader creates a File object from an arbitrary io.Reader source.
 func newFileFromReader(src io.Reader, name string, size int64) (*File, error) {
 	if src == nil {
 		return nil, fmt.Errorf("%w: reader cannot be nil", ErrFileEntry)
@@ -459,7 +459,7 @@ func (zh *zipHeaders) getVersionNeededToExtract() uint16 {
 	if zh.file.config.CompressionMethod == Deflate {
 		return 20
 	}
-	if zh.file.isDir || strings.Contains(zh.file.name, "/") {
+	if zh.file.isDir {
 		return 20
 	}
 	if zh.file.config.EncryptionMethod == ZipCrypto {
