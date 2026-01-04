@@ -459,7 +459,7 @@ func (zh *zipHeaders) getVersionNeededToExtract() uint16 {
 	if zh.file.config.CompressionMethod == Deflate {
 		return 20
 	}
-	if zh.file.isDir {
+	if zh.file.isDir || strings.Contains(zh.file.name, "/") {
 		return 20
 	}
 	if zh.file.config.EncryptionMethod == ZipCrypto {
