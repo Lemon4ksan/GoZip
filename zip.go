@@ -42,7 +42,7 @@
 //
 //	archive := gozip.NewZip()
 //	archive.AddFile("file.txt")
-//	archive.AddDir("images/")
+//	archive.AddDir("images/", WithCompression(gozip.Deflate, gozip.DeflateMaximum))
 //
 //	f, _ := os.Create("output.zip")
 //	archive.WriteTo(f)
@@ -58,9 +58,21 @@
 //	src, _ := os.Open("old.zip")
 //	archive.LoadFromFile(src)
 //
-//	// Add new files, remove old ones, rename entries...
+//	// 1. Remove obsolete files
 //	archive.Remove("logs/obsolete.log")
-//	archive.AddBytes([]byte{0x10, 0x20}, "data/sensitive.bin", WithPassword("pass"))
+//
+//	// 2. Replace a file
+//	file, _ := archive.File("data/config.json")
+//	archive.Remove(file.Name())
+//	// Modify file data by safely reading it from source archive
+//	archive.AddLazy("data/config.json", func() (io.ReadCloser, error) {
+//		rc, _ := file.Open()
+//		defer rc.Close()
+//		// Modify original data ...
+//		return io.NopCloser(bytes.NewReader(processedData)), nil
+//	})
+//
+//	// 3. Rename entries
 //	archive.Rename("dir/old", "new") // -> dir/new
 //
 //	// Save changes to a new writer
@@ -451,6 +463,16 @@ func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...Add
 	if err != nil {
 		return err
 	}
+	return z.addEntry(fileEntry, options)
+}
+
+// AddLazy adds a new file with unknown size and openFunc.
+func (z *Zip) AddLazy(name string, openFunc func() (io.ReadCloser, error), options ...AddOption) error {
+	fileEntry, err := newFileFromReader(io.LimitReader(nil, 0), name, SizeUnknown)
+	if err != nil {
+		return err
+	}
+	fileEntry.openFunc = openFunc
 	return z.addEntry(fileEntry, options)
 }
 
