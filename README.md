@@ -121,14 +121,14 @@ func main() {
 
     // 2. Rename/Move files
     if file, err := archive.File("images/old_logo.png"); err == nil {
-        archive.Move(file, "assets/graphics")
-        archive.Rename(file, "new_logo.png")
+        archive.Move(file.Name(), "assets/graphics")
+        archive.Rename(file.Name(), "new_logo.png")
     }
 
-    // 3. Replace a file
+    // 3. Modify a file
     file := archive.File("data/config.json")
     archive.Remove(file.Name())
-    archive.AddLazy("data/config.json", func() (io.ReadCloser, error) {
+    archive.AddLazy(file.Name(), func() (io.ReadCloser, error) {
         rc, err := file.Open()
         if err != nil {
             return nil, err
@@ -225,6 +225,7 @@ func main() {
     // Set global configuration
     archive.SetConfig(gozip.ZipConfig{
         CompressionMethod: gozip.Deflated,
+        CompressionLevel:  gozip.DeflateNormal,
         EncryptionMethod:  gozip.AES256, // Recommended
         Password:          "MySecretPassword123",
     })
