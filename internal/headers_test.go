@@ -149,7 +149,7 @@ func TestCentralDirectory_Encode(t *testing.T) {
 				ExtraFieldLength:  3,
 				FileCommentLength: 13,
 				Filename:          "image.png",
-				ExtraField:        map[uint16][]byte{0xaaaa: extraData},
+				ExtraField:        extraData,
 				Comment:           "Hello Archive",
 			},
 			expectedFilename: "image.png",

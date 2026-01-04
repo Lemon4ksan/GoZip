@@ -18,13 +18,15 @@ GoZip achieves performance parity with the standard library in sequential mode w
 
 *Benchmarks run on **Intel Core i5-12400F** (6 cores, 12 threads).*
 
+You can speed up the time even further by registering a faster flate implementation. ([`github.com/klauspost/compress/flate`](https://github.com/klauspost/compress) for example)
+
 ## 🚀 Key Features
 
 * **High Performance:** Built-in support for **parallel compression and extraction** using worker pools.
 * **Concurrency Safe:** Optimized for concurrent access using `io.ReaderAt`, allowing wait-free parallel reading.
 * **Smart I/O:** Automatically switches between stream processing and temporary file buffering based on file size and capabilities.
 * **Archive Modification:** Supports renaming, moving, and removing files/directories within an existing archive.
-* **Developer Experience:** Helpers for common tasks: `AddString`, `AddBytes`, `RemoveDir`, `ExtractToWriter`.
+* **Developer Experience:** Helpers for common tasks: `AddString`, `AddBytes`, `AddLazy`, `Find`, `Glob`, `LoadFromFile`.
 * **Context Support:** Full support for `context.Context` (cancellation/timeouts) for all long-running operations.
 * **Security:**
   * **Zip Slip** protection during extraction.
@@ -42,7 +44,7 @@ go get github.com/lemon4ksan/gozip
 
 ### 1. Creating an Archive
 
-The simplest way to create an archive. `AddFromPath` is lazy and efficient.
+The simplest way to create an archive. `AddFile` is lazy and efficient.
 
 ```go
 package main
@@ -56,7 +58,7 @@ func main() {
     archive := gozip.NewZip()
 
     // Add a single file from disk
-    archive.AddFromPath("document.txt")
+    archive.AddFile("document.txt")
 
     // Add data directly from memory
     archive.AddString("debug mode=on", "config.ini")
@@ -64,7 +66,7 @@ func main() {
 
     // Add a directory recursively
     // You can override compression per file
-    archive.AddFromDir("images", gozip.WithCompression(gozip.Deflated, gozip.DeflateFast))
+    archive.AddDir("images", gozip.WithCompression(gozip.Deflated, gozip.DeflateMaximum))
 
     out, _ := os.Create("backup.zip")
     defer out.Close()
@@ -83,7 +85,7 @@ Use `WriteToParallel` to utilize multiple CPU cores.
 ```go
 func main() {
     archive := gozip.NewZip()
-    archive.AddFromDir("huge_dataset")
+    archive.AddDir("huge_dataset")
 
     out, _ := os.Create("data.zip")
     defer out.Close()
@@ -114,17 +116,31 @@ func main() {
     }
 
     // 1. Remove files
-    archive.RemoveFile("secret_config.yaml")
-    archive.RemoveDir("temp_cache") // Recursive removal
+    archive.Remove("secret_config.yaml")
+    archive.Remove("temp_cache") // Recursive removal
 
     // 2. Rename/Move files
     if file, err := archive.File("images/old_logo.png"); err == nil {
-        // Move to new folder and rename
-        archive.Move(file, "assets/graphics")
-        archive.Rename(file, "new_logo.png")
+        archive.Move(file.Name(), "assets/graphics")
+        archive.Rename(file.Name(), "new_logo.png")
     }
 
-    // 3. Add new content
+    // 3. Modify a file
+    file := archive.File("data/config.json")
+    archive.Remove(file.Name())
+    archive.AddLazy(file.Name(), func() (io.ReadCloser, error) {
+        rc, err := file.Open()
+        if err != nil {
+            return nil, err
+        }
+        defer rc.Close()
+
+        // Modify original data ...
+
+        return io.NopCloser(bytes.NewReader(processedData)), nil
+    })
+
+    // 4. Add new content
     archive.AddString("Updated at 2025", "meta.txt")
 
     // Save changes to a new file
@@ -162,7 +178,43 @@ func main() {
 }
 ```
 
-### 5. Encryption (AES-256) 🔒
+### 5. Virtual File Systems 📂
+
+Work with files abstractly, without relying on physical disk.
+
+```go
+package main
+
+import (
+    "embed"
+    "github.com/lemon4ksan/gozip"
+)
+
+//go:embed templates/* static/*
+var assets embed.FS
+
+func main() {
+    archive := gozip.NewZip()
+
+    // Recursively add embed.FS
+    if err := archive.AddFS(assets); err != nil {
+        panic(err)
+    }
+
+    // Turn archive into file system
+    fileSystem := archive.FS()
+
+    // Read files with fs interface
+    data, _ := fs.ReadFile(fileSystem, "style.css")
+
+    // Use in HTTP
+    http.Handle("/", http.FileServer(http.FS(fileSystem)))
+
+    http.ListenAndServe(":8080", nil)
+}
+```
+
+### 6. Encryption (AES-256) 🔒
 
 GoZip supports strong encryption compatible with WinZip and 7-Zip.
 
@@ -173,18 +225,19 @@ func main() {
     // Set global configuration
     archive.SetConfig(gozip.ZipConfig{
         CompressionMethod: gozip.Deflated,
+        CompressionLevel:  gozip.DeflateNormal,
         EncryptionMethod:  gozip.AES256, // Recommended
         Password:          "MySecretPassword123",
     })
 
-    archive.AddFromPath("secret.pdf")
+    archive.AddFile("secret.pdf")
 
     out, _ := os.Create("secure.zip")
     archive.WriteTo(out)
 }
 ```
 
-### 6. Fixing Broken Encodings (CP866 / Russian DOS)
+### 7. Fixing Broken Encodings (CP866 / Russian DOS)
 
 Read archives created on old Windows systems that appear as gibberish (e.g., `ΓÑßΓ.txt`).
 
@@ -245,7 +298,7 @@ Configure individual files using the Option pattern:
 
 * `SortDefault`: Preserves insertion order.
 * `SortAlphabetical`: Sorts by name (A-Z).
-* `SortLargeFilesFirst`: Optimizes **parallel writing**.
+* `SortSizeDescending`: Optimizes parallel writing.
 * `SortZIP64Optimized`: Buckets files by size to optimize Zip64 header overhead.
 
 ## License

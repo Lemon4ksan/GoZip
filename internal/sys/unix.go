@@ -6,16 +6,7 @@
 
 package sys
 
-// getHostSystem returns the HostSystem type.
-// On Unix we usually don't inspect the FD for filesystem type (like NTFS),
-// we just report the OS type.
-func GetHostSystem(_ uintptr) HostSystem {
-	return GetHostSystemByOS()
-}
-
-func GetHostSystemByOS() HostSystem {
-	return HostSystemUNIX
-}
+const DefaultHostSystem = HostSystemUNIX
 
 // unixNanoToWinFiletime converts Unix epoch time to Windows FILETIME (100ns ticks since 1601).
 func unixNanoToWinFiletime(sec int64, nsec int64) uint64 {

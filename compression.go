@@ -34,11 +34,6 @@ const (
 	DeflateStore     = flate.NoCompression // 0
 )
 
-// CompressorFactory creates a Compressor instance for a specific compression level.
-// The level parameter is typically 0-9, but interpretations vary by algorithm.
-// Implementations should normalize invalid levels to defaults.
-type CompressorFactory func(level int) Compressor
-
 // StoredCompressor implements no compression (STORE method).
 type StoredCompressor struct{}
 

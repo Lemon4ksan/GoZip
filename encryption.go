@@ -11,6 +11,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"hash"
@@ -38,16 +39,16 @@ func newZipCryptoWriter(dest io.Writer, password string, checkByte byte) (io.Wri
 	cipher := newZipCipher(password)
 
 	// Write the encryption header (12 bytes)
-	header := make([]byte, 12)
-	if _, err := rand.Read(header); err != nil {
+	var header [12]byte
+	if _, err := rand.Read(header[:]); err != nil {
 		return nil, fmt.Errorf("crypto rand failed: %w", err)
 	}
 
 	// The last byte of the header is used as a check byte (CRC or ModTime)
 	header[11] = checkByte
-	cipher.Encrypt(header)
+	cipher.Encrypt(header[:])
 
-	if _, err := dest.Write(header); err != nil {
+	if _, err := dest.Write(header[:]); err != nil {
 		return nil, fmt.Errorf("write crypto header: %w", err)
 	}
 
@@ -86,11 +87,11 @@ type zipCryptoReader struct {
 func newZipCryptoReader(src io.Reader, password string, flags uint16, crc32Val uint32, modTime uint16) (io.Reader, error) {
 	cipher := newZipCipher(password)
 
-	header := make([]byte, 12)
-	if _, err := io.ReadFull(src, header); err != nil {
+	var header [12]byte
+	if _, err := io.ReadFull(src, header[:]); err != nil {
 		return nil, fmt.Errorf("read crypto header: %w", err)
 	}
-	cipher.Decrypt(header)
+	cipher.Decrypt(header[:])
 
 	// Verify password
 	var expectedByte byte
@@ -178,13 +179,15 @@ const (
 	aes256SaltSize = 16 // 16 bytes for AES-256
 	aesMacSize     = 10 // HMAC-SHA1 truncated to 10 bytes
 	aesPvvSize     = 2  // Password Verification Value
+	overhead       = aes256SaltSize + aesPvvSize + aesMacSize
 )
 
 // aesWriter implements WinZip AES-256 encryption.
 type aesWriter struct {
-	dest   io.Writer
-	stream *winZipCounter
-	mac    hash.Hash
+	dest    io.Writer
+	stream  *winZipCounter
+	mac     hash.Hash
+	scratch []byte
 }
 
 func newAes256Writer(dest io.Writer, password string) (io.WriteCloser, error) {
@@ -222,7 +225,10 @@ func (w *aesWriter) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 	// We must encrypt into a new buffer to avoid modifying p
-	buf := make([]byte, len(p))
+	if cap(w.scratch) < len(p) {
+		w.scratch = make([]byte, len(p))
+	}
+	buf := w.scratch[:len(p)]
 	w.stream.XORKeyStream(buf, p)
 
 	// WinZip AES: Encrypt-then-MAC (HMAC is computed on ciphertext)
@@ -275,7 +281,6 @@ func newAes256Reader(src io.Reader, password string, compressedSize int64) (io.R
 		return nil, err
 	}
 
-	overhead := int64(aes256SaltSize + aesPvvSize + aesMacSize)
 	if compressedSize < overhead {
 		return nil, errors.New("zip: invalid aes file size (too small)")
 	}
@@ -311,7 +316,7 @@ func (r *aesReader) Read(p []byte) (int, error) {
 		}
 
 		calculated := r.mac.Sum(nil)[:aesMacSize]
-		if !bytes.Equal(calculated, expected) {
+		if subtle.ConstantTimeCompare(calculated, expected) != 1 {
 			return n, errors.New("zip: aes authentication failed")
 		}
 		// Verification successful
@@ -362,21 +367,32 @@ func newWinZipCounter(block cipher.Block) *winZipCounter {
 }
 
 func (c *winZipCounter) XORKeyStream(dst, src []byte) {
-	for i := range src {
-		if c.pos == 0 {
-			// Encrypt counter to generate keystream block
-			c.block.Encrypt(c.buffer[:], c.counter[:])
-
-			// Increment counter (Little Endian 128-bit)
-			for j := 0; j < aes.BlockSize; j++ {
-				c.counter[j]++
-				if c.counter[j] != 0 {
-					break // No carry, stop
-				}
-			}
+	for len(src) > 0 {
+		if c.pos == len(c.buffer) || c.pos == 0 {
+			c.block.Encrypt(c.buffer, c.counter[:])
+			c.incrementCounter()
+			c.pos = 0
 		}
-		dst[i] = src[i] ^ c.buffer[c.pos]
-		c.pos = (c.pos + 1) % aes.BlockSize
+		n := len(src)
+		if remain := len(c.buffer) - c.pos; n > remain {
+			n = remain
+		}
+
+		subtle.XORBytes(dst[:n], src[:n], c.buffer[c.pos:])
+
+		dst = dst[n:]
+		src = src[n:]
+		c.pos += n
+	}
+}
+
+// Little Endian increment
+func (c *winZipCounter) incrementCounter() {
+	for j := range aes.BlockSize {
+		c.counter[j]++
+		if c.counter[j] != 0 {
+			break
+		}
 	}
 }
 

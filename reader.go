@@ -29,9 +29,10 @@ const (
 // zipReader handles low-level reading of ZIP archive structure.
 type zipReader struct {
 	mu              sync.RWMutex
-	src             io.ReaderAt         // Source stream for reading archive data
-	fileSize        int64               // Total size of the archive
-	decompressors   decompressorsMap    // Registry of available compressors
+	src             io.ReaderAt      // Source stream for reading archive data
+	fileSize        int64            // Total size of the archive
+	decompressors   decompressorsMap // Registry of available compressors
+	password        string
 	textEncoder     func(string) string // Filename and comment encoder
 	onFileProcessed func(*File, error)  // Callback after reading
 }
@@ -53,6 +54,7 @@ func newZipReader(src io.ReaderAt, size int64, decompressors decompressorsMap, c
 		src:             src,
 		fileSize:        size,
 		decompressors:   decompressors,
+		password:        config.Password,
 		textEncoder:     config.TextEncoding,
 		onFileProcessed: config.OnFileProcessed,
 	}
@@ -61,28 +63,21 @@ func newZipReader(src io.ReaderAt, size int64, decompressors decompressorsMap, c
 // ReadFiles reads the ZIP archive and returns a list of files stored within it.
 // It automatically handles both standard and ZIP64 format archives.
 // Context is used to cancel the scanning process.
-func (zr *zipReader) ReadFiles(ctx context.Context) ([]*File, error) {
-	endDir, err := zr.findAndReadEndOfCentralDir(ctx)
-	if err != nil {
-		return nil, err
-	}
-	centralDirOffset, entriesNum := int64(endDir.CentralDirOffset), int64(endDir.TotalNumberOfEntries)
-
-	// Check for ZIP64 markers
-	if centralDirOffset == math.MaxUint32 || entriesNum == math.MaxUint16 {
-		zip64EndDir, err := zr.findAndReadZip64EndOfCentralDir(ctx, endDir.CommentLength)
+func (zr *zipReader) ReadFiles(ctx context.Context, endDir internal.EndOfCentralDirectory) ([]*File, error) {
+	if endDir.CentralDirOffset == math.MaxUint32 || endDir.TotalNumberOfEntries == math.MaxUint16 {
+		zip64EndDir, err := zr.findAndReadZip64EndOfCentralDir(endDir.CommentLength)
 		if err != nil {
 			return nil, err
 		}
-		centralDirOffset, entriesNum = int64(zip64EndDir.CentralDirOffset), int64(zip64EndDir.TotalNumberOfEntries)
+		return zr.readCentralDir(ctx, zip64EndDir.CentralDirOffset, zip64EndDir.TotalNumberOfEntries)
 	}
 
-	return zr.readCentralDir(ctx, centralDirOffset, entriesNum)
+	return zr.readCentralDir(ctx, uint64(endDir.CentralDirOffset), uint64(endDir.TotalNumberOfEntries))
 }
 
-// findAndReadEndOfCentralDir scans for the End of Central Directory record and reads it.
+// FindAndReadEndOfCentralDir scans for the End of Central Directory record and reads it.
 // Checks context cancellation during the scan loop.
-func (zr *zipReader) findAndReadEndOfCentralDir(ctx context.Context) (internal.EndOfCentralDirectory, error) {
+func (zr *zipReader) FindAndReadEndOfCentralDir(ctx context.Context) (internal.EndOfCentralDirectory, error) {
 	var end internal.EndOfCentralDirectory
 
 	if zr.fileSize < directoryEndLen {
@@ -149,12 +144,8 @@ func (zr *zipReader) findAndReadEndOfCentralDir(ctx context.Context) (internal.E
 }
 
 // findAndReadZip64EndOfCentralDir scans for the Zip64 End of Central Directory record.
-func (zr *zipReader) findAndReadZip64EndOfCentralDir(ctx context.Context, commentLength uint16) (internal.Zip64EndOfCentralDirectory, error) {
+func (zr *zipReader) findAndReadZip64EndOfCentralDir(commentLength uint16) (internal.Zip64EndOfCentralDirectory, error) {
 	var zip64End internal.Zip64EndOfCentralDirectory
-
-	if err := ctx.Err(); err != nil {
-		return zip64End, err
-	}
 
 	// Logic: EOCD (22+comment) -> Zip64 Locator (20) -> Zip64 EOCD
 	zip64locatorOffset := zr.fileSize - int64(directoryEndLen+commentLength) - zip64LocatorLen
@@ -186,7 +177,7 @@ func (zr *zipReader) findAndReadZip64EndOfCentralDir(ctx context.Context, commen
 }
 
 // readCentralDir reads the central directory entries starting at the specified offset.
-func (zr *zipReader) readCentralDir(ctx context.Context, offset int64, entries int64) ([]*File, error) {
+func (zr *zipReader) readCentralDir(ctx context.Context, offset uint64, entries uint64) ([]*File, error) {
 	// Cap initial allocation to avoid OOM on malformed files claiming huge entry counts
 	safeCap := entries
 	if safeCap > 1024*1024 {
@@ -194,7 +185,7 @@ func (zr *zipReader) readCentralDir(ctx context.Context, offset int64, entries i
 	}
 	files := make([]*File, 0, safeCap)
 
-	cdReader := io.NewSectionReader(zr.src, offset, zr.fileSize-offset)
+	cdReader := io.NewSectionReader(zr.src, int64(offset), zr.fileSize-int64(offset))
 
 	for i := range entries {
 		if err := ctx.Err(); err != nil {
@@ -232,65 +223,63 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 		filename = strings.TrimSuffix(filename, "/")
 	}
 
-	uncompressedSize := uint64(entry.UncompressedSize)
-	compressedSize := uint64(entry.CompressedSize)
-	localHeaderOffset := uint64(entry.LocalHeaderOffset)
-
-	// Process ZIP64 Extra Field if present
-	if zip64Data, ok := entry.ExtraField[Zip64ExtraFieldTag]; ok {
-		pos := 0
-
-		if uncompressedSize == math.MaxUint32 {
-			if len(zip64Data) >= pos+8 {
-				uncompressedSize = binary.LittleEndian.Uint64(zip64Data[pos : pos+8])
-				pos += 8
-			}
-		}
-		if compressedSize == math.MaxUint32 {
-			if len(zip64Data) >= pos+8 {
-				compressedSize = binary.LittleEndian.Uint64(zip64Data[pos : pos+8])
-				pos += 8
-			}
-		}
-		if localHeaderOffset == math.MaxUint32 {
-			if len(zip64Data) >= pos+8 {
-				localHeaderOffset = binary.LittleEndian.Uint64(zip64Data[pos : pos+8])
-				pos += 8
-			}
-		}
-	}
-
-	var encryptionMethod EncryptionMethod
-	compressionMethod := entry.CompressionMethod
-	switch {
-	case entry.CompressionMethod == winZipAESMarker:
-		if extraField, ok := entry.ExtraField[AESEncryptionTag]; ok && len(extraField) >= 11 {
-			compressionMethod = binary.LittleEndian.Uint16(extraField[9:11])
-			encryptionMethod = AES256
-		}
-	case (entry.GeneralPurposeBitFlag & 0x1) != 0:
-		encryptionMethod = ZipCrypto
-	}
-
 	f := &File{
 		name:              filename,
 		isDir:             isDir,
 		mode:              parseFileExternalAttributes(entry),
-		uncompressedSize:  int64(uncompressedSize),
-		compressedSize:    int64(compressedSize),
+		uncompressedSize:  int64(entry.UncompressedSize),
+		compressedSize:    int64(entry.CompressedSize),
 		crc32:             entry.CRC32,
-		localHeaderOffset: int64(localHeaderOffset),
+		localHeaderOffset: int64(entry.LocalHeaderOffset),
 		hostSystem:        sys.HostSystem(entry.VersionMadeBy >> 8),
 		modTime:           msDosToTime(entry.LastModFileDate, entry.LastModFileTime),
-		extraField:        entry.ExtraField,
-		config: FileConfig{
-			CompressionMethod: CompressionMethod(compressionMethod),
-			Name:              filename,
-			Comment:           comment,
-			EncryptionMethod:  encryptionMethod,
-		},
+		extraFieldRaw:     entry.ExtraField,
 	}
-	f.sourceConfig = f.config
+
+	var encryptionMethod EncryptionMethod
+	compressionMethod := entry.CompressionMethod
+
+	payload := entry.ExtraField
+	for offset := 0; offset < len(entry.ExtraField); {
+		if offset+4 > len(entry.ExtraField) {
+			break
+		}
+
+		tag := binary.LittleEndian.Uint16(entry.ExtraField[offset : offset+2])
+		size := int(binary.LittleEndian.Uint16(entry.ExtraField[offset+2 : offset+4]))
+
+		offset += 4
+		if offset+size > len(entry.ExtraField) {
+			break
+		}
+
+		data := payload[offset : offset+size]
+
+		switch tag {
+		case Zip64ExtraFieldTag:
+			zr.parseZip64(f, data, entry)
+
+		case AESEncryptionTag:
+			if len(data) >= 7 {
+				compressionMethod = binary.LittleEndian.Uint16(data[5:7])
+				encryptionMethod = AES256
+			}
+		}
+
+		offset += size
+	}
+
+	if (entry.GeneralPurposeBitFlag&0x1) != 0 && encryptionMethod == NotEncrypted {
+		encryptionMethod = ZipCrypto
+	}
+
+	f.config = FileConfig{
+		CompressionMethod: CompressionMethod(compressionMethod),
+		EncryptionMethod:  encryptionMethod,
+		Password:          zr.password,
+		Comment:           comment,
+	}
+	f.srcConfig = f.config
 
 	// openFunc prepares the file for decompression
 	f.openFunc = func() (io.ReadCloser, error) {
@@ -298,7 +287,7 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 	}
 
 	// sourceFunc extracts the raw compressed data (e.g., for optimized copying)
-	f.sourceFunc = func() (*io.SectionReader, error) {
+	f.srcFunc = func() (*io.SectionReader, error) {
 		// We must read the Local Header to find the exact data offset, as
 		// extra fields in Local Header may differ from Central Directory.
 		headerReader := io.NewSectionReader(zr.src, f.localHeaderOffset, localHeaderLen)
@@ -394,6 +383,29 @@ func (zr *zipReader) verifySignature(r io.Reader, s uint32) bool {
 		return false
 	}
 	return binary.LittleEndian.Uint32(buf[:]) == s
+}
+
+func (zr *zipReader) parseZip64(f *File, data []byte, entry internal.CentralDirectory) {
+	pos := 0
+
+	if entry.UncompressedSize == math.MaxUint32 {
+		if len(data) >= pos+8 {
+			f.uncompressedSize = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
+			pos += 8
+		}
+	}
+	if entry.CompressedSize == math.MaxUint32 {
+		if len(data) >= pos+8 {
+			f.compressedSize = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
+			pos += 8
+		}
+	}
+	if entry.LocalHeaderOffset == math.MaxUint32 {
+		if len(data) >= pos+8 {
+			f.localHeaderOffset = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
+			pos += 8
+		}
+	}
 }
 
 func parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {

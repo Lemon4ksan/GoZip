@@ -11,7 +11,9 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lemon4ksan/gozip/internal"
@@ -50,26 +52,28 @@ type File struct {
 	mode  fs.FileMode // Unix-style file permissions and type bits
 	flags uint16      // Internal flags state
 
-	openFunc   func() (io.ReadCloser, error)     // Factory function for reading original content
-	sourceFunc func() (*io.SectionReader, error) // Factory function for reading uncompressed content
+	openFunc func() (io.ReadCloser, error)     // Factory function for reading decompressed content
+	srcFunc  func() (*io.SectionReader, error) // Factory function for reading original content
 
 	uncompressedSize int64  // Size of original content before compression in bytes
 	compressedSize   int64  // Size of compressed data within archive in bytes
 	crc32            uint32 // CRC-32 checksum of uncompressed data
 
 	// Per-file configuration overriding archive defaults
-	config       FileConfig
-	sourceConfig FileConfig
+	config    FileConfig
+	srcConfig FileConfig
 
 	localHeaderOffset int64          // Byte offset of this file's local header within archive
 	hostSystem        sys.HostSystem // Operating system that created the file (for attribute mapping)
 
-	modTime    time.Time              // File modification time (best available precision)
-	metadata   map[string]interface{} // Platform-specific metadata (NTFS timestamps, etc.)
-	extraField map[uint16][]byte      // ZIP extra fields for extended functionality
+	modTime        time.Time              // File modification time (best available precision)
+	metadata       map[string]interface{} // Platform-specific metadata (NTFS timestamps, etc.)
+	extraField     map[uint16][]byte      // ZIP extra fields for extended functionality
+	extraFieldRaw  []byte                 // Raw extra field data
+	extraParseOnce sync.Once              // Sync for map initialization
 }
 
-// newFileFromOS creates a File object from an already opened [os.File] handle.
+// newFileFromOS creates a File object from an already opened os.File handle.
 func newFileFromOS(f *os.File) (*File, error) {
 	if f == nil {
 		return nil, fmt.Errorf("%w: file cannot be nil", ErrFileEntry)
@@ -92,7 +96,7 @@ func newFileFromOS(f *os.File) (*File, error) {
 		isDir:            stat.IsDir(),
 		mode:             stat.Mode(),
 		metadata:         sys.GetFileMetadata(stat),
-		hostSystem:       sys.GetHostSystem(f.Fd()),
+		hostSystem:       sys.DefaultHostSystem,
 		extraField:       make(map[uint16][]byte),
 		openFunc: func() (io.ReadCloser, error) {
 			// NopCloser to prevent the caller from closing the original file handle
@@ -103,38 +107,50 @@ func newFileFromOS(f *os.File) (*File, error) {
 
 // newFileFromPath creates a File object by opening the file at the given path.
 func newFileFromPath(filePath string) (*File, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	stat, err := f.Stat()
+	info, err := os.Lstat(filePath)
 	if err != nil {
 		return nil, err
 	}
 
+	isSymlink := info.Mode()&fs.ModeSymlink != 0
 	var uncompressedSize int64
-	if !stat.IsDir() {
-		uncompressedSize = stat.Size()
+	var linkTarget string
+
+	if isSymlink {
+		linkTarget, err = os.Readlink(filePath)
+		if err != nil {
+			return nil, err
+		}
+		uncompressedSize = int64(len(linkTarget))
+	} else if !info.IsDir() {
+		uncompressedSize = info.Size()
 	}
 
-	return &File{
-		name:             stat.Name(),
+	f := &File{
+		name:             info.Name(),
 		uncompressedSize: uncompressedSize,
-		modTime:          stat.ModTime(),
-		isDir:            stat.IsDir(),
-		mode:             stat.Mode(),
-		metadata:         sys.GetFileMetadata(stat),
-		hostSystem:       sys.GetHostSystem(f.Fd()),
+		modTime:          info.ModTime(),
+		isDir:            info.IsDir(),
+		mode:             info.Mode(),
+		metadata:         sys.GetFileMetadata(info),
+		hostSystem:       sys.DefaultHostSystem,
 		extraField:       make(map[uint16][]byte),
-		openFunc: func() (io.ReadCloser, error) {
+	}
+
+	if isSymlink {
+		f.openFunc = func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(linkTarget)), nil
+		}
+	} else if !f.isDir {
+		f.openFunc = func() (io.ReadCloser, error) {
 			return os.Open(filePath)
-		},
-	}, nil
+		}
+	}
+
+	return f, nil
 }
 
-// newFileFromReader creates a File object from an arbitrary [io.Reader] source.
+// newFileFromReader creates a File object from an arbitrary io.Reader source.
 func newFileFromReader(src io.Reader, name string, size int64) (*File, error) {
 	if src == nil {
 		return nil, fmt.Errorf("%w: reader cannot be nil", ErrFileEntry)
@@ -151,7 +167,7 @@ func newFileFromReader(src io.Reader, name string, size int64) (*File, error) {
 		mode:             0644,
 		uncompressedSize: size,
 		modTime:          time.Now(),
-		hostSystem:       sys.GetHostSystemByOS(),
+		hostSystem:       sys.DefaultHostSystem,
 		extraField:       make(map[uint16][]byte),
 		openFunc: func() (io.ReadCloser, error) {
 			return io.NopCloser(src), nil
@@ -169,9 +185,25 @@ func newDirectoryFile(name string) (*File, error) {
 		name:       name,
 		isDir:      true,
 		mode:       0755 | fs.ModeDir,
-		hostSystem: sys.GetHostSystemByOS(),
+		hostSystem: sys.DefaultHostSystem,
 		modTime:    time.Now(),
 		extraField: make(map[uint16][]byte),
+	}, nil
+}
+
+// newFileFromFS creates a File object from an fs.FS entry.
+func newFileFromFS(fs fs.FS, filePath string, info fs.FileInfo) (*File, error) {
+	return &File{
+		name:             filePath,
+		uncompressedSize: info.Size(),
+		modTime:          info.ModTime(),
+		isDir:            false,
+		mode:             info.Mode(),
+		hostSystem:       sys.DefaultHostSystem,
+		extraField:       make(map[uint16][]byte),
+		openFunc: func() (io.ReadCloser, error) {
+			return fs.Open(filePath)
+		},
 	}, nil
 }
 
@@ -225,17 +257,28 @@ func (f *File) FsTime() (mtime, atime, ctime time.Time) {
 // Open returns a ReadCloser for reading the original, uncompressed file content.
 func (f *File) Open() (io.ReadCloser, error) { return f.openFunc() }
 
+// Open returns a ReadCloser object for reading the original,
+// uncompressed file content using the specified password.
+func (f *File) OpenWithPassword(pwd string) (io.ReadCloser, error) {
+	f.config.Password = pwd
+	return f.openFunc()
+}
+
 // HasExtraField checks whether an extra field with the specified tag exists.
-func (f *File) HasExtraField(tag uint16) bool { _, ok := f.extraField[tag]; return ok }
+func (f *File) HasExtraField(tag uint16) bool {
+	f.ensureExtraParsed()
+	_, ok := f.extraField[tag]
+	return ok
+}
 
 // GetExtraField retrieves the raw bytes of an extra field by its tag ID.
-func (f *File) GetExtraField(tag uint16) []byte { return f.extraField[tag] }
+func (f *File) GetExtraField(tag uint16) []byte {
+	f.ensureExtraParsed()
+	return f.extraField[tag]
+}
 
 // SetConfig applies a FileConfig to this file, overriding individual properties.
 func (f *File) SetConfig(config FileConfig) {
-	if config.Name != "" {
-		f.name = config.Name
-	}
 	if !f.isDir {
 		f.config.CompressionMethod = config.CompressionMethod
 		f.config.CompressionLevel = config.CompressionLevel
@@ -246,14 +289,16 @@ func (f *File) SetConfig(config FileConfig) {
 }
 
 // SetOpenFunc replaces the internal function used to open the file's content.
+// Note that internal file sizes will be updated only after the archive is written.
 func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) {
-	f.sourceFunc = nil
+	f.srcFunc = nil
 	f.openFunc = openFunc
 }
 
 // SetExtraField adds or replaces an extra field entry for this file.
 // Returns an error if adding the field would exceed the maximum extra field length.
 func (f *File) SetExtraField(tag uint16, data []byte) error {
+	f.ensureExtraParsed()
 	currentLen := f.getExtraFieldLength()
 
 	// If replacing, subtract the size of the old field
@@ -265,6 +310,8 @@ func (f *File) SetExtraField(tag uint16, data []byte) error {
 		return ErrExtraFieldTooLong
 	}
 	f.extraField[tag] = data
+	f.extraFieldRaw = nil
+
 	return nil
 }
 
@@ -277,6 +324,9 @@ func (f *File) RequiresZip64() bool {
 
 // getExtraFieldLength calculates the total size of all extra field entries.
 func (f *File) getExtraFieldLength() int {
+	if f.extraField == nil {
+		return len(f.extraFieldRaw)
+	}
 	var size int
 	for _, entry := range f.extraField {
 		size += len(entry)
@@ -294,22 +344,35 @@ func (f *File) getFilename() string {
 
 // shouldCopyRaw checks if we can optimize by copying raw compressed data directly.
 func (f *File) shouldCopyRaw() bool {
-	if f.sourceFunc == nil {
+	if f.srcFunc == nil {
 		return false
 	}
 	// Configuration must match exactly to allow raw copy
-	if f.config.CompressionMethod != f.sourceConfig.CompressionMethod {
+	if f.config.CompressionMethod != f.srcConfig.CompressionMethod {
 		return false
 	}
-	if f.config.EncryptionMethod != f.sourceConfig.EncryptionMethod {
+	if f.config.EncryptionMethod != f.srcConfig.EncryptionMethod {
 		return false
 	}
 	if f.config.EncryptionMethod != NotEncrypted {
-		if f.config.Password != f.sourceConfig.Password {
+		if f.config.Password != f.srcConfig.Password {
 			return false
 		}
 	}
 	return true
+}
+
+// ensureExtraParsed ensures that extraFiled is initialized and parsed.
+func (f *File) ensureExtraParsed() {
+	f.extraParseOnce.Do(func() {
+		if f.extraField == nil {
+			if len(f.extraFieldRaw) > 0 {
+				f.extraField = parseExtraField(f.extraFieldRaw)
+			} else {
+				f.extraField = make(map[uint16][]byte)
+			}
+		}
+	})
 }
 
 // zipHeaders is responsible for generating ZIP format headers from File metadata.
@@ -347,6 +410,12 @@ func (zh *zipHeaders) LocalHeader() internal.LocalFileHeader {
 func (zh *zipHeaders) CentralDirEntry() internal.CentralDirectory {
 	dosDate, dosTime := timeToMsDos(zh.file.modTime)
 	filename := zh.file.getFilename()
+	var extraField []byte
+	if zh.file.extraField == nil {
+		extraField = zh.file.extraFieldRaw
+	} else {
+		extraField = zh.buildExtraFieldBytes()
+	}
 
 	return internal.CentralDirectory{
 		VersionMadeBy:          zh.getVersionMadeBy(),
@@ -359,14 +428,14 @@ func (zh *zipHeaders) CentralDirEntry() internal.CentralDirectory {
 		CompressedSize:         uint32(min(math.MaxUint32, zh.file.compressedSize)),
 		UncompressedSize:       uint32(min(math.MaxUint32, zh.file.uncompressedSize)),
 		FilenameLength:         uint16(len(filename)),
-		ExtraFieldLength:       uint16(zh.file.getExtraFieldLength()),
+		ExtraFieldLength:       uint16(len(extraField)),
 		FileCommentLength:      uint16(len(zh.file.config.Comment)),
 		DiskNumberStart:        0,
 		InternalFileAttributes: 0,
 		ExternalFileAttributes: zh.getExternalFileAttributes(),
 		LocalHeaderOffset:      uint32(min(math.MaxUint32, zh.file.localHeaderOffset)),
 		Filename:               filename,
-		ExtraField:             zh.file.extraField,
+		ExtraField:             extraField,
 		Comment:                zh.file.config.Comment,
 	}
 }
@@ -415,7 +484,7 @@ func (zh *zipHeaders) getFileBitFlag() uint16 {
 		flag |= 0x1
 	}
 
-	if zh.file.config.CompressionMethod == Deflate {
+	if zh.file.config.CompressionMethod == Deflate && zh.file.uncompressedSize != 0 {
 		flag |= zh.getCompressionLevelBits()
 	}
 
@@ -429,6 +498,9 @@ func (zh *zipHeaders) getFileBitFlag() uint16 {
 }
 
 func (zh *zipHeaders) getCompressionMethod() uint16 {
+	if zh.file.uncompressedSize == 0 {
+		return uint16(Store)
+	}
 	if zh.file.config.EncryptionMethod == AES256 {
 		return winZipAESMarker
 	}
@@ -497,14 +569,64 @@ func (zh *zipHeaders) buildLocalExtraData() []byte {
 	return buf
 }
 
-func encodeZip64LocalExtraField(f *File) []byte {
-	// Fixed size: Tag(2) + Size(2) + Uncompressed(8) + Compressed(8) = 20 bytes
-	data := make([]byte, 20)
+func (zh *zipHeaders) buildExtraFieldBytes() []byte {
+	if zh.file.extraField == nil {
+		return zh.file.extraFieldRaw
+	}
+	var buf []byte
+	sorted := getSortedExtraField(zh.file.extraField)
+	for _, b := range sorted {
+		buf = append(buf, b...)
+	}
+	return buf
+}
 
+func encodeZip64LocalExtraField(f *File) []byte {
+	var data [20]byte
 	binary.LittleEndian.PutUint16(data[0:2], Zip64ExtraFieldTag)
 	binary.LittleEndian.PutUint16(data[2:4], 16) // Size of payload
 	binary.LittleEndian.PutUint64(data[4:12], uint64(f.uncompressedSize))
 	binary.LittleEndian.PutUint64(data[12:20], uint64(f.compressedSize))
+	return data[:]
+}
 
-	return data
+// getSortedExtraField returns a sorted slice of extra fields for deterministic writes.
+func getSortedExtraField(extraField map[uint16][]byte) [][]byte {
+	if len(extraField) == 0 {
+		return nil
+	}
+	keys := make([]uint16, 0, len(extraField))
+	for key := range extraField {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	fields := make([][]byte, len(extraField))
+	for i, key := range keys {
+		fields[i] = extraField[key]
+	}
+	return fields
+}
+
+// parseExtraField converts raw extra field bytes into a map keyed by tag IDs.
+func parseExtraField(extraField []byte) map[uint16][]byte {
+	m := make(map[uint16][]byte)
+
+	for offset := 0; offset < len(extraField); {
+		if offset+4 > len(extraField) {
+			break
+		}
+
+		tag := binary.LittleEndian.Uint16(extraField[offset : offset+2])
+		size := int(binary.LittleEndian.Uint16(extraField[offset+2 : offset+4]))
+
+		offset += 4
+		if offset+size > len(extraField) {
+			break
+		}
+
+		m[tag] = extraField[offset-4 : offset+size]
+		offset += size
+	}
+	return m
 }

@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/lemon4ksan/gozip"
@@ -33,7 +35,7 @@ func TestRoundTrip_Sequential(t *testing.T) {
 		"hello.txt":       "Hello World",
 		"dir/":            "",
 		"dir/nested.json": "{}",
-		"images/":          "",
+		"images/":         "",
 		"images/logo.png": string([]byte{0x89, 0x50, 0x4E, 0x47}),
 	}
 
@@ -76,7 +78,7 @@ func TestRoundTrip_Parallel(t *testing.T) {
 func TestRoundTrip_AES256(t *testing.T) {
 	password := "secure_pass"
 	buf := new(bytes.Buffer)
-	
+
 	archive := gozip.NewZip()
 	archive.SetConfig(gozip.ZipConfig{
 		EncryptionMethod: gozip.AES256,
@@ -93,7 +95,7 @@ func TestRoundTrip_AES256(t *testing.T) {
 
 	readArchive := gozip.NewZip()
 	readArchive.SetConfig(gozip.ZipConfig{Password: password})
-	
+
 	if err := readArchive.Load(bytes.NewReader(buf.Bytes()), int64(buf.Len())); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -102,7 +104,7 @@ func TestRoundTrip_AES256(t *testing.T) {
 	if err != nil {
 		t.Fatalf("File not found: %v", err)
 	}
-	
+
 	rc, err := f.Open()
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -145,7 +147,7 @@ func verifyZipContent(t *testing.T, data []byte, expectedFiles map[string]string
 		if err != nil {
 			t.Fatalf("std lib f.Open(%s): %v", f.Name, err)
 		}
-		
+
 		got, err := io.ReadAll(rc)
 		rc.Close()
 		if err != nil {
@@ -178,10 +180,55 @@ type testFile struct {
 	body []byte
 }
 
+const (
+	readFileCount = 1000
+)
+
+var (
+	testZipPath string
+	testZipSize int64
+)
+
 func init() {
 	// Generate data once for consistent benchmarks
 	smallFiles = generateFiles(smallFileCount, smallFileSize)
 	mediumFiles = generateFiles(mediumFileCount, mediumFileSize)
+
+	envPath := os.Getenv("TEST_ZIP_PATH")
+	if envPath != "" {
+		info, err := os.Stat(envPath)
+		if err == nil {
+			testZipPath = envPath
+			testZipSize = info.Size()
+			fmt.Printf("Benchmark: Using external file: %s (%d MB)\n", envPath, testZipSize/1024/1024)
+			return
+		}
+	}
+
+	fmt.Println("Benchmark: Generating temporary test archive...")
+	f, err := os.CreateTemp("", "bench_read_*.zip")
+	if err != nil {
+		panic(err)
+	}
+	testZipPath = f.Name()
+
+	w := gozip.NewZip()
+	content := strings.Repeat("A regular repeating string for compression testing. ", 20) // ~1KB
+
+	for i := range readFileCount {
+		name := fmt.Sprintf("folder_%d/file_%d.txt", i%10, i)
+		w.AddString(content, name)
+	}
+
+	if _, err := w.WriteTo(f); err != nil {
+		panic(err)
+	}
+	f.Close()
+
+	stat, _ := os.Stat(testZipPath)
+	testZipSize = stat.Size()
+	fmt.Printf("Benchmark: Generated %s (%d files, %.2f MB)\n",
+		testZipPath, readFileCount, float64(testZipSize)/1024/1024)
 }
 
 func generateFiles(count, size int) []testFile {
@@ -193,7 +240,7 @@ func generateFiles(count, size int) []testFile {
 		baseContent[i] = byte(rng.Intn(26) + 'a') // a-z
 	}
 
-	for i := 0; i < count; i++ {
+	for i := range count {
 		files[i] = testFile{
 			name: fmt.Sprintf("file_%d.txt", i),
 			body: baseContent, // Shared underlying array to save test memory
@@ -234,7 +281,7 @@ func BenchmarkWrite_Medium_GoZip_Par(b *testing.B) {
 
 func runStdLibBenchmark(b *testing.B, files []testFile) {
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		zw := zip.NewWriter(io.Discard)
 
 		for _, f := range files {
@@ -257,7 +304,7 @@ func runStdLibBenchmark(b *testing.B, files []testFile) {
 
 func runGoZipSeqBenchmark(b *testing.B, files []testFile) {
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		archive := gozip.NewZip()
 		archive.SetConfig(gozip.ZipConfig{
 			CompressionMethod: gozip.Deflate,
@@ -281,7 +328,7 @@ func runGoZipParBenchmark(b *testing.B, files []testFile) {
 	workers := runtime.NumCPU()
 	ctx := context.Background()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		archive := gozip.NewZip()
 		archive.SetConfig(gozip.ZipConfig{
 			CompressionMethod: gozip.Deflate,
@@ -297,5 +344,135 @@ func runGoZipParBenchmark(b *testing.B, files []testFile) {
 		if _, err := archive.WriteToParallelWithContext(ctx, io.Discard, workers); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func BenchmarkLoad_StdLib(b *testing.B) {
+	for b.Loop() {
+		r, err := zip.OpenReader(testZipPath)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = len(r.File)
+		r.Close()
+	}
+}
+
+func BenchmarkLoad_GoZip(b *testing.B) {
+	for b.Loop() {
+		archive := gozip.NewZip()
+		f, err := os.Open(testZipPath)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		err = archive.Load(f, testZipSize)
+		if err != nil {
+			b.Fatal(err)
+		}
+		f.Close()
+	}
+}
+
+func BenchmarkReadSeq_StdLib(b *testing.B) {
+	r, err := zip.OpenReader(testZipPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer r.Close()
+
+	for b.Loop() {
+		for _, f := range r.File {
+			rc, err := f.Open()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if f.UncompressedSize64 == 0 {
+				continue
+			}
+			_, err = io.Copy(io.Discard, rc)
+			rc.Close()
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
+func BenchmarkReadSeq_GoZip(b *testing.B) {
+	f, err := os.Open(testZipPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer f.Close()
+
+	archive := gozip.NewZip()
+	if err := archive.Load(f, testZipSize); err != nil {
+		b.Fatal(err)
+	}
+	files := archive.Files()
+
+	for b.Loop() {
+		for _, file := range files {
+			rc, err := file.Open()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if file.UncompressedSize() == 0 {
+				continue
+			}
+			_, err = io.Copy(io.Discard, rc)
+			rc.Close()
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
+func BenchmarkReadPar_GoZip(b *testing.B) {
+	f, err := os.Open(testZipPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer f.Close()
+
+	archive := gozip.NewZip()
+	if err := archive.Load(f, testZipSize); err != nil {
+		b.Fatal(err)
+	}
+	files := archive.Files()
+	workers := runtime.NumCPU()
+
+	for b.Loop() {
+		var wg sync.WaitGroup
+		queue := make(chan *gozip.File, len(files))
+
+		for _, file := range files {
+			queue <- file
+		}
+		close(queue)
+
+		wg.Add(workers)
+		for range workers {
+			go func() {
+				defer wg.Done()
+				for file := range queue {
+					rc, err := file.Open()
+					if err != nil {
+						b.Errorf("Open error: %v", err)
+						return
+					}
+					if file.UncompressedSize() == 0 {
+						continue
+					}
+					if _, err := io.Copy(io.Discard, rc); err != nil {
+						b.Errorf("Copy error: %v", err)
+					}
+					rc.Close()
+				}
+			}()
+		}
+		wg.Wait()
 	}
 }
