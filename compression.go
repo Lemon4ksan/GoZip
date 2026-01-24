@@ -102,9 +102,7 @@ func (d *DeflateCompressor) Compress(src io.Reader, dest io.Writer) (int64, erro
 type StoredDecompressor struct{}
 
 func (sd *StoredDecompressor) Decompress(src io.Reader) (io.ReadCloser, error) {
-	if rc, ok := src.(io.ReadCloser); ok {
-		return rc, nil
-	}
+	// We don't own src and shouldn't give the caller the ability to close it
 	return io.NopCloser(src), nil
 }
 
