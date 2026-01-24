@@ -6,6 +6,7 @@ package gozip
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -53,7 +54,7 @@ type File struct {
 	flags uint16      // Internal flags state
 
 	openFunc func() (io.ReadCloser, error)     // Factory function for reading decompressed content
-	srcFunc  func() (*io.SectionReader, error) // Factory function for reading original content
+	srcFunc  func() (*io.SectionReader, error) // Factory function for reading compressed content
 
 	uncompressedSize int64  // Size of original content before compression in bytes
 	compressedSize   int64  // Size of compressed data within archive in bytes
@@ -262,6 +263,16 @@ func (f *File) Open() (io.ReadCloser, error) { return f.openFunc() }
 func (f *File) OpenWithPassword(pwd string) (io.ReadCloser, error) {
 	f.config.Password = pwd
 	return f.openFunc()
+}
+
+// OpenRaw returns an io.SectionReader for reading the raw file content
+// (compressed and potentially encrypted) directly from the archive.
+// Returns error if the file was not read from an existing archive.
+func (f *File) OpenRaw() (*io.SectionReader, error) {
+	if f.srcFunc == nil {
+		return nil, errors.New("OpenRaw: data not available (file not read from archive)")
+	}
+	return f.srcFunc()
 }
 
 // HasExtraField checks whether an extra field with the specified tag exists.
