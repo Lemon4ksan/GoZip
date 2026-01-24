@@ -84,7 +84,7 @@ func (zr *zipReader) FindAndReadEndOfCentralDir(ctx context.Context) (internal.E
 		return end, fmt.Errorf("%w: file too small", ErrFormat)
 	}
 
-	const bufSize = 1024
+	const bufSize = 4096 // 4kb for modern SSDs
 	buf := make([]byte, bufSize)
 
 	maxCommentLength := int64(math.MaxUint16)
@@ -213,11 +213,10 @@ func (zr *zipReader) readCentralDir(ctx context.Context, offset uint64, entries 
 
 // newFileFromCentralDir creates a File struct from a central directory entry
 func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *File {
-	var isDir bool
-
 	filename := decodeText(entry.Filename, entry.GeneralPurposeBitFlag, zr.textEncoder)
 	comment := decodeText(entry.Comment, entry.GeneralPurposeBitFlag, zr.textEncoder)
 
+	var isDir bool
 	if strings.HasSuffix(filename, "/") {
 		isDir = true
 		filename = strings.TrimSuffix(filename, "/")
@@ -239,7 +238,6 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 	var encryptionMethod EncryptionMethod
 	compressionMethod := entry.CompressionMethod
 
-	payload := entry.ExtraField
 	for offset := 0; offset < len(entry.ExtraField); {
 		if offset+4 > len(entry.ExtraField) {
 			break
@@ -253,7 +251,7 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 			break
 		}
 
-		data := payload[offset : offset+size]
+		data := entry.ExtraField[offset : offset+size]
 
 		switch tag {
 		case Zip64ExtraFieldTag:
@@ -286,14 +284,14 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 		return zr.openFile(f)
 	}
 
-	// sourceFunc extracts the raw compressed data (e.g., for optimized copying)
+	// srcFunc extracts the raw compressed data (e.g., for optimized copying)
 	f.srcFunc = func() (*io.SectionReader, error) {
 		// We must read the Local Header to find the exact data offset, as
 		// extra fields in Local Header may differ from Central Directory.
 		headerReader := io.NewSectionReader(zr.src, f.localHeaderOffset, localHeaderLen)
 
-		buf := make([]byte, localHeaderLen)
-		if _, err := io.ReadFull(headerReader, buf); err != nil {
+		var buf [localHeaderLen]byte
+		if _, err := io.ReadFull(headerReader, buf[:]); err != nil {
 			return nil, fmt.Errorf("read local header: %w", err)
 		}
 
@@ -316,8 +314,8 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 	headerReader := io.NewSectionReader(zr.src, f.localHeaderOffset, localHeaderLen)
 
-	buf := make([]byte, localHeaderLen)
-	if _, err := io.ReadFull(headerReader, buf); err != nil {
+	var buf [localHeaderLen]byte
+	if _, err := io.ReadFull(headerReader, buf[:]); err != nil {
 		return nil, fmt.Errorf("read local header: %w", err)
 	}
 
@@ -335,6 +333,7 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 	dataR := io.NewSectionReader(zr.src, dataOffset, f.compressedSize)
 
 	var wrappedR io.Reader = dataR
+
 	if isEncrypted {
 		if f.config.Password == "" {
 			return nil, fmt.Errorf("%w: file is encrypted but no password provided", ErrPasswordMismatch)
@@ -464,7 +463,7 @@ type checksumReader struct {
 	size uint64
 }
 
-// Read implements io.Reader interface while calculating CRC32 and tracking bytes read
+// Read implements io.Reader interface while calculating CRC32 and tracking bytes read.
 func (cr *checksumReader) Read(p []byte) (int, error) {
 	n, err := cr.rc.Read(p)
 	if n > 0 {
