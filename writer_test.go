@@ -117,7 +117,7 @@ func TestZipWriter_EncodeToWriter(t *testing.T) {
 				EncryptionMethod:  NotEncrypted,
 			}
 
-			stats, err := zw.encodeToWriter(src, &destBuf, config)
+			stats, err := zw.encodeTo(src, &destBuf, config)
 
 			if (err != nil) != tt.wantErr {
 				t.Errorf("encodeToWriter() error = %v, wantErr %v", err, tt.wantErr)

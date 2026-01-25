@@ -21,7 +21,7 @@ import (
 
 func makeEOCD(entries uint16, cdSize, cdOffset uint32, comment string) []byte {
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, internal.EndOfCentralDirSignature)
+	binary.Write(buf, binary.LittleEndian, internal.EOCDSignature)
 	binary.Write(buf, binary.LittleEndian, uint16(0))            // Disk number
 	binary.Write(buf, binary.LittleEndian, uint16(0))            // Disk number with start
 	binary.Write(buf, binary.LittleEndian, entries)              // Entries on disk
@@ -79,14 +79,14 @@ func TestFindAndReadEndOfCentralDir(t *testing.T) {
 			r := bytes.NewReader(tt.data)
 			zr := newZipReader(r, r.Size(), nil, ZipConfig{})
 
-			got, err := zr.FindAndReadEndOfCentralDir(context.Background())
+			got, err := zr.FindAndReadEOCD(context.Background())
 
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("findAndReadEndOfCentralDir() error = %v, wantErr %v", err, tt.wantErr)
 			}
 
 			if !tt.wantErr && tt.wantFound {
-				if got.TotalNumberOfEntries == 0 && len(tt.data) > 30 {
+				if got.EntriesNum == 0 && len(tt.data) > 30 {
 					// Basic check to see if we parsed something meaningful from our helper
 					// (assuming helper sets entries > 0 usually, except specific cases)
 				}
@@ -107,7 +107,7 @@ func TestFindEOCD_BufferBoundary(t *testing.T) {
 	r := bytes.NewReader(data)
 	zr := newZipReader(r, r.Size(), nil, ZipConfig{})
 
-	res, err := zr.FindAndReadEndOfCentralDir(context.Background())
+	res, err := zr.FindAndReadEOCD(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to find EOCD across buffer boundaries: %v", err)
 	}

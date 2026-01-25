@@ -14,13 +14,13 @@ import (
 // Each record type must be identified using a header signature that identifies the record type.
 // Signature values begin with the two byte constant marker of 0x4b50, representing the characters "PK".
 const (
-	CentralDirectorySignature            uint32 = 0x02014b50
-	LocalFileHeaderSignature             uint32 = 0x04034b50
-	DigitalHeaderSignature               uint32 = 0x05054b50
-	EndOfCentralDirSignature             uint32 = 0x06054b50
-	Zip64EndOfCentralDirSignature        uint32 = 0x06064b50
-	Zip64EndOfCentralDirLocatorSignature uint32 = 0x07064b50
-	ArchiveExtraDataSignature            uint32 = 0x08064b50
+	CentralDirectorySignature uint32 = 0x02014b50
+	LocalFileHeaderSignature  uint32 = 0x04034b50
+	DigitalHeaderSignature    uint32 = 0x05054b50
+	EOCDSignature             uint32 = 0x06054b50
+	Zip64EOCDSignature        uint32 = 0x06064b50
+	Zip64EOCDLocatorSignature uint32 = 0x07064b50
+	ArchiveExtraDataSignature uint32 = 0x08064b50
 )
 
 type LocalFileHeader struct {
@@ -41,7 +41,7 @@ type LocalFileHeader struct {
 func (h LocalFileHeader) Encode() []byte {
 	size := 30 + h.FilenameLength + h.ExtraFieldLength
 	buf := make([]byte, size)
-	
+
 	binary.LittleEndian.PutUint32(buf[0:4], LocalFileHeaderSignature)
 	binary.LittleEndian.PutUint16(buf[4:6], h.VersionNeededToExtract)
 	binary.LittleEndian.PutUint16(buf[6:8], h.GeneralPurposeBitFlag)
@@ -116,11 +116,11 @@ func ReadCentralDirEntry(src io.Reader) (CentralDirectory, error) {
 	}
 
 	if entry.ExtraFieldLength > 0 {
-        entry.ExtraField = make([]byte, entry.ExtraFieldLength)
-        if _, err := io.ReadFull(src, entry.ExtraField); err != nil {
-            return CentralDirectory{}, fmt.Errorf("read extra field: %w", err)
-        }
-    }
+		entry.ExtraField = make([]byte, entry.ExtraFieldLength)
+		if _, err := io.ReadFull(src, entry.ExtraField); err != nil {
+			return CentralDirectory{}, fmt.Errorf("read extra field: %w", err)
+		}
+	}
 
 	if entry.FileCommentLength > 0 {
 		comment := make([]byte, entry.FileCommentLength)
@@ -164,22 +164,22 @@ func (d CentralDirectory) Encode() []byte {
 	return buf
 }
 
-type EndOfCentralDirectory struct {
+type EOCD struct {
 	ThisDiskNum                     uint16
 	DiskNumWithTheStartOfCentralDir uint16
 	TotalNumberOfEntriesOnThisDisk  uint16
-	TotalNumberOfEntries            uint16
+	EntriesNum                      uint16
 	CentralDirSize                  uint32
 	CentralDirOffset                uint32
 	CommentLength                   uint16
 	Comment                         string
 }
 
-func EncodeEndOfCentralDirRecord(entriesNum int, centralDirSize uint64, centralDirOffset uint64, comment string) []byte {
+func EncodeEOCD(entriesNum int, centralDirSize uint64, centralDirOffset uint64, comment string) []byte {
 	commentLen := min(len(comment), math.MaxUint16)
 	buf := make([]byte, 22+commentLen)
 
-	binary.LittleEndian.PutUint32(buf[0:4], EndOfCentralDirSignature)
+	binary.LittleEndian.PutUint32(buf[0:4], EOCDSignature)
 	binary.LittleEndian.PutUint16(buf[4:6], 0)
 	binary.LittleEndian.PutUint16(buf[6:8], 0)
 	binary.LittleEndian.PutUint16(buf[8:10], uint16(min(math.MaxUint16, entriesNum)))
@@ -193,16 +193,16 @@ func EncodeEndOfCentralDirRecord(entriesNum int, centralDirSize uint64, centralD
 	return buf
 }
 
-func ReadEndOfCentralDir(src io.Reader) (EndOfCentralDirectory, error) {
+func ReadEndOfCentralDir(src io.Reader) (EOCD, error) {
 	var buf [18]byte
 	if _, err := io.ReadFull(src, buf[:]); err != nil {
-		return EndOfCentralDirectory{}, fmt.Errorf("read source: %w", err)
+		return EOCD{}, fmt.Errorf("read source: %w", err)
 	}
-	end := EndOfCentralDirectory{
+	end := EOCD{
 		ThisDiskNum:                     binary.LittleEndian.Uint16(buf[0:2]),
 		DiskNumWithTheStartOfCentralDir: binary.LittleEndian.Uint16(buf[2:4]),
 		TotalNumberOfEntriesOnThisDisk:  binary.LittleEndian.Uint16(buf[4:6]),
-		TotalNumberOfEntries:            binary.LittleEndian.Uint16(buf[6:8]),
+		EntriesNum:                      binary.LittleEndian.Uint16(buf[6:8]),
 		CentralDirSize:                  binary.LittleEndian.Uint32(buf[8:12]),
 		CentralDirOffset:                binary.LittleEndian.Uint32(buf[12:16]),
 		CommentLength:                   binary.LittleEndian.Uint16(buf[16:18]),
@@ -210,7 +210,7 @@ func ReadEndOfCentralDir(src io.Reader) (EndOfCentralDirectory, error) {
 	if end.CommentLength > 0 {
 		commentBuf := make([]byte, end.CommentLength)
 		if _, err := io.ReadFull(src, commentBuf); err != nil {
-			return EndOfCentralDirectory{}, fmt.Errorf("read comment: %w", err)
+			return EOCD{}, fmt.Errorf("read comment: %w", err)
 		}
 		end.Comment = string(commentBuf)
 	}
@@ -218,40 +218,40 @@ func ReadEndOfCentralDir(src io.Reader) (EndOfCentralDirectory, error) {
 	return end, nil
 }
 
-type Zip64EndOfCentralDirectory struct {
+type Zip64EOCD struct {
 	Size                            uint64
 	VersionMadeBy                   uint16
 	VersionNeededToExtract          uint16
 	ThisDiskNum                     uint32
 	DiskNumWithTheStartOfCentralDir uint32
 	TotalNumberOfEntriesOnThisDisk  uint64
-	TotalNumberOfEntries            uint64
+	EntriesNum                      uint64
 	CentralDirSize                  uint64
 	CentralDirOffset                uint64
 }
 
-func ReadZip64EndOfCentralDir(src io.Reader) (Zip64EndOfCentralDirectory, error) {
+func ReadZip64EOCD(src io.Reader) (Zip64EOCD, error) {
 	var buf [52]byte
 	if _, err := io.ReadFull(src, buf[:]); err != nil {
-		return Zip64EndOfCentralDirectory{}, fmt.Errorf("read source: %w", err)
+		return Zip64EOCD{}, fmt.Errorf("read source: %w", err)
 	}
-	return Zip64EndOfCentralDirectory{
+	return Zip64EOCD{
 		Size:                            binary.LittleEndian.Uint64(buf[0:8]),
 		VersionMadeBy:                   binary.LittleEndian.Uint16(buf[8:10]),
 		VersionNeededToExtract:          binary.LittleEndian.Uint16(buf[10:12]),
 		ThisDiskNum:                     binary.LittleEndian.Uint32(buf[12:16]),
 		DiskNumWithTheStartOfCentralDir: binary.LittleEndian.Uint32(buf[16:20]),
 		TotalNumberOfEntriesOnThisDisk:  binary.LittleEndian.Uint64(buf[20:28]),
-		TotalNumberOfEntries:            binary.LittleEndian.Uint64(buf[28:36]),
+		EntriesNum:                      binary.LittleEndian.Uint64(buf[28:36]),
 		CentralDirSize:                  binary.LittleEndian.Uint64(buf[36:44]),
 		CentralDirOffset:                binary.LittleEndian.Uint64(buf[44:52]),
 	}, nil
 }
 
-func EncodeZip64EndOfCentralDirRecord(entriesNum uint64, centralDirSize uint64, centralDirOffset uint64) []byte {
+func EncodeZip64EOCDRecord(entriesNum uint64, centralDirSize uint64, centralDirOffset uint64) []byte {
 	buf := make([]byte, 56)
 
-	binary.LittleEndian.PutUint32(buf[0:4], Zip64EndOfCentralDirSignature)
+	binary.LittleEndian.PutUint32(buf[0:4], Zip64EOCDSignature)
 	binary.LittleEndian.PutUint64(buf[4:12], 44)
 	binary.LittleEndian.PutUint16(buf[12:14], 45)
 	binary.LittleEndian.PutUint16(buf[14:16], 45)
@@ -265,28 +265,28 @@ func EncodeZip64EndOfCentralDirRecord(entriesNum uint64, centralDirSize uint64, 
 	return buf
 }
 
-type Zip64EndOfCentralDirectoryLocator struct {
+type Zip64EOCDLocator struct {
 	EndOfCentralDirStartDiskNum uint32
 	Zip64EndOfCentralDirOffset  uint64
 	TotalNumberOfDisks          uint32
 }
 
-func ReadZip64EndOfCentralDirLocator(src io.Reader) (Zip64EndOfCentralDirectoryLocator, error) {
+func ReadZip64EOCDLocator(src io.Reader) (Zip64EOCDLocator, error) {
 	var buf [16]byte
 	if _, err := io.ReadFull(src, buf[:]); err != nil {
-		return Zip64EndOfCentralDirectoryLocator{}, fmt.Errorf("read source: %w", err)
+		return Zip64EOCDLocator{}, fmt.Errorf("read source: %w", err)
 	}
-	return Zip64EndOfCentralDirectoryLocator{
+	return Zip64EOCDLocator{
 		EndOfCentralDirStartDiskNum: binary.LittleEndian.Uint32(buf[0:4]),
 		Zip64EndOfCentralDirOffset:  binary.LittleEndian.Uint64(buf[4:12]),
 		TotalNumberOfDisks:          binary.LittleEndian.Uint32(buf[12:16]),
 	}, nil
 }
 
-func EncodeZip64EndOfCentralDirLocator(endOfCentralDirOffset uint64) []byte {
+func EncodeZip64EOCDLocator(endOfCentralDirOffset uint64) []byte {
 	buf := make([]byte, 20)
 
-	binary.LittleEndian.PutUint32(buf[0:4], Zip64EndOfCentralDirLocatorSignature)
+	binary.LittleEndian.PutUint32(buf[0:4], Zip64EOCDLocatorSignature)
 	binary.LittleEndian.PutUint32(buf[4:8], 0)
 	binary.LittleEndian.PutUint64(buf[8:16], endOfCentralDirOffset)
 	binary.LittleEndian.PutUint32(buf[16:20], 1)

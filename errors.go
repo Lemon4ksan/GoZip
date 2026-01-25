@@ -20,9 +20,6 @@ var (
 	// ErrAlgorithm is returned when a compression algorithm is not supported.
 	ErrAlgorithm = errors.New("unsupported compression algorithm")
 
-	// ErrEncryption is returned when an encryption method is not supported.
-	ErrEncryption = errors.New("unsupported encryption method")
-
 	// ErrPasswordMismatch is returned when the provided password does not match
 	// or when a password is required but not provided.
 	ErrPasswordMismatch = errors.New("zip: invalid password")

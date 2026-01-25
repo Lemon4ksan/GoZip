@@ -217,7 +217,7 @@ func TestEndOfCentralDir_Encode(t *testing.T) {
 	comment := "End of Archive"
 
 	// Action
-	encoded := EncodeEndOfCentralDirRecord(entries, size, offset, comment)
+	encoded := EncodeEOCD(entries, size, offset, comment)
 
 	// Verification
 	if len(encoded) != 22+len(comment) {
@@ -229,7 +229,7 @@ func TestEndOfCentralDir_Encode(t *testing.T) {
 	// Check Signature
 	var signature uint32
 	binary.Read(buf, binary.LittleEndian, &signature)
-	if signature != EndOfCentralDirSignature {
+	if signature != EOCDSignature {
 		t.Errorf("Signature mismatch")
 	}
 
@@ -253,14 +253,14 @@ func TestEndOfCentralDir_Encode(t *testing.T) {
 // TestZip64Records tests the structure of Zip64 specific records
 func TestZip64Records(t *testing.T) {
 	t.Run("Zip64 End Of Central Directory", func(t *testing.T) {
-		encoded := EncodeZip64EndOfCentralDirRecord(100, 5000, 10000)
+		encoded := EncodeZip64EOCDRecord(100, 5000, 10000)
 
 		if len(encoded) != 56 {
 			t.Errorf("Zip64 EOCD size mismatch: got %d, want 56", len(encoded))
 		}
 
 		sig := binary.LittleEndian.Uint32(encoded[0:4])
-		if sig != Zip64EndOfCentralDirSignature {
+		if sig != Zip64EOCDSignature {
 			t.Errorf("Signature mismatch")
 		}
 
@@ -271,14 +271,14 @@ func TestZip64Records(t *testing.T) {
 	})
 
 	t.Run("Zip64 Locator", func(t *testing.T) {
-		encoded := EncodeZip64EndOfCentralDirLocator(9999)
+		encoded := EncodeZip64EOCDLocator(9999)
 
 		if len(encoded) != 20 {
 			t.Errorf("Zip64 Locator size mismatch: got %d, want 20", len(encoded))
 		}
 
 		sig := binary.LittleEndian.Uint32(encoded[0:4])
-		if sig != Zip64EndOfCentralDirLocatorSignature {
+		if sig != Zip64EOCDLocatorSignature {
 			t.Errorf("Signature mismatch")
 		}
 	})
