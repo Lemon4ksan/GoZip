@@ -85,14 +85,14 @@ func newFileFromOS(f *os.File) (*File, error) {
 		return nil, err
 	}
 
-	var uncompressedSize int64
+	var size int64
 	if !stat.IsDir() {
-		uncompressedSize = stat.Size()
+		size = stat.Size()
 	}
 
 	return &File{
 		name:             stat.Name(),
-		uncompressedSize: uncompressedSize,
+		uncompressedSize: size,
 		modTime:          stat.ModTime(),
 		isDir:            stat.IsDir(),
 		mode:             stat.Mode(),
@@ -255,24 +255,56 @@ func (f *File) FsTime() (mtime, atime, ctime time.Time) {
 	return
 }
 
-// Open returns a ReadCloser for reading the original, uncompressed file content.
-func (f *File) Open() (io.ReadCloser, error) { return f.openFunc() }
-
-// Open returns a ReadCloser object for reading the original,
-// uncompressed file content using the specified password.
-func (f *File) OpenWithPassword(pwd string) (io.ReadCloser, error) {
-	f.config.Password = pwd
+// Open returns an io.ReadCloser for reading the uncompressed content of the file.
+// If the file was read from an existing archive, the file config is only used for the password.
+// The original compression and encryption methods are preserved.
+//
+// Returns an error if the file cannot be opened (e.g., if it is explicitly a directory).
+// If the CRC checksum does not match after reading the entire file
+// from the loaded archive, ReadCloser returns [ErrChecksum].
+func (f *File) Open() (io.ReadCloser, error) {
+	if f.openFunc == nil {
+		return nil, errors.New("Open: data not available")
+	}
 	return f.openFunc()
 }
 
 // OpenRaw returns an io.SectionReader for reading the raw file content
 // (compressed and potentially encrypted) directly from the archive.
-// Returns error if the file was not read from an existing archive.
+// Returns error if the original data is unavailable.
 func (f *File) OpenRaw() (*io.SectionReader, error) {
 	if f.srcFunc == nil {
 		return nil, errors.New("OpenRaw: data not available (file not read from archive)")
 	}
 	return f.srcFunc()
+}
+
+// SetSourcePassword updates the password used to read (decrypt) this specific file
+// from the original archive in case if the archive-wide password was incorrect
+// or if different files have different passwords.
+func (f *File) SetSourcePassword(pwd string) {
+    f.srcConfig.Password = pwd
+}
+
+// DisableEncryption sets encryption method to [NotEncrypted] and removes the password for this file.
+// This does not affect configuration for decompressing file from an existing archive.
+func (f *File) DisableEncryption() {
+    f.config.EncryptionMethod = NotEncrypted
+    f.config.Password = ""
+}
+
+// SetCompression replaces the compression method and level with the specified ones.
+// This does not affect configuration for decompressing file from an existing archive.
+func (f *File) SetCompression(method CompressionMethod, level int) {
+    f.config.CompressionMethod = method
+    f.config.CompressionLevel = level
+}
+
+// SetEncryption replaces the encryption method and password with the specified ones.
+// This does not affect configuration for decompressing file from an existing archive.
+func (f *File) SetEncryption(method EncryptionMethod, pwd string) {
+	f.config.EncryptionMethod = method
+	f.config.Password = pwd
 }
 
 // HasExtraField checks whether an extra field with the specified tag exists.
@@ -299,8 +331,8 @@ func (f *File) SetConfig(config FileConfig) {
 	f.config.Comment = config.Comment
 }
 
-// SetOpenFunc replaces the internal function used to open the file's content.
-// Note that internal file sizes will be updated only after the archive is written.
+// SetOpenFunc replaces the function used to open the file's content.
+// Note that file sizes will be updated only after the archive is written.
 func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) {
 	f.srcFunc = nil
 	f.openFunc = openFunc
@@ -366,9 +398,12 @@ func (f *File) shouldCopyRaw() bool {
 		return false
 	}
 	if f.config.EncryptionMethod != NotEncrypted {
-		if f.config.Password != f.srcConfig.Password {
+		if f.config.Password != "" && f.config.Password != f.srcConfig.Password {
 			return false
 		}
+	}
+	if f.config.CompressionLevel != f.srcConfig.CompressionLevel {
+		return false
 	}
 	return true
 }
