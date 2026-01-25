@@ -20,6 +20,13 @@ import (
 )
 
 // EncryptionMethod represents the encryption algorithm used for file protection.
+//
+// Compatibility Warning:
+//   - AES256 is the recommended standard for security. It is supported by modern
+//     archivers like 7-Zip, WinRAR.
+//   - Some legacy tools (e.g., older built-in macOS Archive Utility or Windows Explorer)
+//     may only support ZipCrypto (weak encryption). Use ZipCrypto only if legacy
+//     compatibility is strictly required.
 type EncryptionMethod uint16
 
 // Supported encryption methods

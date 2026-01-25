@@ -256,12 +256,18 @@ func (f *File) FsTime() (mtime, atime, ctime time.Time) {
 }
 
 // Open returns an io.ReadCloser for reading the uncompressed content of the file.
-// If the file was read from an existing archive, the file config is only used for the password.
-// The original compression and encryption methods are preserved.
 //
-// Returns an error if the file cannot be opened (e.g., if it is explicitly a directory).
-// If the CRC checksum does not match after reading the entire file
-// from the loaded archive, ReadCloser returns [ErrChecksum].
+// Behavior:
+//   - If the file comes from an existing archive, the original compression
+//     and encryption methods are preserved automatically.
+//   - The file's Config is used ONLY to retrieve the decryption password.
+//
+// Errors:
+//   - Returns [ErrPasswordMismatch] immediately if the provided password is incorrect
+//     (for AES/ZipCrypto).
+//   - The returned ReadCloser may return [ErrChecksum] during reading (typically at EOF)
+//     or upon Close() if the data integrity check fails.
+//   - Returns an error if the file is a directory or has no data source.
 func (f *File) Open() (io.ReadCloser, error) {
 	if f.openFunc == nil {
 		return nil, errors.New("Open: data not available")
@@ -270,8 +276,13 @@ func (f *File) Open() (io.ReadCloser, error) {
 }
 
 // OpenRaw returns an io.SectionReader for reading the raw file content
-// (compressed and potentially encrypted) directly from the archive.
-// Returns error if the original data is unavailable.
+// (compressed and/or encrypted) directly from the archive source.
+//
+// Use Case:
+//   - Debugging headers or compression ratios.
+//   - Copying raw compressed data to another archive without re-compression
+//
+// Returns error if the file was created in memory and not yet written to an archive.
 func (f *File) OpenRaw() (*io.SectionReader, error) {
 	if f.srcFunc == nil {
 		return nil, errors.New("OpenRaw: data not available (file not read from archive)")
