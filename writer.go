@@ -580,9 +580,10 @@ func newParallelZipWriter(config ZipConfig, factories factoriesMap, dest io.Writ
 
 // zipResult holds the outcome of a compression job
 type zipResult struct {
-	file *File
-	src  io.Reader // Compressed data stream
-	err  error
+	file     *File
+	src      io.Reader // Compressed data stream
+	err      error
+	acquired bool // Indicates if inflightSem slot was acquired
 }
 
 // WriteFiles processes multiple files in parallel and writes them to the ZIP archive.
@@ -603,16 +604,22 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 	go func() {
 		// Feeds work into the system up to the inflight limit
 		for i, f := range files {
-			// Acquire In-Flight Slot, so the writer can always release it.
+			var acquired bool
+
+			// Attempt to acquire In-Flight Slot
 			select {
 			case <-ctx.Done():
-				// If cancelled, we still acquire to keep the accounting symmetrical
+				// Context cancelled: we skip acquiring the semaphore to fail fast.
+				acquired = false
 			case inflightSem <- struct{}{}:
+				// Slot acquired successfully.
+				acquired = true
 			}
 
 			// If context is dead, fast-path the result
 			if ctx.Err() != nil {
-				results[i] <- zipResult{file: f, err: ctx.Err()}
+				// Pass 'acquired' state to the collector so it knows whether to release
+				results[i] <- zipResult{file: f, err: ctx.Err(), acquired: acquired}
 				close(results[i])
 				continue
 			}
@@ -624,8 +631,7 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 				// Acquire CPU Semaphore (Blocks if all CPUs are busy)
 				select {
 				case <-ctx.Done():
-					// Even if cancelled, we must send a result to unblock the reader
-					results[idx] <- zipResult{file: f, err: ctx.Err()}
+					results[idx] <- zipResult{file: f, err: ctx.Err(), acquired: true}
 					close(results[idx])
 					return
 				case pzw.sem <- struct{}{}:
@@ -634,20 +640,25 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 
 				// Compress
 				src, err := pzw.compressFile(ctx, f)
-				results[idx] <- zipResult{file: f, src: src, err: err}
+				// We definitely acquired inflightSem to get here
+				results[idx] <- zipResult{file: f, src: src, err: err, acquired: true}
 				close(results[idx])
 			}(i, f)
 		}
 	}()
-	// We don't wg.Wait() the spawner because the writer loop
-	// knows exactly how many files to expect (len(files)).
 
 	for _, resultChan := range results {
-		
+
 		res, ok := <-resultChan
 		if !ok {
 			// Should not happen unless logic bug or extreme panic
 			continue
+		}
+
+		// Only release the semaphore if we actually acquired it.
+		// This prevents deadlock when context cancellation caused us to skip acquisition.
+		if res.acquired {
+			<-inflightSem
 		}
 
 		if res.err != nil {
@@ -673,7 +684,6 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 				pzw.cleanupBuf(res.src)
 			}
 		}
-		<-inflightSem
 	}
 
 	wg.Wait()
