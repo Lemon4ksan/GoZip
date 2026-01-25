@@ -81,7 +81,7 @@ func (zfs *zipFS) getFileEntry(name string) (*File, error) {
 		}, nil
 	}
 
-	if f, err := zfs.z.File(name); err == nil {
+	if f, ok := zfs.z.File(name); ok {
 		return f, nil
 	}
 

@@ -100,9 +100,9 @@ func TestRoundTrip_AES256(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	f, err := readArchive.File(name)
-	if err != nil {
-		t.Fatalf("File not found: %v", err)
+	f, ok := readArchive.File(name)
+	if !ok {
+		t.Fatalf("File not found")
 	}
 
 	rc, err := f.Open()
