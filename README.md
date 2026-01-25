@@ -20,6 +20,13 @@ GoZip achieves performance parity with the standard library in sequential mode w
 
 You can speed up the time even further by registering a faster flate implementation. ([`github.com/klauspost/compress/flate`](https://github.com/klauspost/compress) for example)
 
+```go
+// Example registration:
+archive.RegisterCompressor(gozip.Deflate, func(level int) gozip.Compressor {
+    return klauspost_wrapper.New(level)
+})
+```
+
 ## 🚀 Key Features
 
 * **High Performance:** Built-in support for **parallel compression and extraction** using worker pools.
@@ -37,7 +44,7 @@ You can speed up the time even further by registering a faster flate implementat
 ## 📦 Installation
 
 ```bash
-go get github.com/lemon4ksan/gozip
+go get github.com/lemon4ksan/gozip@latest
 ```
 
 ## 📖 Usage Examples
@@ -66,7 +73,7 @@ func main() {
 
     // Add a directory recursively
     // You can override compression per file
-    archive.AddDir("images", gozip.WithCompression(gozip.Deflated, gozip.DeflateMaximum))
+    archive.AddDir("images", gozip.WithCompression(gozip.Deflate, gozip.DeflateMaximum))
 
     out, _ := os.Create("backup.zip")
     defer out.Close()
@@ -120,24 +127,31 @@ func main() {
     archive.Remove("temp_cache") // Recursive removal
 
     // 2. Rename/Move files
-    if file, err := archive.File("images/old_logo.png"); err == nil {
+    if file, ok := archive.File("images/old_logo.png"); ok {
         archive.Move(file.Name(), "assets/graphics")
         archive.Rename(file.Name(), "new_logo.png")
     }
 
     // 3. Modify a file
-    file := archive.File("data/config.json")
+    file, _ := archive.File("data/config.json")
     archive.Remove(file.Name())
     archive.AddLazy(file.Name(), func() (io.ReadCloser, error) {
-        rc, err := file.Open()
-        if err != nil {
-            return nil, err
-        }
-        defer rc.Close()
+        pr, pw := io.Pipe()
 
-        // Modify original data ...
+        go func() {
+            defer pw.Close() 
 
-        return io.NopCloser(bytes.NewReader(processedData)), nil
+            rc, err := file.Open()
+            if err != nil {
+                pw.CloseWithError(err)
+                return
+            }
+            defer rc.Close()
+
+            processor.Transform(rc, pw)
+        }()
+
+        return pr, nil
     })
 
     // 4. Add new content
@@ -159,8 +173,10 @@ Safe extraction with timeout protection.
 ```go
 func main() {
     archive := gozip.NewZip()
+
     f, _ := os.Open("huge_backup.zip")
     defer f.Close()
+
     archive.LoadFromFile(f)
 
     // Create a context with a 30-second timeout
@@ -224,7 +240,7 @@ func main() {
 
     // Set global configuration
     archive.SetConfig(gozip.ZipConfig{
-        CompressionMethod: gozip.Deflated,
+        CompressionMethod: gozip.Deflate,
         CompressionLevel:  gozip.DeflateNormal,
         EncryptionMethod:  gozip.AES256, // Recommended
         Password:          "MySecretPassword123",
@@ -234,6 +250,51 @@ func main() {
 
     out, _ := os.Create("secure.zip")
     archive.WriteTo(out)
+}
+```
+
+If you want to remove encryption, you can do it as follows:
+
+```go
+func main() {
+    archive := gozip.NewZip()
+    // Register compressors & decompressors if needed
+
+    archive.SetConfig(gozip.ZipConfig{
+        Password: "pass",
+    })
+
+    f, _ := os.Open("encrypted.zip")
+    defer f.Close()
+
+    // Only the password will apply
+    if err := archive.LoadFromFile(f); err != nil {
+        panic(err)
+    }
+
+    // Remove encryption and set new compression level for each file
+    for _, file := range archive.Files() {
+        // To replace initial password use file.SetSourcePassword()
+        // in case if it's incorrect
+        file.DisableEncryption()
+        file.SetCompression(gozip.Deflate, gozip.DeflateMaximum)
+    }
+
+    out, _ := os.Create("output.zip")
+    defer out.Close()
+
+    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+    defer stop()
+
+    _, err := archive.WriteToParallelWithContext(ctx, out, runtime.NumCPU())
+    if err != nil {
+        if err == context.Canceled {
+            out.Close()
+            os.Remove("output.zip")
+            return
+        }
+        panic(err)
+    }
 }
 ```
 
@@ -276,7 +337,7 @@ if err := archive.Extract("out"); err != nil {
 
 **Available Errors:**
 
-* `ErrFormat`, `ErrAlgorithm`, `ErrEncryption`
+* `ErrFormat`, `ErrAlgorithm`,
 * `ErrPasswordMismatch`, `ErrChecksum`, `ErrSizeMismatch`
 * `ErrFileNotFound`, `ErrDuplicateEntry`
 * `ErrInsecurePath` (Zip Slip attempt)
@@ -293,6 +354,14 @@ Configure individual files using the Option pattern:
 * `WithCompression(method, level)`: Override compression for this file.
 * `WithEncryption(method, password)`: Override encryption for this file.
 * `WithMode(0755)`: Set custom file permissions (Unix style).
+
+Configure which files should be saved or extracted using Filters:
+
+* `WithFiles(files)`: Restrict operation to provided files.
+* `FromDir("folder1")`: Restrict operation to files located within the specified directory.
+* `WithoutDir("folder2")`: Exclude files from a directory from the operation.
+
+Or you can write your own filter, for example to exclude files larger than 10 MB.
 
 ### Sort Strategies
 
