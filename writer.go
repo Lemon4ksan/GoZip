@@ -648,7 +648,6 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 	}()
 
 	for _, resultChan := range results {
-
 		res, ok := <-resultChan
 		if !ok {
 			// Should not happen unless logic bug or extreme panic
@@ -687,6 +686,11 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 	}
 
 	wg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		errs = append(errs, err)
+	}
+
 	return errs
 }
 

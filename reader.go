@@ -343,16 +343,16 @@ func (zr *zipReader) getRawDataStream(f *File) (io.Reader, uint16, error) {
 
 // wrapDecryption wraps reader with decrypter based on method.
 func (zr *zipReader) wrapDecryption(src io.Reader, f *File, flags uint16) (io.Reader, error) {
-	if f.config.Password == "" {
+	if f.srcConfig.Password == "" {
 		return nil, fmt.Errorf("%w: file is encrypted but no password provided", ErrPasswordMismatch)
 	}
 
 	switch f.srcConfig.EncryptionMethod {
 	case ZipCrypto:
 		_, dosTime := timeToMsDos(f.modTime)
-		return newZipCryptoReader(src, f.config.Password, flags, f.crc32, dosTime)
+		return newZipCryptoReader(src, f.srcConfig.Password, flags, f.crc32, dosTime)
 	case AES256:
-		return newAes256Reader(src, f.config.Password, f.compressedSize)
+		return newAes256Reader(src, f.srcConfig.Password, f.compressedSize)
 	default:
 		return nil, fmt.Errorf("unknown encryption method: %d", f.srcConfig.EncryptionMethod)
 	}
