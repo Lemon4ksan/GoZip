@@ -444,6 +444,10 @@ func (zw *zipWriter) createEncryptor(dest io.Writer, cfg FileConfig, crc32Val ui
 
 // writeFileHeader writes the Local File Header.
 func (zw *zipWriter) writeFileHeader(f *File) error {
+	if f.isDir && zw.config.UseImplicitDirs {
+		return nil
+	}
+
 	f.localHeaderOffset = zw.headerOffset
 	header := newZipHeaders(f).LocalHeader()
 
@@ -458,6 +462,10 @@ func (zw *zipWriter) writeFileHeader(f *File) error {
 
 // addCentralDirEntry adds a Central Directory record.
 func (zw *zipWriter) addCentralDirEntry(f *File) error {
+	if f.isDir && zw.config.UseImplicitDirs {
+		return nil
+	}
+
 	if f.config.EncryptionMethod == AES256 {
 		f.SetExtraField(AESEncryptionTag, encodeAESExtraField(f))
 	}
@@ -565,10 +573,15 @@ type parallelZipWriter struct {
 }
 
 func newParallelZipWriter(config ZipConfig, factories factoriesMap, dest io.Writer, workers int) *parallelZipWriter {
+	var threshold int64 = 10 * 1024 * 1024 // 10MB
+	if config.MemoryThreshold > 0 {
+		threshold = config.MemoryThreshold
+	}
+
 	return &parallelZipWriter{
 		zw:              newZipWriter(config, factories, dest),
 		sem:             make(chan struct{}, workers),
-		memoryThreshold: 10 * 1024 * 1024, // 10MB
+		memoryThreshold: threshold,
 		bufferPool: sync.Pool{
 			New: func() interface{} {
 				return newMemoryBuffer(64 * 1024)
@@ -600,6 +613,7 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 
 	var wg sync.WaitGroup
 	var errs []error
+	var stopWriting bool
 
 	go func() {
 		// Feeds work into the system up to the inflight limit
@@ -664,25 +678,39 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 			if !errors.Is(res.err, context.Canceled) && !errors.Is(res.err, context.DeadlineExceeded) {
 				errs = append(errs, fmt.Errorf("%s: %w", res.file.name, res.err))
 			}
-		} else {
-			// Write to the actual ZIP stream
-			// Check context again before expensive I/O
-			if ctx.Err() != nil {
-				pzw.cleanupBuf(res.src)
-			} else {
-				err := pzw.writeCompressedFile(res.file, res.src)
-				if err != nil {
-					errs = append(errs, fmt.Errorf("%s: %w", res.file.name, err))
-				} else if err = pzw.zw.addCentralDirEntry(res.file); err != nil {
-					errs = append(errs, fmt.Errorf("%s: %w", res.file.name, err))
-				}
+			stopWriting = true
+			continue
+		}
 
-				if pzw.onFileProcessed != nil {
-					pzw.onFileProcessed(res.file, err)
-				}
-				pzw.cleanupBuf(res.src)
+		if stopWriting {
+			pzw.cleanupBuf(res.src)
+			continue
+		}
+
+		// Check context again before expensive I/O
+		if err := ctx.Err(); err != nil {
+			stopWriting = true
+			pzw.cleanupBuf(res.src)
+			continue
+		}
+
+		// Write to the actual ZIP stream
+		err := pzw.writeCompressedFile(res.file, res.src)
+		if err != nil {
+			err = fmt.Errorf("%s: %w", res.file.name, err)
+			errs = append(errs, err)
+			stopWriting = true // If write operation fails, there's no reason to continue
+		} else {
+			if err = pzw.zw.addCentralDirEntry(res.file); err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", res.file.name, err))
+				stopWriting = true
 			}
 		}
+
+		if pzw.onFileProcessed != nil {
+			pzw.onFileProcessed(res.file, err)
+		}
+		pzw.cleanupBuf(res.src)
 	}
 
 	wg.Wait()
