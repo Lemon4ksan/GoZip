@@ -42,6 +42,9 @@ const (
 	// AESEncryptionTag identifies the extra field for WinZip AES encryption metadata,
 	// including encryption strength and actual compression method.
 	AESEncryptionTag uint16 = 0x9901
+
+	// MaxStringLength determines the maximum length for filename and comment.
+	MaxStringLength = math.MaxUint16
 )
 
 // File represents a file entry within a ZIP archive, encapsulating both metadata

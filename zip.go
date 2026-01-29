@@ -1310,11 +1310,11 @@ func (z *Zip) addEntry(f *File, options []AddOption) error {
 
 	f.name = strings.TrimPrefix(path.Clean(strings.ReplaceAll(f.name, "\\", "/")), "/")
 
-	if len(f.entryName()) > maxStringLength {
+	if len(f.entryName()) > MaxStringLength {
 		return fmt.Errorf("%w (%d bytes)", ErrFilenameTooLong, len(f.name))
 	}
 
-	if len(f.config.Comment) > maxStringLength {
+	if len(f.config.Comment) > MaxStringLength {
 		return fmt.Errorf("%w (%d bytes)", ErrCommentTooLong, len(f.config.Comment))
 	}
 
@@ -1456,7 +1456,7 @@ func (z *Zip) checkPathTransform(op string, f *File, newPath string) error {
 
 	for _, entry := range z.files {
 		if after, ok := strings.CutPrefix(entry.entryName(), oldPrefix); ok {
-			if len(newPrefix+after) > maxStringLength {
+			if len(newPrefix+after) > MaxStringLength {
 				return wrapErr(op, entry, ErrFilenameTooLong)
 			}
 		}

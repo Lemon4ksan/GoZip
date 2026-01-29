@@ -87,21 +87,20 @@ func (zr *zipReader) FindAndReadEOCD(ctx context.Context) (internal.EOCD, error)
 	const bufSize = 4096 // 4kb for modern SSDs
 	var buf [bufSize]byte
 
-	const maxCommentLength = int64(math.MaxUint16)
-	searchLimit := min(maxCommentLength+eocdSize, zr.fileSize)
+	searchLen := min(int64(MaxStringLength+eocdSize), zr.fileSize)
 
 	// Scan backwards from the end of the file
-	for searchStart := int64(0); searchStart < searchLimit; {
+	for off := zr.fileSize; off > zr.fileSize-searchLen; {
 		if err := ctx.Err(); err != nil {
 			return internal.EOCD{}, err
 		}
 
-		readSize := min(bufSize, searchLimit-searchStart)
-		readPos := zr.fileSize - searchLimit + searchStart
+		readSize := int64(bufSize)
+		readPos := off - readSize
 
-		if readPos < 0 {
-			readPos = 0
-			readSize = min(bufSize, zr.fileSize)
+		if readPos < zr.fileSize-searchLen {
+			readPos = zr.fileSize - searchLen
+			readSize = off - readPos
 		}
 
 		n, err := zr.src.ReadAt(buf[:readSize], readPos)
@@ -109,38 +108,48 @@ func (zr *zipReader) FindAndReadEOCD(ctx context.Context) (internal.EOCD, error)
 			return internal.EOCD{}, fmt.Errorf("read at %d: %w", readPos, err)
 		}
 
-		if n == 0 {
-			break
-		}
-
-		// The active buffer is valid up to n bytes
-		chunk := buf[:n]
-
-		// Search for the signature in the chunk (backwards)
-		for p := n - 4; p >= 0; p-- {
-			if binary.LittleEndian.Uint32(chunk[p:p+4]) == internal.EOCDSignature {
-				recordOffset := readPos + int64(p)
-
-				// Ensure we can read the full 22-byte EOCD header
-				if recordOffset+eocdSize > zr.fileSize {
-					continue
-				}
-
-				// Calculate start of the record (skip signature 4 bytes)
-				sr := io.NewSectionReader(zr.src, recordOffset+4, zr.fileSize-(recordOffset+4))
-				return internal.ReadEndOfCentralDir(sr)
-			}
+		if eocd, found := zr.tryReadSignature(readSize, readPos, buf[:n]); found {
+			return eocd, nil
 		}
 
 		// Move search window backwards
 		// We subtract 3 to allow overlap for signatures that cross buffer boundaries
-		searchStart += int64(n) - 3
-		if int64(n) < 4 {
+		off -= (readSize - 3)
+
+		if readSize < 4 {
 			break
 		}
 	}
 
 	return internal.EOCD{}, fmt.Errorf("%w: no end of central directory signature found", ErrFormat)
+}
+
+func (zr *zipReader) tryReadSignature(readSize int64, readPos int64, buf []byte) (internal.EOCD, bool) {
+	for p := readSize - 4; p >= 0; p-- {
+		if binary.LittleEndian.Uint32(buf[p:p+4]) == internal.EOCDSignature {
+			recordOffset := readPos + p
+
+			// Ensure we can read the full 22-byte EOCD header
+			if recordOffset+eocdSize > zr.fileSize {
+				continue
+			}
+
+			expectedCommentLen := zr.fileSize - (recordOffset + eocdSize)
+			if expectedCommentLen > MaxStringLength {
+				continue
+			}
+
+			// Calculate start of the record (skip signature 4 bytes)
+			sr := io.NewSectionReader(zr.src, recordOffset+4, zr.fileSize-(recordOffset+4))
+			eocd, err := internal.ReadEndOfCentralDir(sr)
+
+			if err == nil && int64(eocd.CommentLength) == expectedCommentLen {
+				return eocd, true
+			}
+		}
+	}
+
+	return internal.EOCD{}, false
 }
 
 // findAndReadZip64EOCD scans for the Zip64 End of Central Directory record.
@@ -201,6 +210,7 @@ func (zr *zipReader) readCentralDir(ctx context.Context, offset uint64, entriesN
 
 		file := zr.newFileFromCentralDir(entry)
 		files = append(files, file)
+
 		if zr.onFileProcessed != nil {
 			zr.onFileProcessed(file, nil)
 		}
@@ -246,8 +256,10 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 		return zr.openFile(f)
 	}
 
+	headerOffset, dataSize := f.localHeaderOffset, f.compressedSize
 	f.srcFunc = func() (*io.SectionReader, error) {
-		return zr.openFileRaw(f)
+		sr, _, err := zr.getRawDataStream(headerOffset, dataSize)
+		return sr, err
 	}
 
 	return f
@@ -296,12 +308,12 @@ func (zr *zipReader) parseExtraField(f *File, entry internal.CentralDirectory) (
 // openFile implements the logic to read a file from the archive.
 // It locates the data, handles decryption, and initializes the decompressor.
 func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
-	data, flags, err := zr.getRawDataStream(f)
+	data, flags, err := zr.getRawDataStream(f.localHeaderOffset, f.compressedSize)
 	if err != nil {
 		return nil, err
 	}
 
-	wrapped := data
+	var wrapped io.Reader = data
 	isEncrypted := flags&0x1 != 0
 
 	if isEncrypted {
@@ -319,8 +331,9 @@ func (zr *zipReader) openFile(f *File) (io.ReadCloser, error) {
 	return newChecksumReader(rc, f), nil
 }
 
-func (zr *zipReader) getRawDataStream(f *File) (io.Reader, uint16, error) {
-	headerReader := io.NewSectionReader(zr.src, f.localHeaderOffset, localHeaderSize)
+// getRawDataStream wraps file data with io.SectionReader and returns file flags.
+func (zr *zipReader) getRawDataStream(headerOffset, dataSize int64) (*io.SectionReader, uint16, error) {
+	headerReader := io.NewSectionReader(zr.src, headerOffset, localHeaderSize)
 
 	var buf [localHeaderSize]byte
 	if _, err := io.ReadFull(headerReader, buf[:]); err != nil {
@@ -336,9 +349,9 @@ func (zr *zipReader) getRawDataStream(f *File) (io.Reader, uint16, error) {
 	filenameLen := int64(binary.LittleEndian.Uint16(buf[26:28]))
 	extraLen := int64(binary.LittleEndian.Uint16(buf[28:30]))
 
-	dataOffset := f.localHeaderOffset + localHeaderSize + filenameLen + extraLen
+	dataOffset := headerOffset + localHeaderSize + filenameLen + extraLen
 
-	return io.NewSectionReader(zr.src, dataOffset, f.compressedSize), flags, nil
+	return io.NewSectionReader(zr.src, dataOffset, dataSize), flags, nil
 }
 
 // wrapDecryption wraps reader with decrypter based on method.
@@ -369,29 +382,6 @@ func (zr *zipReader) wrapDecompression(src io.Reader, method CompressionMethod) 
 	}
 
 	return decompressor.Decompress(src)
-}
-
-// openFileRaw implements the logic to read raw file data from the archive without any decompression.
-func (zr *zipReader) openFileRaw(f *File) (*io.SectionReader, error) {
-	// We must read the Local Header to find the exact data offset, as
-	// extra fields in Local Header may differ from Central Directory.
-	headerReader := io.NewSectionReader(zr.src, f.localHeaderOffset, localHeaderSize)
-
-	var buf [localHeaderSize]byte
-	if _, err := io.ReadFull(headerReader, buf[:]); err != nil {
-		return nil, fmt.Errorf("read local header: %w", err)
-	}
-
-	if binary.LittleEndian.Uint32(buf[0:4]) != internal.LocalFileHeaderSignature {
-		return nil, fmt.Errorf("%w: expected local file header signature", ErrFormat)
-	}
-
-	filenameLen := int64(binary.LittleEndian.Uint16(buf[26:28]))
-	extraLen := int64(binary.LittleEndian.Uint16(buf[28:30]))
-
-	dataOffset := f.localHeaderOffset + localHeaderSize + filenameLen + extraLen
-
-	return io.NewSectionReader(zr.src, dataOffset, f.compressedSize), nil
 }
 
 // verifySignature checks whether the next 4 bytes match the given signature.
