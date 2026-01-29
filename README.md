@@ -288,7 +288,7 @@ func main() {
 
     _, err := archive.WriteToParallelWithContext(ctx, out, runtime.NumCPU())
     if err != nil {
-        if err == context.Canceled {
+        if errors.Is(err, context.Canceled) {
             out.Close()
             os.Remove("output.zip")
             return
@@ -321,27 +321,59 @@ func main() {
 
 ## ⚠️ Error Handling
 
-GoZip uses typed sentinel errors:
+GoZip provides a structured error system. Instead of simple strings, most operations return errors that can be inspected to find exactly which file caused the issue and why.
+
+### 1. The `FileError` Structure
+
+Whenever an error is tied to a specific archive entry, GoZip wraps it in a `*FileError`.
 
 ```go
-if err := archive.Extract("out"); err != nil {
-    if errors.Is(err, gozip.ErrPasswordMismatch) {
-        // Prompt user for password again
-    } else if errors.Is(err, gozip.ErrFormat) {
-        // Not a valid zip file
-    } else if errors.Is(err, gozip.ErrFilenameTooLong) {
-        // Handle limitation
+if err := archive.AddFile("data/report.pdf"); err != nil {
+    var fileErr *gozip.FileError
+    if errors.As(err, &fileErr) {
+        fmt.Printf("Operation: %s\n", fileErr.Op)   // e.g., "add", "stat", "open"
+        fmt.Printf("File:      %s\n", fileErr.File.Name())
+        fmt.Printf("Cause:     %v\n", fileErr.Err)  // Underlying error (e.g., os.ErrPermission)
     }
 }
 ```
 
-**Available Errors:**
+### 2. Handling Bulk Operations (`errors.Join`)
 
-* `ErrFormat`, `ErrAlgorithm`,
-* `ErrPasswordMismatch`, `ErrChecksum`, `ErrSizeMismatch`
-* `ErrFileNotFound`, `ErrDuplicateEntry`
-* `ErrInsecurePath` (Zip Slip attempt)
-* `ErrFilenameTooLong`, `ErrCommentTooLong`, `ErrExtraFieldTooLong`
+Methods that process multiple files (like `AddDir`, `Extract`, or `WriteTo`) use a "Best Effort" strategy.
+They continue processing after non-fatal errors and return a combined error using `errors.Join`.
+
+To inspect all errors in a combined result:
+
+```go
+if err := archive.Extract("./out"); err != nil {
+    // Standard way to unwrap joined errors (Go 1.20+)
+    if e, ok := err.(interface{ Unwrap() []error }); ok {
+        for _, subErr := range e.Unwrap() {
+            var fErr *gozip.FileError
+            if errors.As(subErr, &fErr) {
+                log.Printf("Failed to extract %s: %v", fErr.File.Name(), fErr.Err)
+            }
+        }
+    }
+}
+```
+
+### 3. Sentinel Errors Reference
+
+### Error Reference
+
+| Error | Description |
+| :--- | :--- |
+| `ErrFormat` | Not a valid ZIP archive (invalid signatures). |
+| `ErrPasswordMismatch` | Incorrect password or missing password for encrypted file. |
+| `ErrChecksum` | CRC-32 integrity check failed after reading. |
+| `ErrSizeMismatch` | Extracted data size doesn't match the header. |
+| `ErrInsecurePath` | **Zip Slip** detected: file path attempts to escape destination. |
+| `ErrDuplicateEntry` | A file with this name already exists in the archive. |
+| `ErrAlgorithm` | Compression method not supported (e.g., LZMA without plugin). |
+| `ErrFileNotFound` | Requested entry is missing. Wraps `fs.ErrNotExist`. |
+| `ErrFilenameTooLong` | Filename exceeds the ZIP limit of 65,535 bytes. |
 
 ## ⚙️ Configuration & Options
 
@@ -369,6 +401,9 @@ Or you can write your own filter, for example to exclude files larger than 10 MB
 * `SortAlphabetical`: Sorts by name (A-Z).
 * `SortSizeDescending`: Optimizes parallel writing.
 * `SortZIP64Optimized`: Buckets files by size to optimize Zip64 header overhead.
+
+To optimize memory usage and avoid high heap peaks, use `SortSizeDescending`.
+This ensures large buffers are reused efficiently and heavy files don't block the output queue.
 
 ## License
 
