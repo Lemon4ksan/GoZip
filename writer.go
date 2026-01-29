@@ -261,6 +261,10 @@ func (zw *zipWriter) encodeToAndUpdate(f *File, dest io.Writer) error {
 		return err
 	}
 
+	if f.uncompressedSize != SizeUnknown && f.uncompressedSize != stats.uncompressedSize {
+		return ErrSizeMismatch
+	}
+
 	f.uncompressedSize = stats.uncompressedSize
 	f.compressedSize = stats.compressedSize
 	f.crc32 = stats.crc32
@@ -613,70 +617,27 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 
 	var wg sync.WaitGroup
 	var errs []error
-	var stopWriting bool
 
 	go func() {
-		// Feeds work into the system up to the inflight limit
 		for i, f := range files {
-			var acquired bool
-
-			// Attempt to acquire In-Flight Slot
-			select {
-			case <-ctx.Done():
-				// Context cancelled: we skip acquiring the semaphore to fail fast.
-				acquired = false
-			case inflightSem <- struct{}{}:
-				// Slot acquired successfully.
-				acquired = true
-			}
-
-			// If context is dead, fast-path the result
-			if ctx.Err() != nil {
-				// Pass 'acquired' state to the collector so it knows whether to release
-				results[i] <- zipResult{file: f, err: ctx.Err(), acquired: acquired}
-				close(results[i])
-				continue
-			}
-
-			wg.Add(1)
-			go func(idx int, f *File) {
-				defer wg.Done()
-
-				// Acquire CPU Semaphore (Blocks if all CPUs are busy)
-				select {
-				case <-ctx.Done():
-					results[idx] <- zipResult{file: f, err: ctx.Err(), acquired: true}
-					close(results[idx])
-					return
-				case pzw.sem <- struct{}{}:
-				}
-				defer func() { <-pzw.sem }()
-
-				// Compress
-				src, err := pzw.compressFile(ctx, f)
-				// We definitely acquired inflightSem to get here
-				results[idx] <- zipResult{file: f, src: src, err: err, acquired: true}
-				close(results[idx])
-			}(i, f)
+			pzw.spawnWorker(ctx, f, results[i], inflightSem, &wg)
 		}
 	}()
 
+	var stopWriting bool
 	for _, resultChan := range results {
 		res, ok := <-resultChan
 		if !ok {
-			// Should not happen unless logic bug or extreme panic
 			continue
 		}
 
-		// Only release the semaphore if we actually acquired it.
-		// This prevents deadlock when context cancellation caused us to skip acquisition.
 		if res.acquired {
 			<-inflightSem
 		}
 
 		if res.err != nil {
-			if !errors.Is(res.err, context.Canceled) && !errors.Is(res.err, context.DeadlineExceeded) {
-				errs = append(errs, fmt.Errorf("%s: %w", res.file.name, res.err))
+			if ctx.Err() == nil {
+				errs = append(errs, res.err)
 			}
 			stopWriting = true
 			continue
@@ -687,22 +648,19 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 			continue
 		}
 
-		// Check context again before expensive I/O
 		if err := ctx.Err(); err != nil {
 			stopWriting = true
 			pzw.cleanupBuf(res.src)
 			continue
 		}
 
-		// Write to the actual ZIP stream
 		err := pzw.writeCompressedFile(res.file, res.src)
 		if err != nil {
-			err = fmt.Errorf("%s: %w", res.file.name, err)
-			errs = append(errs, err)
-			stopWriting = true // If write operation fails, there's no reason to continue
+			errs = append(errs, wrapErr("write", res.file, err))
+			stopWriting = true
 		} else {
 			if err = pzw.zw.addCentralDirEntry(res.file); err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", res.file.name, err))
+				errs = append(errs, wrapErr("write", res.file, err))
 				stopWriting = true
 			}
 		}
@@ -710,6 +668,7 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 		if pzw.onFileProcessed != nil {
 			pzw.onFileProcessed(res.file, err)
 		}
+
 		pzw.cleanupBuf(res.src)
 	}
 
@@ -722,9 +681,48 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 	return errs
 }
 
+func (pzw *parallelZipWriter) spawnWorker(
+	ctx context.Context,
+	f *File,
+	resChan chan<- zipResult,
+	inflightSem chan struct{},
+	wg *sync.WaitGroup,
+) {
+	acquired := false
+	select {
+	case <-ctx.Done():
+	case inflightSem <- struct{}{}:
+		acquired = true
+	}
+
+	if err := ctx.Err(); err != nil {
+		resChan <- zipResult{file: f, err: err, acquired: acquired}
+		close(resChan)
+		return
+	}
+
+	wg.Go(func() {
+		select {
+		case <-ctx.Done():
+			resChan <- zipResult{file: f, err: ctx.Err(), acquired: true}
+			close(resChan)
+			return
+		case pzw.sem <- struct{}{}:
+		}
+		defer func() { <-pzw.sem }()
+
+		src, err := pzw.compressFile(ctx, f)
+		if err != nil {
+			err = wrapErr("compress", f, err)
+		}
+		resChan <- zipResult{file: f, src: src, err: err, acquired: true}
+		close(resChan)
+	})
+}
+
 // compressFile compresses a single file to memory or temp file.
-func (pzw *parallelZipWriter) compressFile(ctx context.Context, file *File) (io.Reader, error) {
-	if file.isDir || file.uncompressedSize == 0 {
+func (pzw *parallelZipWriter) compressFile(ctx context.Context, f *File) (io.Reader, error) {
+	if f.isDir || f.uncompressedSize == 0 {
 		return nil, nil
 	}
 
@@ -735,11 +733,11 @@ func (pzw *parallelZipWriter) compressFile(ctx context.Context, file *File) (io.
 	var fileBuffer io.ReadWriteSeeker
 
 	// Use memory buffer for small files, temp file for large ones
-	if file.uncompressedSize != SizeUnknown && file.uncompressedSize <= pzw.memoryThreshold {
+	if f.uncompressedSize != SizeUnknown && f.uncompressedSize <= pzw.memoryThreshold {
 		buffer := pzw.bufferPool.Get().(*memoryBuffer)
-		if int(file.uncompressedSize) > cap(buffer.data) {
+		if int(f.uncompressedSize) > cap(buffer.data) {
 			pzw.bufferPool.Put(buffer)
-			buffer = newMemoryBuffer(int(file.uncompressedSize))
+			buffer = newMemoryBuffer(int(f.uncompressedSize))
 		} else {
 			buffer.Reset()
 		}
@@ -752,44 +750,43 @@ func (pzw *parallelZipWriter) compressFile(ctx context.Context, file *File) (io.
 		fileBuffer = tmpFile
 	}
 
-	// Helper to cleanup on error
-	cleanup := func() {
-		pzw.cleanupBuf(fileBuffer)
-	}
-
-	if file.shouldCopyRaw() {
-		src, err := file.srcFunc()
+	if f.shouldCopyRaw() {
+		src, err := f.srcFunc()
 		if err != nil {
-			cleanup()
+			pzw.cleanupBuf(fileBuffer)
 			return nil, err
 		}
 
 		if _, err := io.Copy(fileBuffer, src); err != nil {
-			cleanup()
+			pzw.cleanupBuf(fileBuffer)
 			return nil, fmt.Errorf("copy raw: %w", err)
 		}
 	} else {
-		src, err := file.Open()
+		src, err := f.Open()
 		if err != nil {
-			cleanup()
+			pzw.cleanupBuf(fileBuffer)
 			return nil, err
 		}
 		defer src.Close()
 
 		// Encode to the buffer
-		stats, err := pzw.zw.encodeTo(&contextReader{ctx: ctx, r: src}, fileBuffer, file.config)
+		stats, err := pzw.zw.encodeTo(&contextReader{ctx: ctx, r: src}, fileBuffer, f.config)
 		if err != nil {
-			cleanup()
+			pzw.cleanupBuf(fileBuffer)
 			return nil, fmt.Errorf("encode: %w", err)
 		}
 
-		file.uncompressedSize = stats.uncompressedSize
-		file.compressedSize = stats.compressedSize
-		file.crc32 = stats.crc32
+		if f.uncompressedSize != SizeUnknown && stats.uncompressedSize != f.uncompressedSize {
+			return nil, ErrSizeMismatch
+		}
+
+		f.uncompressedSize = stats.uncompressedSize
+		f.compressedSize = stats.compressedSize
+		f.crc32 = stats.crc32
 	}
 
 	if _, err := fileBuffer.Seek(0, io.SeekStart); err != nil {
-		cleanup()
+		pzw.cleanupBuf(fileBuffer)
 		return fileBuffer, fmt.Errorf("seek buffer: %w", err)
 	}
 

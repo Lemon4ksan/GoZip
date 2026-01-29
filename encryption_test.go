@@ -221,7 +221,7 @@ func TestAes256_CorruptedData_MACFailure(t *testing.T) {
 	_, err = r.Read(make([]byte, 1))
 	if err == nil || err == io.EOF {
 		t.Error("Expected error due to corrupted MAC/Data, got success/EOF")
-	} else if err.Error() != "zip: aes authentication failed" {
+	} else if err.Error() != "aes authentication failed" {
 		t.Errorf("Expected authentication failure, got: %v", err)
 	}
 }

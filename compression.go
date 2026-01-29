@@ -34,12 +34,20 @@ const (
 	DeflateStore     = flate.NoCompression // 0
 )
 
-// StoredCompressor implements no compression (STORE method).
+// StoredCompressor implements the Store method (no compression).
 type StoredCompressor struct{}
 
 func (sc *StoredCompressor) Compress(src io.Reader, dest io.Writer) (int64, error) {
 	// io.Copy uses io.WriterTo if available, making this efficient
 	return io.Copy(dest, src)
+}
+
+// StoredDecompressor implements the Store method (no compression).
+type StoredDecompressor struct{}
+
+func (sd *StoredDecompressor) Decompress(src io.Reader) (io.ReadCloser, error) {
+	// We don't own src and shouldn't give the caller the ability to close it
+	return io.NopCloser(src), nil
 }
 
 // DeflateCompressor implements DEFLATE compression with memory pooling.
@@ -96,14 +104,6 @@ func (d *DeflateCompressor) Compress(src io.Reader, dest io.Writer) (int64, erro
 	}
 
 	return n, nil
-}
-
-// StoredDecompressor implements the "Store" method (no compression).
-type StoredDecompressor struct{}
-
-func (sd *StoredDecompressor) Decompress(src io.Reader) (io.ReadCloser, error) {
-	// We don't own src and shouldn't give the caller the ability to close it
-	return io.NopCloser(src), nil
 }
 
 // DeflateDecompressor implements the "Deflate" method.

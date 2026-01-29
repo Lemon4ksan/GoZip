@@ -10,11 +10,13 @@ import (
 )
 
 var (
-	_ fs.FS        = (*zipFS)(nil)
-	_ fs.StatFS    = (*zipFS)(nil)
-	_ fs.ReadDirFS = (*zipFS)(nil)
+	_ fs.FS         = (*zipFS)(nil)
+	_ fs.StatFS     = (*zipFS)(nil)
+	_ fs.ReadFileFS = (*zipFS)(nil)
+	_ fs.ReadDirFS  = (*zipFS)(nil)
 )
 
+// zipFS implements a read-only virtual filesystem on top of the ZIP archive.
 type zipFS struct {
 	z *Zip
 }
@@ -36,6 +38,15 @@ func (zfs *zipFS) Open(name string) (fs.File, error) {
 	}
 
 	return fsFile, nil
+}
+
+// ReadFile implements fs.ReadFileFS.
+func (zfs *zipFS) ReadFile(name string) ([]byte, error) {
+	r, err := zfs.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(r)
 }
 
 // Stat implements fs.StatFS.
@@ -100,7 +111,7 @@ func (zfs *zipFS) getFileEntry(name string) (*File, error) {
 func (zfs *zipFS) hasImplicitDir(name string) bool {
 	prefix := name + "/"
 	for _, f := range zfs.z.files {
-		if strings.HasPrefix(f.getFilename(), prefix) {
+		if strings.HasPrefix(f.entryName(), prefix) {
 			return true
 		}
 	}
@@ -153,7 +164,7 @@ func (d *fsDir) ReadDir(n int) ([]fs.DirEntry, error) {
 	var entries []fs.DirEntry
 
 	for _, f := range d.z.files {
-		filename := f.getFilename()
+		filename := f.entryName()
 		if !strings.HasPrefix(filename, dirPath) {
 			continue
 		}

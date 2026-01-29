@@ -36,6 +36,23 @@
 //	fsys := archive.FS()
 //	data, _ := fs.ReadFile(fsys, "file.txt")
 //
+// # Error handling
+//
+// [FileError] is used for errors related to [File] instance and operations,
+// allowing users to access file metadata (name, size) for logging/retry logic.
+// Plain wrapped errors are used for global archive issues.
+// Example:
+//
+//	err := archive.AddFile("data/report.pdf")
+//	if err != nil {
+//	    var fileErr *gozip.FileError
+//	    if errors.As(err, &fileErr) {
+//	        fmt.Printf("Operation: %s\n", fileErr.Op)   // e.g., "add", "compress", "extract"
+//	        fmt.Printf("File:      %s\n", fileErr.File.Name())
+//	        fmt.Printf("Cause:     %v\n", fileErr.Err)  // Underlying error (e.g., [ErrPasswordMismatch])
+//	    }
+//	}
+//
 // # Basic Usage
 //
 // Creating an archive sequentially:
@@ -61,15 +78,22 @@
 //	// 1. Remove obsolete files
 //	archive.Remove("logs/obsolete.log")
 //
-//	// 2. Replace a file
+//	// 2. Modify a file
 //	file, _ := archive.File("data/config.json")
 //	archive.Remove(file.Name())
-//	// Modify file data by safely reading it from source archive
-//	archive.AddLazy("data/config.json", func() (io.ReadCloser, error) {
-//		rc, _ := file.Open()
-//		defer rc.Close()
-//		// Modify original data ...
-//		return io.NopCloser(bytes.NewReader(processedData)), nil
+//	archive.AddLazy(file.Name(), func() (io.ReadCloser, error) {
+//		pr, pw := io.Pipe()
+//		go func() {
+//			defer pw.Close()
+//			rc, err := file.Open()
+//			if err != nil {
+//				pw.CloseWithError(err)
+//				return
+//			}
+//			defer rc.Close()
+//			processor.Transform(rc, pw)
+//		}()
+//		return pr, nil
 //	})
 //
 //	// 3. Rename entries
@@ -103,7 +127,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -138,16 +161,25 @@ type ZipConfig struct {
 	// Comment is the archive-level comment (max 65535 bytes).
 	Comment string
 
-	// FileSortStrategy defines the order of files in the written archive.
+	// FileSortStrategy determines the order of file processing
+	// and their order in the written archive.
 	FileSortStrategy FileSortStrategy
 
-	// TextEncoding handles filename decoding for non-UTF8 legacy archives.
+	// TextEncoding handles filename decoding for legacy archives (non-UTF8).
+	// This function is only used in read operations. GoZip always sets
+	// the UTF-8 flag for maximum compatibility when writing.
 	// Default: [DecodeCP437] (IBM PC).
 	TextEncoding TextDecoder
 
-	// OnFileProcessed is a callback triggered after a file is successfully
-	// written, read, or extracted.
-	// WARNING: In parallel operations, this is called concurrently.
+	// OnFileProcessed is a callback triggered after a file is written, read, or extracted.
+	// Errors are not wrapped in [FileError], because file instance is passed separately.
+	//
+	// Advanced Usage (Fail-Fast):
+	// This callback can be used to stop bulk operations on the first error.
+	// Simply capture a context's cancel function and call it when err != nil.
+	// The library will catch the cancellation and perform a graceful shutdown.
+	//
+	// WARNING: In parallel operations, this callback is triggered concurrently.
 	OnFileProcessed func(*File, error)
 
 	// MemoryThreshold determines the maximum file size in bytes that can be buffered in memory.
@@ -258,46 +290,63 @@ func WithFiles(files []*File) Filter {
 }
 
 // FromDir restricts operation to files nested under the specified path.
-func FromDir(path string) Filter {
+func FromDir(dirPath string) Filter {
 	return func(files []*File) []*File {
-		if path == "" || path == "." {
+		if dirPath == "" || dirPath == "." {
 			return files
 		}
 
-		dirPath := path
-		if !strings.HasSuffix(dirPath, "/") {
-			dirPath += "/"
+		prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
+		if !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
 		}
+		dirEntryName := strings.TrimSuffix(prefix, "/")
 
-		result := make([]*File, 0, len(files))
-		for _, file := range files {
-			if strings.HasPrefix(file.name, path) {
-				result = append(result, file)
+		n := 0
+		for _, f := range files {
+			fName := f.entryName()
+			if strings.HasPrefix(fName, prefix) || fName == dirEntryName {
+				files[n] = f
+				n++
 			}
 		}
-		return result
+
+		for i := n; i < len(files); i++ {
+			files[i] = nil
+		}
+
+		return files[:n]
 	}
 }
 
 // WithoutDir excludes a directory and its contents from operation.
-func WithoutDir(path string) Filter {
+func WithoutDir(dirPath string) Filter {
 	return func(files []*File) []*File {
-		if path == "" || path == "." {
+		if dirPath == "" || dirPath == "." {
 			return nil
 		}
 
-		dirPath := path
-		if !strings.HasSuffix(dirPath, "/") {
-			dirPath += "/"
+		prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
+		if !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+		dirEntryName := strings.TrimSuffix(prefix, "/")
+
+		n := 0
+		for _, f := range files {
+			fName := f.entryName()
+			if strings.HasPrefix(fName, prefix) || fName == dirEntryName {
+				continue
+			}
+			files[n] = f
+			n++
 		}
 
-		result := make([]*File, 0, len(files))
-		for _, file := range files {
-			if !strings.HasPrefix(file.name, dirPath) {
-				result = append(result, file)
-			}
+		for i := n; i < len(files); i++ {
+			files[i] = nil
 		}
-		return result
+
+		return files[:n]
 	}
 }
 
@@ -363,6 +412,11 @@ func NewZip() *Zip {
 	}
 }
 
+// Config returns current global zip configuration.
+func (z *Zip) Config() ZipConfig {
+	return z.config
+}
+
 // SetConfig updates the global configuration atomically.
 // For files loaded from an existing archive, only the password is applied.
 func (z *Zip) SetConfig(c ZipConfig) {
@@ -395,18 +449,24 @@ func (z *Zip) FS() fs.FS {
 
 // AddFile adds a file from the local filesystem to the archive.
 //
-// Behavior:
-//   - The file path in the archive is normalized to use forward slashes.
-//   - Symlinks are stored as files containing the link target (not followed).
-//   - Large files (> 4GB) automatically trigger Zip64 extensions.
+// Features:
+//   - Normalizes paths to use forward slashes.
+//   - Stores symlinks as link targets (not followed).
+//   - Automatically handles Zip64 for large files.
+//
+// Conflict Behavior:
+//   - Unlike [Zip.Load], this method is strict: if a file with the same name
+//     already exists in the archive, it returns [ErrDuplicateEntry] and
+//     does NOT overwrite the existing entry.
+//   - To replace a file, use [Zip.Remove] before adding.
 //
 // Options can be used to override compression, encryption, or file attributes.
 func (z *Zip) AddFile(path string, options ...AddOption) error {
 	fileEntry, err := newFileFromPath(path)
 	if err != nil {
-		return err
+		return wrapErr("add", nil, err)
 	}
-	return z.addEntry(fileEntry, options)
+	return wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
 }
 
 // AddOSFile adds an open *os.File to the archive. Uses native OS metadata.
@@ -414,9 +474,9 @@ func (z *Zip) AddFile(path string, options ...AddOption) error {
 func (z *Zip) AddOSFile(f *os.File, options ...AddOption) error {
 	fileEntry, err := newFileFromOS(f)
 	if err != nil {
-		return err
+		return wrapErr("add", nil, err)
 	}
-	return z.addEntry(fileEntry, options)
+	return wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
 }
 
 // AddDir recursively adds a directory and its contents to the archive.
@@ -429,9 +489,9 @@ func (z *Zip) AddOSFile(f *os.File, options ...AddOption) error {
 func (z *Zip) AddDir(path string, options ...AddOption) error {
 	var errs []error
 
-	err := filepath.WalkDir(path, func(walkPath string, _ fs.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(path, func(walkPath string, _ fs.DirEntry, err error) error {
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, wrapErr("add", nil, fmt.Errorf("scan %s: %w", walkPath, err)))
 			return nil
 		}
 
@@ -441,28 +501,25 @@ func (z *Zip) AddDir(path string, options ...AddOption) error {
 
 		relPath, err := filepath.Rel(path, walkPath)
 		if err != nil {
-			return err
+			errs = append(errs, wrapErr("add", nil, err))
 		}
 
 		pathOpt := WithPath(filepath.ToSlash(filepath.Dir(relPath)))
 		fileOpts := append([]AddOption{pathOpt}, options...)
 
 		if err := z.AddFile(walkPath, fileOpts...); err != nil {
-			errs = append(errs, fmt.Errorf("failed to add %s: %w", walkPath, err))
+			errs = append(errs, err)
 			return nil
 		}
 
 		return nil
 	})
 
-	if err != nil {
-		errs = append(errs, err)
+	if walkErr != nil {
+		errs = append(errs, wrapErr("add", nil, walkErr))
 	}
 
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // AddFS adds files from an [fs.FS] (e.g., [embed.FS], [os.DirFS]) to the archive.
@@ -491,10 +548,10 @@ func (z *Zip) AddFS(fileSystem fs.FS, options ...AddOption) error {
 
 		fileEntry, err := newFileFromFS(fileSystem, filePath, info)
 		if err != nil {
-			return err
+			return wrapErr("create", fileEntry, err)
 		}
 
-		return z.addEntry(fileEntry, fileOpts)
+		return wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
 	})
 }
 
@@ -506,16 +563,16 @@ func (z *Zip) AddFS(fileSystem fs.FS, options ...AddOption) error {
 //
 // Performance Warning:
 //   - If size is [SizeUnknown] and the target writer is an [io.Seeker] (e.g., os.File),
-//     the library will buffer the entire stream to a temporary file to calculate
+//     the writer will buffer the entire stream to a temporary file to calculate
 //     headers before writing. To avoid this, provide the exact size if possible.
 //
 // Returns [ErrFileEntry] if an invalid argument is passed.
 func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...AddOption) error {
 	fileEntry, err := newFileFromReader(r, filename, size)
 	if err != nil {
-		return err
+		return wrapErr("add", nil, err)
 	}
-	return z.addEntry(fileEntry, options)
+	return wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
 }
 
 // AddLazy adds a file entry whose content is opened only when writing the archive.
@@ -529,7 +586,7 @@ func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...Add
 //     Ensure the closure is thread-safe.
 //
 // Resource Management:
-//   - The io.ReadCloser returned by openFunc is automatically closed by the library
+//   - The [io.ReadCloser] returned by openFunc is automatically closed by the library
 //     after the file is written. You do not need to wrap it to close it manually,
 //     but you are responsible for closing any resources used to create that reader
 //     (e.g. database connections) inside the closure or after WriteTo finishes.
@@ -538,10 +595,10 @@ func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...Add
 func (z *Zip) AddLazy(name string, openFunc func() (io.ReadCloser, error), options ...AddOption) error {
 	fileEntry, err := newFileFromReader(io.LimitReader(nil, 0), name, SizeUnknown)
 	if err != nil {
-		return err
+		return wrapErr("add", nil, err)
 	}
 	fileEntry.openFunc = openFunc
-	return z.addEntry(fileEntry, options)
+	return wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
 }
 
 // AddBytes creates a file from a byte slice.
@@ -563,30 +620,44 @@ func (z *Zip) AddString(content string, filename string, options ...AddOption) e
 func (z *Zip) Mkdir(name string, options ...AddOption) error {
 	dirEntry, err := newDirectoryFile(name)
 	if err != nil {
-		return err
+		return wrapErr("add", nil, err)
 	}
-	return z.addEntry(dirEntry, options)
+	return wrapErr("add", dirEntry, z.addEntry(dirEntry, options))
 }
 
-// Remove removes a file or directory from the archive. Empty string or "." means to delete all files.
-// If the target is a directory, it recursively removes all files and subdirectories inside it.
-// Returns [ErrFileNotFound] if no files were deleted.
+// Remove deletes a file or directory from the archive.
+//
+// Behavior:
+//   - If the target is a directory, it recursively removes all its contents
+//     and the directory entry itself.
+//   - Providing an empty string or "." results in a "Reset" operation:
+//     all entries are removed, and the archive becomes empty.
+//   - Path normalization is applied (e.g., "dir\\file.txt" becomes "dir/file.txt").
+//
+// Errors:
+//   - Returns a [FileError] wrapping [ErrFileNotFound] if no entries
+//     matched the provided name.
+//
+// Complexity: O(N) where N is the total number of files in the archive.
 func (z *Zip) Remove(name string) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 
 	if name == "" || name == "." {
+		if len(z.files) == 0 {
+			return nil
+		}
 		z.files = z.files[:0]
 		clear(z.lookup)
 		return nil
 	}
 
-	cleanName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
+	cleanName := z.normalizePath(name)
 	dirPrefix := cleanName + "/"
 
 	var n, deletedCount int
 	for _, f := range z.files {
-		fName := f.getFilename()
+		fName := f.entryName()
 
 		isExactMatch := fName == cleanName || fName == dirPrefix
 		isChild := strings.HasPrefix(fName, dirPrefix)
@@ -601,164 +672,85 @@ func (z *Zip) Remove(name string) error {
 		n++
 	}
 
+	if deletedCount == 0 {
+		return wrapErr("remove", nil, fmt.Errorf("%w: '%s'", ErrFileNotFound, name))
+	}
+
 	for i := n; i < len(z.files); i++ {
 		z.files[i] = nil
 	}
 
 	z.files = z.files[:n]
 
-	if deletedCount == 0 {
-		return fmt.Errorf("%w: %s", ErrFileNotFound, name)
-	}
-
 	return nil
 }
 
-// Rename changes a file's name while preserving its directory location.
-// e.g., "logs/old.txt", "add/new.txt" -> "logs/add/new.txt".
-// If the target is a directory, all children are recursively renamed.
-// Returns [ErrFileNotFound] if "old" file doesn't exist.
-func (z *Zip) Rename(old, new string) error {
-	if new == "" {
-		return fmt.Errorf("%w: new name cannot be empty", ErrFileEntry)
+// Rename changes the name of an entry while preserving its current directory location.
+// Example: Rename("logs/old.txt", "new.txt") -> "logs/new.txt"
+//
+// Behavior:
+//   - For Directories: Recursively renames all nested files and subdirectories
+//     to reflect the new parent name.
+//   - Atomicity: This operation is atomic. It performs a "dry run" check of all
+//     resulting paths. If any path (including children) exceeds ZIP limits
+//     or conflicts with existing entries, no changes are applied to the archive.
+//   - Pathing: The 'new' parameter should be the new base name, not a full path.
+//
+// Errors:
+//   - Returns [ErrFileEntry] if the newName is empty or contains slashes.
+//   - Returns [ErrFileNotFound] if the old entry does not exist.
+//   - Returns [ErrDuplicateEntry] if the destination path is already occupied.
+//   - Returns [ErrFilenameTooLong] if any resulting path exceeds 65,535 bytes.
+func (z *Zip) Rename(old, newName string) error {
+	if old == newName {
+		return nil
+	}
+	if newName == "" {
+		return wrapErr("rename", nil, fmt.Errorf("%w: new name cannot be empty", ErrFileEntry))
+	}
+	if strings.ContainsAny(newName, "\\/") {
+		return wrapErr("rename", nil, fmt.Errorf("%w: name cannot contain slashes", ErrFileEntry))
 	}
 
-	file, ok := z.File(old)
-	if !ok {
-		return ErrFileNotFound
+	z.mu.Lock()
+	defer z.mu.Unlock()
+
+	file, err := z.findEntry(old)
+	if err != nil {
+		return wrapErr("rename", nil, err)
 	}
 
 	parent := path.Dir(file.name)
 	if parent == "." {
 		parent = ""
 	}
+	newPath := path.Join(parent, z.normalizePath(newName))
 
-	fullPath := path.Join(parent, new)
-	fullPath = strings.TrimPrefix(path.Clean(strings.ReplaceAll(fullPath, "\\", "/")), "/")
-
-	if fullPath == file.name {
-		return nil
-	}
-
-	if z.Exists(fullPath) {
-		return fmt.Errorf("%w: '%s' already exists", ErrDuplicateEntry, fullPath)
-	}
-
-	if len(fullPath)+1 > math.MaxUint16 {
-		return fmt.Errorf("%w: %s (%d bytes)", ErrFilenameTooLong, fullPath, len(fullPath))
-	}
-
-	z.mu.Lock()
-	defer z.mu.Unlock()
-
-	if err := z.createMissingDirs(fullPath); err != nil {
-		return err
-	}
-
-	if !file.isDir {
-		delete(z.lookup, file.getFilename())
-		file.name = fullPath
-		z.lookup[file.getFilename()] = file
-		return nil
-	}
-
-	oldPrefix := file.getFilename()
-	newPrefix := fullPath + "/"
-
-	for _, f := range z.files {
-		filename := f.getFilename()
-
-		if after, ok := strings.CutPrefix(filename, oldPrefix); ok {
-			// e.g. "docs/old/file.txt" -> "docs/new/file.txt"
-			newChildPath := newPrefix + after
-			cleanChildName := strings.TrimSuffix(newChildPath, "/")
-
-			if len(cleanChildName)+1 > math.MaxUint16 {
-				return fmt.Errorf("%w: child path %s too long", ErrFilenameTooLong, cleanChildName)
-			}
-
-			delete(z.lookup, filename)
-			f.name = cleanChildName
-			z.lookup[f.getFilename()] = f
-		}
-	}
-
-	return nil
+	return z.atomicPathTransform("rename", file, newPath)
 }
 
-// Move changes the directory location of a file while preserving its base name.
-// e.g., "docs/file.txt", "backup/docs" -> "backup/docs/file.txt".
-// Directories are moved recursively. Missing parent directories are created automatically.
-// Returns [ErrFileNotFound] if "old" file doesn't exist.
-func (z *Zip) Move(old, new string) error {
-	file, ok := z.File(old)
-	if !ok {
-		return ErrFileNotFound
-	}
-
-	baseName := path.Base(file.name)
-
-	if file.isDir && baseName == "." {
-		// Handle root or weird paths
-		baseName = strings.TrimSuffix(file.name, "/")
-		baseName = path.Base(baseName)
-	}
-
-	fullPath := path.Join(new, baseName)
-	fullPath = strings.TrimPrefix(path.Clean(strings.ReplaceAll(fullPath, "\\", "/")), "/")
-
-	if fullPath == file.name {
-		return nil
-	}
-
-	if z.Exists(fullPath) {
-		return fmt.Errorf("%w: destination '%s' already exists", ErrDuplicateEntry, fullPath)
-	}
-
-	if len(fullPath)+1 > math.MaxUint16 {
-		return fmt.Errorf("%w: %s (%d bytes)", ErrFilenameTooLong, fullPath, len(fullPath))
-	}
-
-	// Ensure destination directory exists
-	ok = z.Exists(new)
-
+// Move changes the directory location of an entry while preserving its base name.
+// Example: Move("file.txt", "backup/docs") -> "backup/docs/file.txt".
+//
+// Behavior:
+//   - For Directories: Moves the entire directory tree recursively to the new location.
+//   - Implicit Creation: Automatically creates any missing parent directories
+//     in the destination path.
+//   - Atomicity: Like Rename, this operation is atomic. It validates all
+//     resulting child paths before modifying the archive structure.
+//
+// Errors returned match [Zip.Rename].
+func (z *Zip) Move(old, newDir string) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 
-	if !ok {
-		if err := z.createMissingDirs(fullPath); err != nil {
-			return err
-		}
+	file, err := z.findEntry(old)
+	if err != nil {
+		return wrapErr("move", nil, err)
 	}
+	newPath := path.Join(z.normalizePath(newDir), path.Base(file.name))
 
-	if !file.isDir {
-		delete(z.lookup, file.getFilename())
-		file.name = fullPath
-		z.lookup[file.getFilename()] = file
-		return nil
-	}
-
-	oldPrefix := file.getFilename()
-	newPrefix := fullPath + "/"
-
-	for _, f := range z.files {
-		filename := f.getFilename()
-
-		if after, ok := strings.CutPrefix(filename, oldPrefix); ok {
-			newChildPath := newPrefix + after
-			cleanChildName := strings.TrimSuffix(newChildPath, "/")
-
-			if len(cleanChildName)+1 > math.MaxUint16 {
-				return fmt.Errorf("%w: child path %s too long", ErrFilenameTooLong, cleanChildName)
-			}
-
-			delete(z.lookup, filename)
-			f.name = cleanChildName
-			z.lookup[f.getFilename()] = f
-		}
-	}
-
-	return nil
+	return z.atomicPathTransform("move", file, newPath)
 }
 
 // File returns the entry matching the given name.
@@ -810,24 +802,16 @@ func (z *Zip) Exists(name string) bool {
 }
 
 // OpenFile returns a ReadCloser for the named file within the archive.
-// Returns [ErrFileNotFound] if not found.
+// Returns [ErrFileNotFound] if not found or target is a directory.
 func (z *Zip) OpenFile(name string) (io.ReadCloser, error) {
-	searchName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
-
-	if !z.Exists(searchName) {
-		return nil, fmt.Errorf("%w: %s", ErrFileNotFound, name)
-	}
-
 	z.mu.RLock()
 	defer z.mu.RUnlock()
 
-	for _, f := range z.files {
-		if f.name == searchName && !f.isDir {
-			return f.Open()
-		}
+	f, ok := z.lookup[z.normalizePath(name)]
+	if !ok || f.isDir {
+		return nil, wrapErr("open", nil, ErrFileNotFound)
 	}
-
-	return nil, fmt.Errorf("%w: %s", ErrFileNotFound, name)
+	return f.Open()
 }
 
 // Glob returns all files whose names match the specified shell pattern.
@@ -873,7 +857,6 @@ func (z *Zip) Find(pattern string) ([]*File, error) {
 
 	var matches []*File
 	for _, f := range z.files {
-		// Check against base name (filename only)
 		if matched, _ := path.Match(pattern, path.Base(f.name)); matched {
 			matches = append(matches, f)
 		}
@@ -885,9 +868,9 @@ func (z *Zip) Find(pattern string) ([]*File, error) {
 // WriteTo serializes the archive to the specified writer sequentially.
 //
 // Behavior:
+//   - Processes files using "Best Effort" strategy.
 //   - Writes Central Directory and End of Central Directory (EOCD) records.
 //   - Automatically handles Zip64 if files exceed 4GB or 65535 count.
-//   - Context cancellation stops the process immediately.
 //
 // Returns the total number of bytes written.
 func (z *Zip) WriteTo(dest io.Writer, filters ...Filter) (int64, error) {
@@ -895,7 +878,6 @@ func (z *Zip) WriteTo(dest io.Writer, filters ...Filter) (int64, error) {
 }
 
 // WriteToWithContext writes the archive with context support.
-// Returns the number of bytes written and any error encountered.
 // Cancelling the context stops processing the remaining files and results in a valid archive.
 func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, filters ...Filter) (int64, error) {
 	files := z.Files()
@@ -917,28 +899,28 @@ func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, filters ..
 
 	writer := newZipWriter(z.config, z.factories, writerDest)
 
-	var writeErr error
+	var errs []error
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
-			writeErr = err
+			errs = append(errs, err)
 			break
 		}
 
 		err := writer.WriteFile(file)
 		if err != nil {
-			err = fmt.Errorf("zip: write file %s: %w", file.name, err)
+			errs = append(errs, wrapErr("write", file, err))
 		}
+
 		if z.config.OnFileProcessed != nil {
 			z.config.OnFileProcessed(file, err)
 		}
-		if err != nil {
-			return counter.bytesWritten, err
-		}
 	}
 
-	finalizeErr := writer.WriteCentralDirAndEndRecords()
+	if err := writer.WriteCentralDirAndEndRecords(); err != nil {
+		errs = append(errs, fmt.Errorf("zip: finalize: %w", err))
+	}
 
-	return counter.bytesWritten, errors.Join(writeErr, finalizeErr)
+	return counter.bytesWritten, errors.Join(errs...)
 }
 
 // WriteToParallel writes the archive using multiple concurrent workers.
@@ -989,27 +971,21 @@ func (z *Zip) WriteToParallelWithContext(ctx context.Context, dest io.Writer, ma
 }
 
 // Load parses an existing ZIP archive's central directory and merges
-// its entries into the current Zip instance.
+// its entries into the current Zip instance using "Best Effort" strategy.
 //
 // Behavior:
 //   - It does not load file contents into memory, only headers.
-//   - The current [ZipConfig.Password] is applied to all loaded files
-//     for future extraction or reading.
+//   - The current [ZipConfig.Password] is applied to all loaded files.
 //
-// Supported Archives:
-//   - Natively handles standard ZIP and Zip64 (archives > 4GB or > 65535 files).
-//   - Supports archives with preambles (e.g., self-extracting EXE files or
-//     combined files), as it searches for the EOCD signature from the end.
+// Conflict Handling (Smart Merge):
+//   - If the current archive already contains entries with the same name as in the source,
+//     the **existing entries are replaced** by the new ones.
+//     This ensures the final archive remains valid (no duplicate file headers).
+//   - Returns [ErrDuplicateEntry] (wrapped in a combined error) as a warning
+//     indicating that an overwrite occurred.
 //
-// Conflict Handling & Merging:
-//   - This is a merging operation. If the current Zip instance already contains
-//     entries, the new files are appended to the list.
-//   - In case of name collisions, the newer entries from the loaded source will
-//     overwrite existing ones in the [Zip.File] lookup map, but both versions
-//     will remain in the sequential [Zip.Files] list.
-//   - Returns [ErrDuplicateEntry] if a loaded file path conflicts with an
-//     existing directory structure (e.g., a file named "a" is loaded when
-//     a directory "a/" already exists).
+// Supported Formats:
+//   - Standard ZIP, Zip64, and archives with preambles (e.g., self-extracting EXEs).
 //
 // Errors:
 //   - Returns [ErrFormat] if the source is not a valid ZIP archive.
@@ -1018,10 +994,16 @@ func (z *Zip) Load(src io.ReaderAt, size int64) error {
 }
 
 // LoadWithContext parses an archive with context support.
-// If context is cancelled, no files are added to the current structure.
+// Cancelling the context stops processing the remaining files.
 func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	callback := func(f *File, err error) {
+		if z.config.OnFileProcessed != nil {
+			z.config.OnFileProcessed(f, err)
+		}
 	}
 
 	reader := newZipReader(src, size, z.decompressors, z.config)
@@ -1040,17 +1022,48 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 		return err
 	}
 
+	totalFiles := len(files)
+	if len(z.files) == 0 {
+		if cap(z.files) < totalFiles {
+			newFiles := make([]*File, 0, totalFiles)
+			z.files = newFiles
+		}
+	}
+	if len(z.lookup) == 0 {
+		z.lookup = make(map[string]*File, totalFiles)
+	}
+
 	var errs []error
 	for _, file := range files {
-		file.config.Password = z.config.Password
-
-		if err := z.createMissingDirs(file.name); err != nil {
-			errs = append(errs, err)
-		} else if !z.Exists(file.name) {
-			z.files = append(z.files, file)
+		if ctx.Err() != nil {
+			break
 		}
 
-		z.lookup[file.getFilename()] = file
+		file.config.Password = z.config.Password
+		filename := file.entryName()
+
+		if existing, exists := z.lookup[filename]; exists {
+			z.replaceEntry(existing, file)
+			if !existing.isImplicit {
+				errs = append(errs, wrapErr("load", file, ErrDuplicateEntry))
+				callback(file, ErrDuplicateEntry)
+			}
+			continue
+		}
+
+		z.lookup[filename] = file
+
+		err := z.createMissingDirs(file.name)
+		if err != nil {
+			errs = append(errs, wrapErr("load", file, err))
+		} else {
+			z.files = append(z.files, file)
+		}
+		callback(file, err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		errs = append(errs, err)
 	}
 
 	return errors.Join(errs...)
@@ -1072,7 +1085,7 @@ func (z *Zip) LoadFromFileWithContext(ctx context.Context, f *os.File) error {
 	return z.LoadWithContext(ctx, f, stat.Size())
 }
 
-// Extract unpacks the archive to the specified destination directory.
+// Extract unpacks the archive to the specified destination directory using "Best Effort" strategy.
 //
 // Security (Zip Slip):
 //   - Protects against directory traversal attacks. Attempts to extract files
@@ -1098,7 +1111,7 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, filters ...Fi
 	for _, filter := range filters {
 		files = filter(files)
 	}
-	files = sortAlphabetical(files)
+	sortAlphabetical(files)
 
 	callback := func(f *File, err error) {
 		if z.config.OnFileProcessed != nil {
@@ -1107,7 +1120,7 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, filters ...Fi
 	}
 
 	for _, f := range files {
-		if err := ctx.Err(); err != nil {
+		if ctx.Err() != nil {
 			break
 		}
 
@@ -1117,17 +1130,17 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, filters ...Fi
 		fpath := filepath.Join(path, f.name)
 
 		// Zip Slip Protection
-		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
-			err := fmt.Errorf("%w: %s", ErrInsecurePath, fpath)
-			errs = append(errs, err)
-			callback(f, err)
+		rel, err := filepath.Rel(path, fpath)
+		if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+			errs = append(errs, wrapErr("extract", f, ErrInsecurePath))
+			callback(f, ErrInsecurePath)
 			continue
 		}
 
 		if f.isDir {
 			err := os.MkdirAll(fpath, 0755)
 			if err != nil {
-				errs = append(errs, err)
+				errs = append(errs, wrapErr("extract", f, err))
 			} else {
 				dirsToRestore = append(dirsToRestore, f)
 			}
@@ -1136,28 +1149,27 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, filters ...Fi
 		}
 
 		if err := os.MkdirAll(filepath.Dir(fpath), 0755); err != nil {
-			errs = append(errs, fmt.Errorf("create dir for %s: %w", f.name, err))
+			errs = append(errs, wrapErr("extract", f, err))
 			callback(f, err)
 			continue
 		}
 
-		err := z.extractFile(ctx, f, fpath)
+		err = z.extractFile(ctx, f, fpath)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if ctx.Err() != nil {
 				break
 			}
 			if errors.Is(err, ErrPasswordMismatch) {
 				f.config.Password = ""
 			}
-			errs = append(errs, fmt.Errorf("failed to extract %s: %w", fpath, err))
+			errs = append(errs, wrapErr("extract", f, err))
 		}
 		callback(f, err)
 	}
 
 	for i := len(dirsToRestore) - 1; i >= 0; i-- {
-		d := dirsToRestore[i]
-		dPath := filepath.Join(path, d.name)
-		os.Chtimes(dPath, time.Now(), d.modTime)
+		dir := dirsToRestore[i]
+		os.Chtimes(filepath.Join(path, dir.name), time.Now(), dir.modTime)
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -1179,17 +1191,16 @@ func (z *Zip) ExtractParallel(path string, workers int, filters ...Filter) error
 
 // ExtractParallelWithContext extracts files concurrently with context support.
 func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, workers int, filters ...Filter) error {
-	var errs []error
-	var filesToExtract []*File
-	var dirsToRestore []*File
-	dirsToCreate := make(map[string]*File)
 	path = filepath.Clean(path)
 
 	files := z.Files()
 	for _, filter := range filters {
 		files = filter(files)
 	}
-	files = sortAlphabetical(files)
+	sortAlphabetical(files)
+
+	filesToExtract := make([]*File, 0, len(files))
+	dirsToRestore := make([]*File, 0, len(files)/2)
 
 	callback := func(f *File, err error) {
 		if z.config.OnFileProcessed != nil {
@@ -1197,6 +1208,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 		}
 	}
 
+	var errs []error
 	for _, f := range files {
 		if f.config.Password == "" {
 			f.config.Password = z.config.Password
@@ -1204,36 +1216,29 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 		fpath := filepath.Join(path, f.name)
 
 		// Zip Slip Protection
-		if !strings.HasPrefix(fpath, path+string(os.PathSeparator)) {
-			errs = append(errs, fmt.Errorf("%w: %s", ErrInsecurePath, fpath))
+		rel, err := filepath.Rel(path, fpath)
+		if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+			errs = append(errs, wrapErr("extract", f, ErrInsecurePath))
+			if z.config.OnFileProcessed != nil {
+				z.config.OnFileProcessed(f, err)
+			}
 			continue
 		}
 
 		if f.isDir {
-			dirsToCreate[fpath] = f
-			dirsToRestore = append(dirsToRestore, f)
+			if err := os.MkdirAll(fpath, 0755); err != nil {
+				errs = append(errs, wrapErr("extract", f, err))
+			} else {
+				dirsToRestore = append(dirsToRestore, f)
+			}
 			continue
 		}
 
-		dirsToCreate[filepath.Dir(fpath)] = f
 		filesToExtract = append(filesToExtract, f)
 	}
 
 	if len(errs) > 0 {
 		return errors.Join(errs...)
-	}
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	// Create directories upfront to avoid race conditions
-	for name, dir := range dirsToCreate {
-		err := os.MkdirAll(name, 0755)
-		if err != nil {
-			err = fmt.Errorf("failed to create directory: %w", err)
-		}
-		callback(dir, err)
 	}
 
 	sem := make(chan struct{}, workers)
@@ -1251,20 +1256,16 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 		go func(f *File) {
 			defer func() { <-sem; wg.Done() }()
 
-			fpath := filepath.Join(path, f.name)
-
-			err := z.extractFile(ctx, f, fpath)
+			err := z.extractFile(ctx, f, filepath.Join(path, f.name))
 			if err != nil {
 				if ctx.Err() == nil {
-					errChan <- fmt.Errorf("failed to extract %s: %w", f.name, err)
+					errChan <- wrapErr("extract", f, err)
 				}
 				if errors.Is(err, ErrPasswordMismatch) {
 					f.config.Password = ""
 				}
 			}
-			if ctx.Err() == nil {
-				callback(f, err)
-			}
+			callback(f, err)
 		}(f)
 	}
 
@@ -1273,22 +1274,19 @@ Finish:
 	close(errChan)
 
 	for i := len(dirsToRestore) - 1; i >= 0; i-- {
-		d := dirsToRestore[i]
-		dPath := filepath.Join(path, d.name)
-		os.Chtimes(dPath, time.Now(), d.modTime)
-	}
-
-	if err := ctx.Err(); err != nil {
-		return err
+		dir := dirsToRestore[i]
+		os.Chtimes(filepath.Join(path, dir.name), time.Now(), dir.modTime)
 	}
 
 	for err := range errChan {
 		errs = append(errs, err)
 	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
+
+	if err := ctx.Err(); err != nil {
+		errs = append(errs, err)
 	}
-	return nil
+
+	return errors.Join(errs...)
 }
 
 // Internal helpers
@@ -1312,11 +1310,11 @@ func (z *Zip) addEntry(f *File, options []AddOption) error {
 
 	f.name = strings.TrimPrefix(path.Clean(strings.ReplaceAll(f.name, "\\", "/")), "/")
 
-	if len(f.name)+1 > math.MaxUint16 {
+	if len(f.entryName()) > maxStringLength {
 		return fmt.Errorf("%w (%d bytes)", ErrFilenameTooLong, len(f.name))
 	}
 
-	if len(f.config.Comment) > math.MaxUint16 {
+	if len(f.config.Comment) > maxStringLength {
 		return fmt.Errorf("%w (%d bytes)", ErrCommentTooLong, len(f.config.Comment))
 	}
 
@@ -1324,11 +1322,11 @@ func (z *Zip) addEntry(f *File, options []AddOption) error {
 	defer z.mu.Unlock()
 
 	if _, ok := z.lookup[f.name]; ok {
-		return fmt.Errorf("%w: '%s' already exists", ErrDuplicateEntry, f.name)
+		return fmt.Errorf("%w: file already exists", ErrDuplicateEntry)
 	}
 
 	if _, ok := z.lookup[f.name+"/"]; !f.isDir && ok {
-		return fmt.Errorf("%w: '%s' is already a directory", ErrDuplicateEntry, f.name)
+		return fmt.Errorf("%w: directory already exists", ErrDuplicateEntry)
 	}
 
 	if err := z.createMissingDirs(f.name); err != nil {
@@ -1336,7 +1334,7 @@ func (z *Zip) addEntry(f *File, options []AddOption) error {
 	}
 
 	z.files = append(z.files, f)
-	z.lookup[f.getFilename()] = f
+	z.lookup[f.entryName()] = f
 	return nil
 }
 
@@ -1356,7 +1354,7 @@ func (z *Zip) createMissingDirs(filePath string) error {
 			break
 		}
 		if _, ok := z.lookup[dir]; ok {
-			return fmt.Errorf("%w: '%s' is already a file", ErrDuplicateEntry, dir)
+			return fmt.Errorf("%w: %s", ErrDuplicateEntry, dir)
 		}
 		missingDirs = append(missingDirs, dir)
 		dir = path.Dir(dir)
@@ -1367,6 +1365,9 @@ func (z *Zip) createMissingDirs(filePath string) error {
 		if err != nil {
 			return err
 		}
+
+		dirEntry.isImplicit = true
+
 		z.files = append(z.files, dirEntry)
 		z.lookup[missingDirs[i]+"/"] = dirEntry
 	}
@@ -1374,11 +1375,136 @@ func (z *Zip) createMissingDirs(filePath string) error {
 	return nil
 }
 
+// normalizePath ensures the name matches the expected archive format.
+func (z *Zip) normalizePath(name string) string {
+	if name == "" {
+		return ""
+	}
+
+	// Check whether any changes are needed at all (Zero-alloc check)
+	needsFix := false
+	for i := 0; i < len(name); i++ {
+		char := name[i]
+		if char == '\\' || (char == '/' && i+1 < len(name) && name[i+1] == '/') {
+			needsFix = true
+			break
+		}
+	}
+
+	// If the path is clean (95% of the time in ZIP this is the case), just check the edges
+	if !needsFix {
+		res := name
+		if len(res) > 0 && res[0] == '/' {
+			res = res[1:]
+		}
+		return res
+	}
+
+	// The hard path (for "bad" paths only)
+	return strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
+}
+
+// findEntry - internal search without blocking.
+func (z *Zip) findEntry(name string) (*File, error) {
+	key := z.normalizePath(name)
+	if f, ok := z.lookup[key]; ok {
+		return f, nil
+	}
+	if f, ok := z.lookup[key+"/"]; ok {
+		return f, nil
+	}
+	return nil, fmt.Errorf("%w: '%s'", ErrFileNotFound, name)
+}
+
+// atomicPathTransform ensures that either all files (including children) are moved, or none.
+func (z *Zip) atomicPathTransform(op string, f *File, newPath string) error {
+	if f.name == newPath {
+		return nil
+	}
+
+	if err := z.checkPathTransform(op, f, newPath); err != nil {
+		return err
+	}
+
+	if err := z.createMissingDirs(newPath); err != nil {
+		return wrapErr(op, f, err)
+	}
+
+	return z.applyPathTransform(f, newPath)
+}
+
+func (z *Zip) checkPathTransform(op string, f *File, newPath string) error {
+	if _, exists := z.lookup[newPath]; exists {
+		return wrapErr(op, f, fmt.Errorf("%w: '%s'", ErrDuplicateEntry, newPath))
+	}
+	if _, exists := z.lookup[newPath+"/"]; exists {
+		return wrapErr(op, f, fmt.Errorf("%w: '%s'", ErrDuplicateEntry, newPath))
+	}
+
+	// Check: Cannot move a folder to itself or to a subfolder
+	if f.isDir {
+		if strings.HasPrefix(newPath+"/", f.entryName()) {
+			return wrapErr(op, f, fmt.Errorf("%w: cannot move directory into itself", ErrFileEntry))
+		}
+	}
+
+	oldPrefix := f.entryName()
+	newPrefix := newPath
+	if f.isDir {
+		newPrefix += "/"
+	}
+
+	for _, entry := range z.files {
+		if after, ok := strings.CutPrefix(entry.entryName(), oldPrefix); ok {
+			if len(newPrefix+after) > maxStringLength {
+				return wrapErr(op, entry, ErrFilenameTooLong)
+			}
+		}
+	}
+	return nil
+}
+
+func (z *Zip) applyPathTransform(f *File, newPath string) error {
+	oldPrefix := f.entryName()
+	newPrefix := newPath
+	if f.isDir {
+		newPrefix += "/"
+	}
+
+	for _, entry := range z.files {
+		filename := entry.entryName()
+		if after, ok := strings.CutPrefix(filename, oldPrefix); ok {
+			delete(z.lookup, filename)
+			entry.name = strings.TrimSuffix(newPrefix+after, "/")
+			z.lookup[entry.entryName()] = entry
+		}
+	}
+
+	return nil
+}
+
+// replaceEntry atomically replaces an existing file with a new one
+// to maintain archive consistency (Last Write Wins).
+func (z *Zip) replaceEntry(old, new *File) {
+	z.lookup[new.entryName()] = new
+	for i, f := range z.files {
+		if f == old {
+			z.files[i] = new
+			return
+		}
+	}
+	z.files = append(z.files, new)
+}
+
 // extractFile handles low-level extraction logic.
 // It uses the shared buffer pool and attempts to restore file metadata (times/perms).
 func (z *Zip) extractFile(ctx context.Context, f *File, path string) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	if strings.ContainsAny(path, "\x00\r\n\t") {
+		return fmt.Errorf("%w: filename contains control characters", ErrFileEntry)
 	}
 
 	src, err := f.Open()
@@ -1413,8 +1539,8 @@ func (z *Zip) extractFile(ctx context.Context, f *File, path string) error {
 	}
 	// Best-effort attempts to restore metadata. Errors are ignored as they
 	// may occur on file systems that don't support these operations.
-	os.Chmod(path, perm)
-	os.Chtimes(path, time.Now(), f.modTime)
+	_ = os.Chmod(path, perm)
+	_ = os.Chtimes(path, time.Now(), f.modTime)
 
 	return nil
 }

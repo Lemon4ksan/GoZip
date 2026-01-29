@@ -48,10 +48,10 @@ const (
 // and content access mechanisms. Each File object corresponds to one entry in the
 // ZIP central directory and can represent either a regular file or a directory.
 type File struct {
-	name  string      // File path within the archive (using forward slashes)
-	isDir bool        // True if this entry represents a directory
-	mode  fs.FileMode // Unix-style file permissions and type bits
-	flags uint16      // Internal flags state
+	name       string      // File path within the archive (using forward slashes)
+	isDir      bool        // True if this entry represents a directory
+	isImplicit bool        // True if dir was created automatically.
+	mode       fs.FileMode // Unix-style file permissions and type bits
 
 	openFunc func() (io.ReadCloser, error)     // Factory function for reading decompressed content
 	srcFunc  func() (*io.SectionReader, error) // Factory function for reading compressed content
@@ -64,6 +64,7 @@ type File struct {
 	config    FileConfig
 	srcConfig FileConfig
 
+	flags             uint16         // Internal flags state
 	localHeaderOffset int64          // Byte offset of this file's local header within archive
 	hostSystem        sys.HostSystem // Operating system that created the file (for attribute mapping)
 
@@ -214,6 +215,9 @@ func (f *File) Name() string { return f.name }
 // IsDir returns true if the file represents a directory entry.
 func (f *File) IsDir() bool { return f.isDir }
 
+// IsImplicit returns true if dir was created automatically.
+func (f *File) IsImplicit() bool { return f.isImplicit }
+
 // Mode returns underlying file attributes.
 func (f *File) Mode() fs.FileMode { return f.mode }
 
@@ -275,14 +279,15 @@ func (f *File) Open() (io.ReadCloser, error) {
 	return f.openFunc()
 }
 
-// OpenRaw returns an io.SectionReader for reading the raw file content
+// OpenRaw returns an [io.SectionReader] for reading the raw file content
 // (compressed and/or encrypted) directly from the archive source.
+// If the file is encrypted (AES), the reader includes Salt, PVV, and MAC bytes.
+// Returns error if the file was created in memory (e.g. AddReader)
+// and has not been written to disk yet.
 //
-// Use Case:
-//   - Debugging headers or compression ratios.
-//   - Copying raw compressed data to another archive without re-compression
-//
-// Returns error if the file was created in memory and not yet written to an archive.
+// Use Cases:
+//   - Efficiently copying files between archives without re-compression (Zero-Copy).
+//   - Debugging compression headers or encryption metadata.
 func (f *File) OpenRaw() (*io.SectionReader, error) {
 	if f.srcFunc == nil {
 		return nil, errors.New("OpenRaw: data not available (file not read from archive)")
@@ -294,21 +299,21 @@ func (f *File) OpenRaw() (*io.SectionReader, error) {
 // from the original archive in case if the archive-wide password was incorrect
 // or if different files have different passwords.
 func (f *File) SetSourcePassword(pwd string) {
-    f.srcConfig.Password = pwd
+	f.srcConfig.Password = pwd
 }
 
 // DisableEncryption sets encryption method to [NotEncrypted] and removes the password for this file.
 // This does not affect configuration for decompressing file from an existing archive.
 func (f *File) DisableEncryption() {
-    f.config.EncryptionMethod = NotEncrypted
-    f.config.Password = ""
+	f.config.EncryptionMethod = NotEncrypted
+	f.config.Password = ""
 }
 
 // SetCompression replaces the compression method and level with the specified ones.
 // This does not affect configuration for decompressing file from an existing archive.
 func (f *File) SetCompression(method CompressionMethod, level int) {
-    f.config.CompressionMethod = method
-    f.config.CompressionLevel = level
+	f.config.CompressionMethod = method
+	f.config.CompressionLevel = level
 }
 
 // SetEncryption replaces the encryption method and password with the specified ones.
@@ -342,11 +347,12 @@ func (f *File) SetConfig(config FileConfig) {
 	f.config.Comment = config.Comment
 }
 
-// SetOpenFunc replaces the function used to open the file's content.
-// Note that file sizes will be updated only after the archive is written.
+// SetOpenFunc replaces the function used to open the
+// file's content and sets the size to [SizeUnknown].
 func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) {
 	f.srcFunc = nil
 	f.openFunc = openFunc
+	f.uncompressedSize = SizeUnknown
 }
 
 // SetExtraField adds or replaces an extra field entry for this file.
@@ -388,8 +394,8 @@ func (f *File) getExtraFieldLength() int {
 	return size
 }
 
-// getFilename returns the filename as it appears in ZIP headers.
-func (f *File) getFilename() string {
+// entryName returns the filename as it appears in ZIP headers.
+func (f *File) entryName() string {
 	if f.isDir {
 		return f.name + "/"
 	}
@@ -444,7 +450,7 @@ func newZipHeaders(f *File) *zipHeaders {
 // LocalHeader generates the local file header that precedes the file data.
 func (zh *zipHeaders) LocalHeader() internal.LocalFileHeader {
 	dosDate, dosTime := timeToMsDos(zh.file.modTime)
-	filename := zh.file.getFilename()
+	filename := zh.file.entryName()
 	localExtra := zh.buildLocalExtraData()
 
 	return internal.LocalFileHeader{
@@ -466,7 +472,7 @@ func (zh *zipHeaders) LocalHeader() internal.LocalFileHeader {
 // CentralDirEntry generates the central directory entry for this file.
 func (zh *zipHeaders) CentralDirEntry() internal.CentralDirectory {
 	dosDate, dosTime := timeToMsDos(zh.file.modTime)
-	filename := zh.file.getFilename()
+	filename := zh.file.entryName()
 	var extraField []byte
 	if zh.file.extraField == nil {
 		extraField = zh.file.extraFieldRaw

@@ -288,7 +288,7 @@ func newAes256Reader(src io.Reader, password string, compressedSize int64) (io.R
 	}
 
 	if compressedSize < overhead {
-		return nil, errors.New("zip: invalid aes file size (too small)")
+		return nil, errors.New("invalid aes file size (too small)")
 	}
 	// The actual encrypted data size
 	dataSize := compressedSize - overhead
@@ -323,7 +323,7 @@ func (r *aesReader) Read(p []byte) (int, error) {
 
 		calculated := r.mac.Sum(nil)[:aesMacSize]
 		if subtle.ConstantTimeCompare(calculated, expected[:]) != 1 {
-			return n, errors.New("zip: aes authentication failed")
+			return n, errors.New("aes authentication failed")
 		}
 		// Verification successful
 		return n, io.EOF
