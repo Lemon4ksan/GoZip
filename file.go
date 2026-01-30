@@ -67,6 +67,7 @@ type File struct {
 	config    FileConfig
 	srcConfig FileConfig
 
+	hasZip64Extra     bool           // True if 0x0001 tag is present in local header or cd
 	flags             uint16         // Internal flags state
 	localHeaderOffset int64          // Byte offset of this file's local header within archive
 	hostSystem        sys.HostSystem // Operating system that created the file (for attribute mapping)

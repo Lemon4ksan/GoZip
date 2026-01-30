@@ -814,9 +814,10 @@ func (z *Zip) OpenFile(name string) (io.ReadCloser, error) {
 	return f.Open()
 }
 
-// Glob returns all files whose names match the specified shell pattern.
-// Pattern syntax is identical to [path.Match].
+// Glob returns all files file whose name matches the [path.Match] pattern.
 func (z *Zip) Glob(pattern string) ([]*File, error) {
+	pattern = strings.ReplaceAll(pattern, "\\", "/")
+
 	if _, err := path.Match(pattern, ""); err != nil {
 		return nil, err
 	}
@@ -972,6 +973,7 @@ func (z *Zip) WriteToParallelWithContext(ctx context.Context, dest io.Writer, ma
 
 // Load parses an existing ZIP archive's central directory and merges
 // its entries into the current Zip instance using "Best Effort" strategy.
+// For sources that don't support io.ReaderAt see [StreamReader].
 //
 // Behavior:
 //   - It does not load file contents into memory, only headers.

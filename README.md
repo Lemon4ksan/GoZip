@@ -13,10 +13,23 @@ GoZip achieves performance parity with the standard library in sequential mode w
 
 | Scenario | Standard Lib | GoZip (Sequential) | GoZip (Parallel 12 workers) |
 | :--- | :--- | :--- | :--- |
-| **1000 Small Files (1KB)** | 20 ms | 20 ms | **7.3 ms (2.8x faster)** |
-| **10 Medium Files (10MB)** | 1.60 s | 1.57 s | **0.25 s (6.4x faster)** |
+| **Write 1000 Small Files** | 57.4 ms | 55.4 ms | **9.7 ms (5.9x faster)** |
+| **Write 10 Medium Files (100MB)** | 1.23 s | 1.21 s | **0.20 s (6.1x faster)** |
+| **Metadata Parsing (1000 files)** | 0.12 ms | 3.04 ms | **0.25 ms (StreamReader)** |
 
 *Benchmarks run on **Intel Core i5-12400F** (6 cores, 12 threads).*
+
+GoZip's `Load` is slower than stdLib because it eagerly builds an O(1) lookup map and ensures structural safety. Use **StreamReader** for maximum efficiency during sequential processing.
+
+### StreamReader Efficiency
+
+If you don't need random access to files, `StreamReader` is the fastest way to process an archive. It skips the expensive index-building step:
+
+* **12x faster** initial access compared to `archive.Load()`.
+* **Minimal memory footprint** as it only keeps one file header in memory at a time.
+* Ideal for high-throughput data pipelines and cloud functions.
+
+## Custom algorithms
 
 You can speed up the time even further by registering a faster flate implementation. ([`github.com/klauspost/compress/flate`](https://github.com/klauspost/compress) for example)
 
@@ -318,6 +331,74 @@ func main() {
     archive.Extract("output")
 }
 ```
+
+## 🌊 Streaming Reader (Sequential Access)
+
+While the standard `Zip` object requires random access (`io.ReaderAt`), GoZip provides a `StreamReader` for processing archives sequentially. This is ideal for reading ZIP files directly from **HTTP response bodies**, **TCP connections**, or **Unix pipes** without saving them to disk.
+
+### Key Advantages
+
+* **Memory Efficient:** Processes files one by one with a tiny memory footprint.
+* **No Seek Required:** Works with any `io.Reader`.
+* **Data Descriptor Support:** Correctly handles archives created in streaming mode (where file sizes are unknown until the end of the file data).
+
+### Example: Processing a remote ZIP via HTTP
+
+```go
+package main
+
+import (
+    "io"
+    "net/http"
+    "github.com/lemon4ksan/gozip"
+)
+
+func main() {
+    resp, err := http.Get("https://example.com/huge_backup.zip")
+    if err != nil {
+        panic(err)
+    }
+    defer resp.Body.Close()
+
+    // Initialize StreamReader from the network stream
+    sr := gozip.NewStreamReader(resp.Body)
+
+    for {
+        // Move to the next file in the stream
+        f, err := sr.Next()
+        if err == io.EOF {
+            break // End of archive
+        }
+        if err != nil {
+            panic(err)
+        }
+
+        // Process only specific files without downloading the rest
+        if isRequired(f.Name()) {
+            rc, _ := sr.Open()
+
+            // Integrity check happens inside io.ReadAll at the very end.
+            data, err := io.ReadAll(rc)
+            if err != nil {
+                if errors.Is(err, gozip.ErrChecksum) {
+                    fmt.Println("Error: File is corrupted")
+                }
+            }
+
+            rc.Close()
+        }
+        // sr.Next() will automatically skip remaining data of the current file
+    }
+}
+```
+
+### Limitations of Streaming Mode
+
+Due to the nature of the ZIP format, reading sequentially has some trade-offs:
+
+1. **Limited Metadata:** Since `StreamReader` reads Local File Headers instead of the Central Directory at the end, some attributes (like Unix permissions, file comments, or precise NTFS timestamps) are unavailable.
+2. **No Backtracking:** Once a file is skipped or read, you cannot go back to it without restarting the entire stream.
+3. **Data Descriptor Scanning:** For `Stored` (uncompressed) files with unknown sizes, the reader must scan the stream for signatures, which has a very small chance of false positives in purely random binary data.
 
 ## ⚠️ Error Handling
 

@@ -212,7 +212,7 @@ func (zw *zipWriter) writeDataDescriptor(f *File) error {
 	if f.RequiresZip64() {
 		// ZIP64 Data Descriptor: Sig(4) + CRC(4) + Comp(8) + Uncomp(8)
 		var buf [24]byte
-		binary.LittleEndian.PutUint32(buf[0:4], 0x08074b50)
+		binary.LittleEndian.PutUint32(buf[0:4], internal.DataDescriptorSignature)
 		binary.LittleEndian.PutUint32(buf[4:8], f.crc32)
 		binary.LittleEndian.PutUint64(buf[8:16], uint64(f.compressedSize))
 		binary.LittleEndian.PutUint64(buf[16:24], uint64(f.uncompressedSize))
@@ -220,7 +220,7 @@ func (zw *zipWriter) writeDataDescriptor(f *File) error {
 	} else {
 		// Standard Data Descriptor: Sig(4) + CRC(4) + Comp(4) + Uncomp(4)
 		var buf [16]byte
-		binary.LittleEndian.PutUint32(buf[0:4], 0x08074b50)
+		binary.LittleEndian.PutUint32(buf[0:4], internal.DataDescriptorSignature)
 		binary.LittleEndian.PutUint32(buf[4:8], f.crc32)
 		binary.LittleEndian.PutUint32(buf[8:12], uint32(f.compressedSize))
 		binary.LittleEndian.PutUint32(buf[12:16], uint32(f.uncompressedSize))

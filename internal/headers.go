@@ -21,6 +21,7 @@ const (
 	Zip64EOCDSignature        uint32 = 0x06064b50
 	Zip64EOCDLocatorSignature uint32 = 0x07064b50
 	ArchiveExtraDataSignature uint32 = 0x08064b50
+	DataDescriptorSignature   uint32 = 0x08074b50
 )
 
 type LocalFileHeader struct {
@@ -58,6 +59,43 @@ func (h LocalFileHeader) Encode() []byte {
 	copy(buf[30+h.FilenameLength:], h.ExtraField)
 
 	return buf
+}
+
+func ReadLocalFileHeader(src io.Reader) (LocalFileHeader, error) {
+	var buf [26]byte
+	if _, err := io.ReadFull(src, buf[:]); err != nil {
+		return LocalFileHeader{}, fmt.Errorf("read source: %w", err)
+	}
+
+	entry := LocalFileHeader{
+		VersionNeededToExtract: binary.LittleEndian.Uint16(buf[0:2]),
+		GeneralPurposeBitFlag:  binary.LittleEndian.Uint16(buf[2:4]),
+		CompressionMethod:      binary.LittleEndian.Uint16(buf[4:6]),
+		LastModFileTime:        binary.LittleEndian.Uint16(buf[6:8]),
+		LastModFileDate:        binary.LittleEndian.Uint16(buf[8:10]),
+		CRC32:                  binary.LittleEndian.Uint32(buf[10:14]),
+		CompressedSize:         binary.LittleEndian.Uint32(buf[14:18]),
+		UncompressedSize:       binary.LittleEndian.Uint32(buf[18:22]),
+		FilenameLength:         binary.LittleEndian.Uint16(buf[22:24]),
+		ExtraFieldLength:       binary.LittleEndian.Uint16(buf[24:26]),
+	}
+
+	if entry.FilenameLength > 0 {
+		filename := make([]byte, entry.FilenameLength)
+		if _, err := io.ReadFull(src, filename); err != nil {
+			return LocalFileHeader{}, fmt.Errorf("read filename: %w", err)
+		}
+		entry.Filename = string(filename)
+	}
+
+	if entry.ExtraFieldLength > 0 {
+		entry.ExtraField = make([]byte, entry.ExtraFieldLength)
+		if _, err := io.ReadFull(src, entry.ExtraField); err != nil {
+			return LocalFileHeader{}, fmt.Errorf("read extra field: %w", err)
+		}
+	}
+
+	return entry, nil
 }
 
 type CentralDirectory struct {
@@ -292,4 +330,55 @@ func EncodeZip64EOCDLocator(endOfCentralDirOffset uint64) []byte {
 	binary.LittleEndian.PutUint32(buf[16:20], 1)
 
 	return buf
+}
+
+type SharedEntry struct {
+	VersionNeededToExtract uint16
+	GeneralPurposeBitFlag  uint16
+	CompressionMethod      uint16
+	LastModFileTime        uint16
+	LastModFileDate        uint16
+	CRC32                  uint32
+	CompressedSize         uint32
+	UncompressedSize       uint32
+	FilenameLength         uint16
+	ExtraFieldLength       uint16
+	LocalHeaderOffset      uint32
+	Filename               string
+	ExtraField             []byte
+}
+
+func SharedEntryFromLocal(entry LocalFileHeader) SharedEntry {
+	return SharedEntry{
+		VersionNeededToExtract: entry.VersionNeededToExtract,
+		GeneralPurposeBitFlag:  entry.GeneralPurposeBitFlag,
+		CompressionMethod:      entry.CompressionMethod,
+		LastModFileTime:        entry.LastModFileTime,
+		LastModFileDate:        entry.LastModFileDate,
+		CRC32:                  entry.CRC32,
+		CompressedSize:         entry.CompressedSize,
+		UncompressedSize:       entry.UncompressedSize,
+		FilenameLength:         entry.FilenameLength,
+		ExtraFieldLength:       entry.ExtraFieldLength,
+		Filename:               entry.Filename,
+		ExtraField:             entry.ExtraField,
+	}
+}
+
+func SharedEntryFromCD(entry CentralDirectory) SharedEntry {
+	return SharedEntry{
+		VersionNeededToExtract: entry.VersionNeededToExtract,
+		GeneralPurposeBitFlag:  entry.GeneralPurposeBitFlag,
+		CompressionMethod:      entry.CompressionMethod,
+		LastModFileTime:        entry.LastModFileTime,
+		LastModFileDate:        entry.LastModFileDate,
+		CRC32:                  entry.CRC32,
+		CompressedSize:         entry.CompressedSize,
+		UncompressedSize:       entry.UncompressedSize,
+		FilenameLength:         entry.FilenameLength,
+		ExtraFieldLength:       entry.ExtraFieldLength,
+		LocalHeaderOffset:      entry.LocalHeaderOffset,
+		Filename:               entry.Filename,
+		ExtraField:             entry.ExtraField,
+	}
 }

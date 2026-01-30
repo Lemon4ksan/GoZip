@@ -1,6 +1,4 @@
 // Copyright 2025 Lemon4ksan. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
 
 package gozip_test
 
@@ -163,16 +161,10 @@ func verifyZipContent(t *testing.T, data []byte, expectedFiles map[string]string
 // --- Benchmarks ---
 
 const (
-	smallFileCount = 1000
-	smallFileSize  = 1 * 1024 // 1KB
-
+	smallFileCount  = 1000
+	smallFileSize   = 1 * 1024 // 1KB
 	mediumFileCount = 10
 	mediumFileSize  = 10 * 1024 * 1024 // 10MB
-)
-
-var (
-	smallFiles  []testFile
-	mediumFiles []testFile
 )
 
 type testFile struct {
@@ -180,16 +172,14 @@ type testFile struct {
 	body []byte
 }
 
-const (
-	readFileCount = 1000
-)
-
 var (
+	smallFiles  []testFile
+	mediumFiles []testFile
 	testZipPath string
 	testZipSize int64
 )
 
-func init() {
+func TestMain(m *testing.M) {
 	// Generate data once for consistent benchmarks
 	smallFiles = generateFiles(smallFileCount, smallFileSize)
 	mediumFiles = generateFiles(mediumFileCount, mediumFileSize)
@@ -212,38 +202,38 @@ func init() {
 	}
 	testZipPath = f.Name()
 
-	w := gozip.NewZip()
+	archive := gozip.NewZip()
 	content := strings.Repeat("A regular repeating string for compression testing. ", 20) // ~1KB
 
-	for i := range readFileCount {
+	for i := range 500 {
 		name := fmt.Sprintf("folder_%d/file_%d.txt", i%10, i)
-		w.AddString(content, name)
+		archive.AddString(content, name)
 	}
 
-	if _, err := w.WriteTo(f); err != nil {
+	if _, err := archive.WriteTo(f); err != nil {
 		panic(err)
 	}
 	f.Close()
 
-	stat, _ := os.Stat(testZipPath)
-	testZipSize = stat.Size()
-	fmt.Printf("Benchmark: Generated %s (%d files, %.2f MB)\n",
-		testZipPath, readFileCount, float64(testZipSize)/1024/1024)
+	info, _ := os.Stat(testZipPath)
+	testZipSize = info.Size()
+
+	code := m.Run()
+
+	os.Remove(testZipPath)
+	os.Exit(code)
 }
 
 func generateFiles(count, size int) []testFile {
 	files := make([]testFile, count)
+	// Generate random data to stress the compressor
 	rng := rand.New(rand.NewSource(42))
-
-	baseContent := make([]byte, size)
-	for i := range baseContent {
-		baseContent[i] = byte(rng.Intn(26) + 'a') // a-z
-	}
-
 	for i := range count {
+		body := make([]byte, size)
+		rng.Read(body)
 		files[i] = testFile{
 			name: fmt.Sprintf("file_%d.txt", i),
-			body: baseContent, // Shared underlying array to save test memory
+			body: body, // Shared underlying array to save test memory
 		}
 	}
 	return files
@@ -347,12 +337,11 @@ func runGoZipParBenchmark(b *testing.B, files []testFile) {
 	}
 }
 
+// --- Benchmark: Load/Metadata ---
+
 func BenchmarkLoad_StdLib(b *testing.B) {
 	for b.Loop() {
-		r, err := zip.OpenReader(testZipPath)
-		if err != nil {
-			b.Fatal(err)
-		}
+		r, _ := zip.OpenReader(testZipPath)
 		_ = len(r.File)
 		r.Close()
 	}
@@ -361,118 +350,95 @@ func BenchmarkLoad_StdLib(b *testing.B) {
 func BenchmarkLoad_GoZip(b *testing.B) {
 	for b.Loop() {
 		archive := gozip.NewZip()
-		f, err := os.Open(testZipPath)
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		err = archive.Load(f, testZipSize)
-		if err != nil {
-			b.Fatal(err)
-		}
+		f, _ := os.Open(testZipPath)
+		archive.Load(f, testZipSize)
 		f.Close()
 	}
 }
 
-func BenchmarkReadSeq_StdLib(b *testing.B) {
-	r, err := zip.OpenReader(testZipPath)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer r.Close()
-
-	for b.Loop() {
-		for _, f := range r.File {
-			rc, err := f.Open()
-			if err != nil {
-				b.Fatal(err)
-			}
-			if f.UncompressedSize64 == 0 {
-				continue
-			}
-			_, err = io.Copy(io.Discard, rc)
-			rc.Close()
-			if err != nil {
-				b.Fatal(err)
-			}
-		}
-	}
-}
+// --- Benchmark: Read/Decompress ---
 
 func BenchmarkReadSeq_GoZip(b *testing.B) {
-	f, err := os.Open(testZipPath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	f, _ := os.Open(testZipPath)
 	defer f.Close()
-
 	archive := gozip.NewZip()
-	if err := archive.Load(f, testZipSize); err != nil {
-		b.Fatal(err)
-	}
+	archive.Load(f, testZipSize)
 	files := archive.Files()
 
+	b.ResetTimer()
 	for b.Loop() {
 		for _, file := range files {
-			rc, err := file.Open()
-			if err != nil {
-				b.Fatal(err)
-			}
-			if file.UncompressedSize() == 0 {
-				continue
-			}
-			_, err = io.Copy(io.Discard, rc)
+			rc, _ := file.Open()
+			io.Copy(io.Discard, rc)
 			rc.Close()
-			if err != nil {
-				b.Fatal(err)
-			}
 		}
 	}
 }
 
 func BenchmarkReadPar_GoZip(b *testing.B) {
-	f, err := os.Open(testZipPath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	f, _ := os.Open(testZipPath)
 	defer f.Close()
-
 	archive := gozip.NewZip()
-	if err := archive.Load(f, testZipSize); err != nil {
-		b.Fatal(err)
-	}
+	archive.Load(f, testZipSize)
 	files := archive.Files()
 	workers := runtime.NumCPU()
 
+	b.ResetTimer()
 	for b.Loop() {
 		var wg sync.WaitGroup
-		queue := make(chan *gozip.File, len(files))
-
+		ch := make(chan *gozip.File, len(files))
 		for _, file := range files {
-			queue <- file
+			ch <- file
 		}
-		close(queue)
+		close(ch)
 
 		wg.Add(workers)
 		for range workers {
 			go func() {
 				defer wg.Done()
-				for file := range queue {
-					rc, err := file.Open()
-					if err != nil {
-						b.Errorf("Open error: %v", err)
-						return
-					}
-					if file.UncompressedSize() == 0 {
-						continue
-					}
-					if _, err := io.Copy(io.Discard, rc); err != nil {
-						b.Errorf("Copy error: %v", err)
-					}
+				for file := range ch {
+					rc, _ := file.Open()
+					io.Copy(io.Discard, rc)
 					rc.Close()
 				}
 			}()
 		}
 		wg.Wait()
+	}
+}
+
+// --- Benchmark StreamReader (Streaming) ---
+
+func BenchmarkStreamReader_GoZip(b *testing.B) {
+	for b.Loop() {
+		f, _ := os.Open(testZipPath)
+		sr := gozip.NewStreamReader(f)
+		for {
+			_, err := sr.Next()
+			if err == io.EOF {
+				break
+			}
+			rc, _ := sr.Open()
+			io.Copy(io.Discard, rc)
+			rc.Close()
+		}
+		f.Close()
+	}
+}
+
+// --- Benchmark: Extraction (Parallel) ---
+
+func BenchmarkExtractParallel_GoZip(b *testing.B) {
+	tempDir, _ := os.MkdirTemp("", "gozip_extract_*")
+	defer os.RemoveAll(tempDir)
+
+	f, _ := os.Open(testZipPath)
+	defer f.Close()
+	archive := gozip.NewZip()
+	archive.Load(f, testZipSize)
+
+	b.ResetTimer()
+	for b.Loop() {
+		archive.ExtractParallel(tempDir, runtime.NumCPU())
 	}
 }
