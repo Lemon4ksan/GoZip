@@ -165,6 +165,10 @@ type ZipConfig struct {
 	// and their order in the written archive.
 	FileSortStrategy FileSortStrategy
 
+	// ConflictHandler defines the strategy for handling duplicate file names during [Zip.Load].
+	// If nil, defaults to [ActionReplace] (Last Write Wins).
+	ConflictHandler ConflictHandler
+
 	// TextEncoding handles filename decoding for legacy archives (non-UTF8).
 	// This function is only used in read operations. GoZip always sets
 	// the UTF-8 flag for maximum compatibility when writing.
@@ -981,10 +985,9 @@ func (z *Zip) WriteToParallelWithContext(ctx context.Context, dest io.Writer, ma
 //
 // Conflict Handling (Smart Merge):
 //   - If the current archive already contains entries with the same name as in the source,
-//     the **existing entries are replaced** by the new ones.
+//     the existing entries are replaced by the new ones by default.
 //     This ensures the final archive remains valid (no duplicate file headers).
-//   - Returns [ErrDuplicateEntry] (wrapped in a combined error) as a warning
-//     indicating that an overwrite occurred.
+//   - You can change logic by specifying custom [ZipConfig.ConflictHandler].
 //
 // Supported Formats:
 //   - Standard ZIP, Zip64, and archives with preambles (e.g., self-extracting EXEs).
@@ -1002,14 +1005,7 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 		return err
 	}
 
-	callback := func(f *File, err error) {
-		if z.config.OnFileProcessed != nil {
-			z.config.OnFileProcessed(f, err)
-		}
-	}
-
 	reader := newZipReader(src, size, z.decompressors, z.config)
-
 	eocd, err := reader.FindAndReadEOCD(ctx)
 	if err != nil {
 		return err
@@ -1024,15 +1020,14 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 		return err
 	}
 
-	totalFiles := len(files)
-	if len(z.files) == 0 {
-		if cap(z.files) < totalFiles {
-			newFiles := make([]*File, 0, totalFiles)
-			z.files = newFiles
-		}
-	}
-	if len(z.lookup) == 0 {
-		z.lookup = make(map[string]*File, totalFiles)
+	z.mu.Lock()
+	defer z.mu.Unlock()
+
+	z.prepareInternalStorage(len(files))
+
+	handler := z.config.ConflictHandler
+	if handler == nil {
+		handler = DefaultConflictHandler
 	}
 
 	var errs []error
@@ -1042,26 +1037,15 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 		}
 
 		file.config.Password = z.config.Password
-		filename := file.entryName()
 
-		if existing, exists := z.lookup[filename]; exists {
-			z.replaceEntry(existing, file)
-			if !existing.isImplicit {
-				errs = append(errs, wrapErr("load", file, ErrDuplicateEntry))
-				callback(file, ErrDuplicateEntry)
-			}
-			continue
-		}
-
-		z.lookup[filename] = file
-
-		err := z.createMissingDirs(file.name)
+		added, err := z.addLoadedFile(file, handler)
 		if err != nil {
 			errs = append(errs, wrapErr("load", file, err))
-		} else {
-			z.files = append(z.files, file)
 		}
-		callback(file, err)
+
+		if added && z.config.OnFileProcessed != nil {
+			z.config.OnFileProcessed(file, err)
+		}
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -1435,6 +1419,7 @@ func (z *Zip) atomicPathTransform(op string, f *File, newPath string) error {
 	return z.applyPathTransform(f, newPath)
 }
 
+// checkPathTransform ensures newPath is valid.
 func (z *Zip) checkPathTransform(op string, f *File, newPath string) error {
 	if _, exists := z.lookup[newPath]; exists {
 		return wrapErr(op, f, fmt.Errorf("%w: '%s'", ErrDuplicateEntry, newPath))
@@ -1483,6 +1468,64 @@ func (z *Zip) applyPathTransform(f *File, newPath string) error {
 	}
 
 	return nil
+}
+
+// prepareInternalStorage optimizes allocations if the archive was empty.
+func (z *Zip) prepareInternalStorage(newFilesCount int) {
+	if len(z.files) == 0 {
+		z.files = make([]*File, 0, newFilesCount)
+	}
+	if len(z.lookup) == 0 {
+		z.lookup = make(map[string]*File, newFilesCount)
+	}
+}
+
+// addLoadedFile determines how to add a file from an external source to the current archive.
+// It returns true if the file was added or replaced, and false if it was skipped.
+func (z *Zip) addLoadedFile(file *File, handler ConflictHandler) (bool, error) {
+	filename := file.entryName()
+	existing, exists := z.lookup[filename]
+
+	if !exists {
+		if err := z.createMissingDirs(file.name); err != nil {
+			return false, err
+		}
+		z.lookup[filename] = file
+		z.files = append(z.files, file)
+		return true, nil
+	}
+
+	action, newName := handler(existing, file)
+
+	switch action {
+	case ActionReplace:
+		z.replaceEntry(existing, file)
+		return true, nil
+
+	case ActionSkip:
+		return false, nil
+
+	case ActionError:
+		return false, ErrDuplicateEntry
+
+	case ActionRename:
+		if newName == "" {
+			return false, fmt.Errorf("%w: empty rename name", ErrFileEntry)
+		}
+		file.name = newName
+		if err := z.createMissingDirs(file.name); err != nil {
+			return false, err
+		}
+		if _, exists := z.lookup[file.entryName()]; exists {
+			return false, fmt.Errorf("%w: rename target '%s' exists", ErrDuplicateEntry, newName)
+		}
+		z.lookup[file.entryName()] = file
+		z.files = append(z.files, file)
+		return true, nil
+
+	default:
+		return false, nil
+	}
 }
 
 // replaceEntry atomically replaces an existing file with a new one
