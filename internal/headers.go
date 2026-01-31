@@ -260,7 +260,7 @@ func EncodeEOCD(entriesNum int, centralDirSize int64, centralDirOffset int64, co
 	binary.LittleEndian.PutUint16(buf[4:6], 0)
 	binary.LittleEndian.PutUint16(buf[6:8], 0)
 	binary.LittleEndian.PutUint16(buf[8:10], uint16(min(MaxUint16, entriesNum)))
-	binary.LittleEndian.PutUint16(buf[10:12], uint16(min(MaxUint32, entriesNum)))
+	binary.LittleEndian.PutUint16(buf[10:12], uint16(min(MaxUint16, entriesNum)))
 	binary.LittleEndian.PutUint32(buf[12:16], uint32(min(MaxUint32, centralDirSize)))
 	binary.LittleEndian.PutUint32(buf[16:20], uint32(min(MaxUint32, centralDirOffset)))
 	binary.LittleEndian.PutUint16(buf[20:22], uint16(commentLen))

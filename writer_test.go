@@ -376,6 +376,48 @@ func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 	}
 }
 
+func TestParallelZipWriter_ContextCancel(t *testing.T) {
+	mw := NewMemoryWriteSeeker()
+	pzw := newParallelZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw, 2)
+
+	slowFile := &File{
+		name:             "slow.txt",
+		uncompressedSize: 1000,
+		openFunc: func() (io.ReadCloser, error) {
+			r, w := io.Pipe()
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				w.Write([]byte("data"))
+				w.Close()
+			}()
+			return r, nil
+		},
+	}
+
+	files := []*File{slowFile, slowFile, slowFile}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	errs := pzw.WriteFiles(ctx, files)
+
+	found := false
+	for _, err := range errs {
+		if errors.Is(err, context.Canceled) {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		t.Errorf("Expected context.Canceled error, got %v", errs)
+	}
+}
+
 // TestMemoryBuffer_ReadWriteSeek verifies custom buffer logic
 func TestMemoryBuffer_ReadWriteSeek(t *testing.T) {
 	mb := newMemoryBuffer(10)

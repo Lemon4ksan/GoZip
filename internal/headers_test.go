@@ -7,279 +7,259 @@ package internal
 import (
 	"bytes"
 	"encoding/binary"
-	"io"
+	"reflect"
 	"testing"
 )
 
-// Shadow structs for binary reading (excluding string/slice fields)
-// These are necessary because binary.Read cannot handle string fields found in the main structs.
-type rawLocalHeader struct {
-	Signature              uint32
-	VersionNeededToExtract uint16
-	GeneralPurposeBitFlag  uint16
-	CompressionMethod      uint16
-	LastModFileTime        uint16
-	LastModFileDate        uint16
-	CRC32                  uint32
-	CompressedSize         uint32
-	UncompressedSize       uint32
-	FilenameLength         uint16
-	ExtraFieldLength       uint16
-}
-
-type rawCentralDirectory struct {
-	Signature              uint32
-	VersionMadeBy          uint16
-	VersionNeededToExtract uint16
-	GeneralPurposeBitFlag  uint16
-	CompressionMethod      uint16
-	LastModFileTime        uint16
-	LastModFileDate        uint16
-	CRC32                  uint32
-	CompressedSize         uint32
-	UncompressedSize       uint32
-	FilenameLength         uint16
-	ExtraFieldLength       uint16
-	FileCommentLength      uint16
-	DiskNumberStart        uint16
-	InternalFileAttributes uint16
-	ExternalFileAttributes uint32
-	LocalHeaderOffset      uint32
-}
-
-// TestLocalFileHeader_Encode tests the updated encode method which now includes the filename
-func TestLocalFileHeader_Encode(t *testing.T) {
+// TestLocalFileHeader_RoundTrip verifies that data remains consistent
+// after Encoding and then Reading back.
+func TestLocalFileHeader_RoundTrip(t *testing.T) {
 	tests := []struct {
-		name     string
-		header   LocalFileHeader
-		expected string // Expected filename in output
+		name string
+		in   LocalFileHeader
 	}{
 		{
-			name: "Standard file",
-			header: LocalFileHeader{
+			name: "Basic",
+			in: LocalFileHeader{
 				VersionNeededToExtract: 20,
+				GeneralPurposeBitFlag:  0x800,
+				CompressionMethod:      8,
+				LastModFileTime:        0x4B00,
+				LastModFileDate:        0x5600,
+				CRC32:                  0xAABBCCDD,
+				CompressedSize:         500,
+				UncompressedSize:       1000,
+				FilenameLength:         8,
+				ExtraFieldLength:       4,
+				Filename:               "test.txt",
+				ExtraField:             []byte{0xDE, 0xAD, 0xBE, 0xEF},
+			},
+		},
+		{
+			name: "Empty Filename and Extra",
+			in: LocalFileHeader{
+				VersionNeededToExtract: 10,
+				CompressionMethod:      0,
+			},
+		},
+		{
+			name: "UTF-8 Filename",
+			in: LocalFileHeader{
+				VersionNeededToExtract: 20,
+				GeneralPurposeBitFlag:  0x800,
+				FilenameLength:         16, // bytes length
+				Filename:               "привет.txt",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := tt.in.Encode()
+
+			reader := bytes.NewReader(encoded)
+
+			var sig uint32
+			binary.Read(reader, binary.LittleEndian, &sig)
+			if sig != LocalFileHeaderSignature {
+				t.Fatal("Wrong signature encoded")
+			}
+
+			out, err := ReadLocalFileHeader(reader)
+			if err != nil {
+				t.Fatalf("ReadLocalFileHeader failed: %v", err)
+			}
+
+			if !reflect.DeepEqual(tt.in, out) {
+				t.Errorf("RoundTrip mismatch.\nIn:  %+v\nOut: %+v", tt.in, out)
+			}
+		})
+	}
+}
+
+// TestCentralDirectory_RoundTrip verifies consistency for Central Directory entries.
+func TestCentralDirectory_RoundTrip(t *testing.T) {
+	tests := []struct {
+		name string
+		in   CentralDirectory
+	}{
+		{
+			name: "Full Entry",
+			in: CentralDirectory{
+				VersionMadeBy:          63,
+				VersionNeededToExtract: 20,
+				GeneralPurposeBitFlag:  0,
 				CompressionMethod:      8,
 				CRC32:                  0x12345678,
-				CompressedSize:         100,
-				UncompressedSize:       200,
-				FilenameLength:         8,
-				Filename:               "test.txt",
+				CompressedSize:         1024,
+				UncompressedSize:       2048,
+				FilenameLength:         9,
+				ExtraFieldLength:       4,
+				FileCommentLength:      5,
+				LocalHeaderOffset:      12345,
+				Filename:               "image.png",
+				ExtraField:             []byte{1, 2, 3, 4},
+				Comment:                "hello",
 			},
-			expected: "test.txt",
-		},
-		{
-			name: "File inside directory",
-			header: LocalFileHeader{
-				VersionNeededToExtract: 20,
-				CompressionMethod:      0,
-				FilenameLength:         14,
-				Filename:               "folder/doc.txt",
-			},
-			expected: "folder/doc.txt",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Action
-			encoded := tt.header.Encode()
+			encoded := tt.in.Encode()
 
-			// Verification
-			buf := bytes.NewReader(encoded)
+			reader := bytes.NewReader(encoded)
 
-			// 1. Verify Fixed Header
-			var raw rawLocalHeader
-			if err := binary.Read(buf, binary.LittleEndian, &raw); err != nil {
-				t.Fatalf("Failed to read raw header: %v", err)
+			var sig uint32
+			binary.Read(reader, binary.LittleEndian, &sig)
+			if sig != CentralDirectorySignature {
+				t.Fatal("Wrong signature encoded")
 			}
 
-			if raw.Signature != LocalFileHeaderSignature {
-				t.Errorf("Signature mismatch: got %x, want %x", raw.Signature, LocalFileHeaderSignature)
-			}
-			if raw.FilenameLength != tt.header.FilenameLength {
-				t.Errorf("FilenameLength mismatch: got %d, want %d", raw.FilenameLength, tt.header.FilenameLength)
+			out, err := ReadCentralDirEntry(reader)
+			if err != nil {
+				t.Fatalf("ReadCentralDirEntry failed: %v", err)
 			}
 
-			// 2. Verify Variable Data (Filename)
-			filenameBytes := make([]byte, raw.FilenameLength)
-			if _, err := io.ReadFull(buf, filenameBytes); err != nil {
-				t.Fatalf("Failed to read filename from buffer: %v", err)
-			}
-
-			if string(filenameBytes) != tt.expected {
-				t.Errorf("Filename mismatch: got %q, want %q", string(filenameBytes), tt.expected)
-			}
-
-			// 3. Check total size matches expectations
-			expectedSize := 30 + int(tt.header.FilenameLength) + int(tt.header.ExtraFieldLength)
-			if len(encoded) != expectedSize {
-				t.Errorf("Total encoded size mismatch: got %d, want %d", len(encoded), expectedSize)
+			if !reflect.DeepEqual(tt.in, out) {
+				t.Errorf("Mismatch.\nIn:  %+v\nOut: %+v", tt.in, out)
 			}
 		})
 	}
 }
 
-// TestCentralDirectory_Encode tests the updated encode method with Filename, ExtraFields, and Comment
-func TestCentralDirectory_Encode(t *testing.T) {
-	extraData := []byte{0x01, 0x02, 0x03} // Fake extra data
+// TestEOCD_RoundTrip verifies End of Central Directory Record.
+func TestEOCD_RoundTrip(t *testing.T) {
+	entries := 15
+	size := int64(3000)
+	offset := int64(5000)
+	comment := "Archive Comment"
 
-	tests := []struct {
-		name             string
-		entry            CentralDirectory
-		expectedFilename string
-		expectedComment  string
-	}{
-		{
-			name: "Simple Entry",
-			entry: CentralDirectory{
-				VersionMadeBy:     63,
-				CRC32:             0xAABBCCDD,
-				FilenameLength:    8,
-				Filename:          "test.txt",
-				LocalHeaderOffset: 12345,
-			},
-			expectedFilename: "test.txt",
-			expectedComment:  "",
-		},
-		{
-			name: "Entry with Extra Field and Comment",
-			entry: CentralDirectory{
-				VersionMadeBy:     63,
-				FilenameLength:    9,
-				ExtraFieldLength:  3,
-				FileCommentLength: 13,
-				Filename:          "image.png",
-				ExtraField:        extraData,
-				Comment:           "Hello Archive",
-			},
-			expectedFilename: "image.png",
-			expectedComment:  "Hello Archive",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Action
-			encoded := tt.entry.Encode()
-
-			// Verification
-			buf := bytes.NewReader(encoded)
-
-			// 1. Verify Fixed Header
-			var raw rawCentralDirectory
-			if err := binary.Read(buf, binary.LittleEndian, &raw); err != nil {
-				t.Fatalf("Failed to read raw central dir: %v", err)
-			}
-
-			if raw.Signature != CentralDirectorySignature {
-				t.Errorf("Signature mismatch: got %x, want %x", raw.Signature, CentralDirectorySignature)
-			}
-
-			// 2. Verify Filename
-			filenameBytes := make([]byte, raw.FilenameLength)
-			if _, err := io.ReadFull(buf, filenameBytes); err != nil {
-				t.Fatalf("Reading filename: %v", err)
-			}
-			if string(filenameBytes) != tt.expectedFilename {
-				t.Errorf("Filename mismatch: got %q, want %q", string(filenameBytes), tt.expectedFilename)
-			}
-
-			// 3. Verify Extra Fields
-			if raw.ExtraFieldLength > 0 {
-				extraBytes := make([]byte, raw.ExtraFieldLength)
-				if _, err := io.ReadFull(buf, extraBytes); err != nil {
-					t.Fatalf("Reading extra fields: %v", err)
-				}
-				if !bytes.Equal(extraBytes, extraData) {
-					t.Error("Extra field data mismatch")
-				}
-			}
-
-			// 4. Verify Comment
-			if raw.FileCommentLength > 0 {
-				commentBytes := make([]byte, raw.FileCommentLength)
-				if _, err := io.ReadFull(buf, commentBytes); err != nil {
-					t.Fatalf("Reading comment: %v", err)
-				}
-				if string(commentBytes) != tt.expectedComment {
-					t.Errorf("Comment mismatch: got %q, want %q", string(commentBytes), tt.expectedComment)
-				}
-			}
-		})
-	}
-}
-
-// TestEndOfCentralDir_Encode tests the EOCD record encoding including the comment
-func TestEndOfCentralDir_Encode(t *testing.T) {
-	entries := 5
-	size := int64(1024)
-	offset := int64(2048)
-	comment := "End of Archive"
-
-	// Action
 	encoded := EncodeEOCD(entries, size, offset, comment)
 
-	// Verification
-	if len(encoded) != 22+len(comment) {
-		t.Errorf("Encoded length mismatch: got %d, want %d", len(encoded), 22+len(comment))
+	reader := bytes.NewReader(encoded)
+
+	var sig uint32
+	binary.Read(reader, binary.LittleEndian, &sig)
+	if sig != EOCDSignature {
+		t.Fatal("Wrong signature encoded")
 	}
 
-	buf := bytes.NewReader(encoded)
-
-	// Check Signature
-	var signature uint32
-	binary.Read(buf, binary.LittleEndian, &signature)
-	if signature != EOCDSignature {
-		t.Errorf("Signature mismatch")
+	eocd, err := ReadEOCD(reader)
+	if err != nil {
+		t.Fatalf("ReadEOCD failed: %v", err)
 	}
 
-	// Skip to Comment Length (Offset 20)
-	buf.Seek(20, io.SeekStart)
-	var commentLen uint16
-	binary.Read(buf, binary.LittleEndian, &commentLen)
-
-	if int(commentLen) != len(comment) {
-		t.Errorf("Comment length mismatch: got %d, want %d", commentLen, len(comment))
+	if int(eocd.EntriesNum) != entries {
+		t.Errorf("Entries mismatch: got %d, want %d", eocd.EntriesNum, entries)
 	}
-
-	// Verify Comment Body
-	actualComment := make([]byte, commentLen)
-	io.ReadFull(buf, actualComment)
-	if string(actualComment) != comment {
-		t.Errorf("Comment content mismatch: got %q, want %q", string(actualComment), comment)
+	if int64(eocd.CentralDirSize) != size {
+		t.Errorf("Size mismatch: got %d, want %d", eocd.CentralDirSize, size)
+	}
+	if int64(eocd.CentralDirOffset) != offset {
+		t.Errorf("Offset mismatch: got %d, want %d", eocd.CentralDirOffset, offset)
+	}
+	if eocd.Comment != comment {
+		t.Errorf("Comment mismatch: got %q, want %q", eocd.Comment, comment)
 	}
 }
 
-// TestZip64Records tests the structure of Zip64 specific records
-func TestZip64Records(t *testing.T) {
-	t.Run("Zip64 End Of Central Directory", func(t *testing.T) {
-		encoded := EncodeZip64EOCDRecord(100, 5000, 10000)
+func TestEOCD_Limits(t *testing.T) {
+	// Test clamping logic (e.g. entries > 65535 should become 65535 in standard EOCD)
+	hugeEntries := 100000
+	encoded := EncodeEOCD(hugeEntries, 0, 0, "")
 
-		if len(encoded) != 56 {
-			t.Errorf("Zip64 EOCD size mismatch: got %d, want 56", len(encoded))
-		}
+	reader := bytes.NewReader(encoded)
 
-		sig := binary.LittleEndian.Uint32(encoded[0:4])
-		if sig != Zip64EOCDSignature {
-			t.Errorf("Signature mismatch")
-		}
+	var sig uint32
+	binary.Read(reader, binary.LittleEndian, &sig)
+	if sig != EOCDSignature {
+		t.Fatal("Wrong signature encoded")
+	}
 
-		sizeOfRest := binary.LittleEndian.Uint64(encoded[4:12])
-		if sizeOfRest != 44 {
-			t.Errorf("Size of rest mismatch: got %d, want 44", sizeOfRest)
-		}
-	})
+	eocd, _ := ReadEOCD(reader)
 
-	t.Run("Zip64 Locator", func(t *testing.T) {
-		encoded := EncodeZip64EOCDLocator(9999)
+	if eocd.EntriesNum != 0xFFFF {
+		t.Errorf("Expected clamping to 0xFFFF, got %d", eocd.EntriesNum)
+	}
+}
 
-		if len(encoded) != 20 {
-			t.Errorf("Zip64 Locator size mismatch: got %d, want 20", len(encoded))
-		}
+func TestZip64EOCD_RoundTrip(t *testing.T) {
+	entries := 100000 // More than uint16
+	size := int64(5000000000)
+	offset := int64(9000000000)
 
-		sig := binary.LittleEndian.Uint32(encoded[0:4])
-		if sig != Zip64EOCDLocatorSignature {
-			t.Errorf("Signature mismatch")
-		}
-	})
+	encoded := EncodeZip64EOCDRecord(entries, size, offset)
+
+	reader := bytes.NewReader(encoded)
+
+	var sig uint32
+	binary.Read(reader, binary.LittleEndian, &sig)
+	if sig != Zip64EOCDSignature {
+		t.Fatal("Wrong signature encoded")
+	}
+
+	out, err := ReadZip64EOCD(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if int(out.EntriesNum) != entries {
+		t.Errorf("Entries mismatch: got %d, want %d", out.EntriesNum, entries)
+	}
+	if int64(out.CentralDirOffset) != offset {
+		t.Errorf("Offset mismatch")
+	}
+}
+
+func TestZip64Locator_RoundTrip(t *testing.T) {
+	offset := int64(123456789)
+	encoded := EncodeZip64EOCDLocator(offset)
+
+	reader := bytes.NewReader(encoded)
+
+	var sig uint32
+	binary.Read(reader, binary.LittleEndian, &sig)
+	if sig != Zip64EOCDLocatorSignature {
+		t.Fatal("Wrong signature encoded")
+	}
+
+	out, err := ReadZip64EOCDLocator(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if int64(out.Zip64EndOfCentralDirOffset) != offset {
+		t.Errorf("Offset mismatch: got %d, want %d", out.Zip64EndOfCentralDirOffset, offset)
+	}
+}
+
+func TestExtraFields_Parsing(t *testing.T) {
+	// Construct raw bytes: Tag(2) + Size(2) + Data
+	// Field 1: Tag=0x0001 (Zip64), Size=4, Data=0xDEADBEEF
+	// Field 2: Tag=0xCAFE, Size=2, Data=0xBEAF
+	raw := []byte{
+		0x01, 0x00, 0x04, 0x00, 0xEF, 0xBE, 0xAD, 0xDE,
+		0xFE, 0xCA, 0x02, 0x00, 0xAF, 0xBE,
+	}
+
+	parsed := ParseExtraField(raw)
+
+	if len(parsed) != 2 {
+		t.Fatalf("Expected 2 fields, got %d", len(parsed))
+	}
+
+	// Check Zip64
+	if val, ok := parsed[0x0001]; !ok {
+		t.Error("Missing Zip64 tag")
+	} else if !bytes.Equal(val, []byte{0x01, 0x00, 0x04, 0x00, 0xEF, 0xBE, 0xAD, 0xDE}) {
+		t.Error("Wrong data for Zip64 tag")
+	}
+
+	// Check Custom
+	if val, ok := parsed[0xCAFE]; !ok {
+		t.Error("Missing CAFE tag")
+	} else if !bytes.Equal(val, []byte{0xFE, 0xCA, 0x02, 0x00, 0xAF, 0xBE}) {
+		t.Error("Wrong data for CAFE tag")
+	}
 }

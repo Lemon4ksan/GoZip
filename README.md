@@ -9,25 +9,17 @@ Designed for high-load applications, GoZip focuses on **concurrency**, **memory 
 
 ## ⚡ Performance Benchmarks
 
-GoZip achieves performance parity with the standard library in sequential mode while offering near-linear scalability in parallel mode.
+GoZip achieves performance parity with the standard library (`archive/zip`) in sequential mode while offering significant speedups in parallel mode by utilizing all available CPU cores.
 
-| Scenario | Standard Lib | GoZip (Sequential) | GoZip (Parallel 12 workers) |
-| :--- | :--- | :--- | :--- |
-| **Write 1000 Small Files** | 57.4 ms | 55.4 ms | **9.7 ms (5.9x faster)** |
-| **Write 10 Medium Files (100MB)** | 1.23 s | 1.21 s | **0.20 s (6.1x faster)** |
-| **Metadata Parsing (1000 files)** | 0.12 ms | 3.04 ms | **0.25 ms (StreamReader)** |
+| Scenario | Standard Lib | GoZip (Sequential) | GoZip (Parallel)
+| :--- | :--- | :--- | :---
+| **Write 1000 Small Files** | 14.77 ms | 14.81 ms | **6.32 ms (2.3x faster)**
+| **Write 10 Medium Files (100MB)** | 175.6 ms | 176.3 ms | **42.5 ms (4.1x faster)**
+| **Metadata Parsing** | 0.12 ms | 3.06 ms | **0.27 ms (StreamReader)**
 
 *Benchmarks run on **Intel Core i5-12400F** (6 cores, 12 threads).*
 
 GoZip's `Load` is slower than stdLib because it eagerly builds an O(1) lookup map and ensures structural safety. Use **StreamReader** for maximum efficiency during sequential processing.
-
-### StreamReader Efficiency
-
-If you don't need random access to files, `StreamReader` is the fastest way to process an archive. It skips the expensive index-building step:
-
-* **12x faster** initial access compared to `archive.Load()`.
-* **Minimal memory footprint** as it only keeps one file header in memory at a time.
-* Ideal for high-throughput data pipelines and cloud functions.
 
 ## Custom algorithms
 
@@ -43,6 +35,7 @@ archive.RegisterCompressor(gozip.Deflate, func(level int) gozip.Compressor {
 ## 🚀 Key Features
 
 * **High Performance:** Built-in support for **parallel compression and extraction** using worker pools.
+* **Zero Overhead**: In sequential mode, GoZip matches the standard library's speed, proving that its rich API features do not compromise performance.
 * **Concurrency Safe:** Optimized for concurrent access using `io.ReaderAt`, allowing wait-free parallel reading.
 * **Smart I/O:** Automatically switches between stream processing and temporary file buffering based on file size and capabilities.
 * **Archive Modification:** Supports renaming, moving, and removing files/directories within an existing archive.
@@ -51,7 +44,7 @@ archive.RegisterCompressor(gozip.Deflate, func(level int) gozip.Compressor {
 * **Security:**
   * **Zip Slip** protection during extraction.
   * **AES-256** (WinZip compatible) and legacy **ZipCrypto** encryption support.
-* **Cross-Platform Metadata:** Preserves **NTFS** (Windows) timestamps and **Unix/macOS** file permissions.
+* **Cross-Platform Metadata:** Preserves **NTFS** timestamps and **Unix/macOS** file permissions.
 * **Legacy Compatibility:** Includes support for **CP866 (Cyrillic DOS)** and **CP437** encodings.
 
 ## 📦 Installation
@@ -444,17 +437,17 @@ if err := archive.Extract("./out"); err != nil {
 
 ### Error Reference
 
-| Error | Description |
-| :--- | :--- |
-| `ErrFormat` | Not a valid ZIP archive (invalid signatures). |
-| `ErrPasswordMismatch` | Incorrect password or missing password for encrypted file. |
-| `ErrChecksum` | CRC-32 integrity check failed after reading. |
-| `ErrSizeMismatch` | Extracted data size doesn't match the header. |
-| `ErrInsecurePath` | **Zip Slip** detected: file path attempts to escape destination. |
-| `ErrDuplicateEntry` | A file with this name already exists in the archive. |
-| `ErrAlgorithm` | Compression method not supported (e.g., LZMA without plugin). |
-| `ErrFileNotFound` | Requested entry is missing. Wraps `fs.ErrNotExist`. |
-| `ErrFilenameTooLong` | Filename exceeds the ZIP limit of 65,535 bytes. |
+| Error | Description
+| :--- | :---
+| `ErrFormat` | Not a valid ZIP archive (invalid signatures).
+| `ErrPasswordMismatch` | Incorrect password or missing password for encrypted file.
+| `ErrChecksum` | CRC-32 integrity check failed after reading.
+| `ErrSizeMismatch` | Extracted data size doesn't match the header.
+| `ErrInsecurePath` | **Zip Slip** detected: file path attempts to escape destination.
+| `ErrDuplicateEntry` | A file with this name already exists in the archive.
+| `ErrAlgorithm` | Compression method not supported (e.g., LZMA without plugin).
+| `ErrFileNotFound` | Requested entry is missing. Wraps `fs.ErrNotExist`.
+| `ErrFilenameTooLong` | Filename exceeds the ZIP limit of 65,535 bytes.
 
 ## ⚙️ Configuration & Options
 

@@ -5,6 +5,7 @@
 package gozip
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -228,7 +229,7 @@ func (f *File) Name() string { return f.name }
 // IsDir returns true if the file represents a directory entry.
 func (f *File) IsDir() bool { return f.isDir }
 
-// IsImplicit returns true if dir was created automatically.
+// IsImplicit returns true if the entry was created automatically and is not associated with a real directory.
 func (f *File) IsImplicit() bool { return f.isImplicit }
 
 // Mode returns underlying file attributes.
@@ -372,6 +373,19 @@ func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) {
 // Returns an error if adding the field would exceed the maximum extra field length.
 func (f *File) SetExtraField(tag uint16, data []byte) error {
 	f.ensureExtraParsed()
+
+	// Check if the user has already provided a block with a tag (for protection purposes).
+	var fullBlock []byte
+	if len(data) >= 4 && binary.LittleEndian.Uint16(data[0:2]) == tag {
+		fullBlock = data
+	} else {
+		// Wrap the payload in a Tag + Size header.
+		fullBlock = make([]byte, 4+len(data))
+		binary.LittleEndian.PutUint16(fullBlock[0:2], tag)
+		binary.LittleEndian.PutUint16(fullBlock[2:4], uint16(len(data)))
+		copy(fullBlock[4:], data)
+	}
+
 	currentLen := f.getExtraFieldLength()
 
 	// If replacing, subtract the size of the old field

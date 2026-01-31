@@ -125,6 +125,30 @@ func TestFindEOCD_BufferBoundary(t *testing.T) {
 	}
 }
 
+func TestParseZip64_Internal(t *testing.T) {
+	// Tag(2) + Size(2) + Uncomp(8) + Comp(8) + Offset(8)
+	data := internal.EncodeZip64ExtraField(5000000000, 5000000000, 5000000000)
+
+	f := &File{}
+	entry := internal.SharedEntry{
+		UncompressedSize:  StandardSizeLimit,
+		CompressedSize:    StandardSizeLimit,
+		LocalHeaderOffset: StandardSizeLimit,
+	}
+
+	parseZip64(f, data[4:], entry)
+
+	if f.uncompressedSize != 5000000000 {
+		t.Errorf("Uncompressed mismatch: %d", f.uncompressedSize)
+	}
+	if f.compressedSize != 5000000000 {
+		t.Errorf("Compressed mismatch: %d", f.compressedSize)
+	}
+	if f.localHeaderOffset != 5000000000 {
+		t.Errorf("LocalHeaderOffset mismatch: %d", f.localHeaderOffset)
+	}
+}
+
 func TestNewFileFromCentralDir_Zip64(t *testing.T) {
 	cd := internal.CentralDirectory{
 		UncompressedSize:  StandardSizeLimit,
@@ -336,6 +360,50 @@ func TestZipReader_OpenFile_Integration(t *testing.T) {
 
 	if err := rc.Close(); err != nil {
 		t.Errorf("Close (checksum verification) failed: %v", err)
+	}
+}
+
+func TestStreamReader_DataDescriptor(t *testing.T) {
+	content := []byte("stream content")
+	crc := crc32.ChecksumIEEE(content)
+
+	buf := new(bytes.Buffer)
+
+	lh := internal.LocalFileHeader{
+		GeneralPurposeBitFlag: 0x08, // Bit 3
+		CompressionMethod:     uint16(Store),
+		Filename:              "stream.txt",
+		FilenameLength:        10,
+	}
+	buf.Write(lh.Encode())
+
+	buf.Write(content)
+
+	buf.Write(internal.EncodeDataDescriptor(crc, int64(len(content)), int64(len(content))))
+
+	nextLh := internal.LocalFileHeader{Filename: "next.txt", FilenameLength: 8}
+	buf.Write(nextLh.Encode())
+
+	sr := NewStreamReader(buf)
+	_, err := sr.Next()
+	if err != nil {
+		t.Fatalf("Next failed: %v", err)
+	}
+
+	rc, err := sr.Open()
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	got, _ := io.ReadAll(rc)
+	if !bytes.Equal(got, content) {
+		t.Errorf("Content mismatch: got %s", got)
+	}
+	rc.Close()
+
+	nextF, err := sr.Next()
+	if err != nil || nextF.Name() != "next.txt" {
+		t.Errorf("Failed to advance to next file after Data Descriptor: %v", err)
 	}
 }
 

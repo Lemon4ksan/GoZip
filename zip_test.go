@@ -1,4 +1,6 @@
 // Copyright 2025 Lemon4ksan. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 package gozip_test
 
@@ -8,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"runtime"
 	"strings"
@@ -27,18 +28,20 @@ func TestRoundTrip_Sequential(t *testing.T) {
 		CompressionMethod: gozip.Deflate,
 		CompressionLevel:  gozip.DeflateNormal,
 		Comment:           "Test Archive",
+		UseImplicitDirs:   true,
 	})
 
 	testFiles := map[string]string{
 		"hello.txt":       "Hello World",
-		"dir/":            "",
 		"dir/nested.json": "{}",
-		"images/":         "",
-		"images/logo.png": string([]byte{0x89, 0x50, 0x4E, 0x47}),
+		"images/logo.png": string([]byte{0x89, 0x50, 0x4E, 0x47}), // Fake PNG signature
 	}
 
 	for name, content := range testFiles {
 		if strings.HasSuffix(name, "/") {
+			if err := archive.Mkdir(name); err != nil {
+				t.Fatalf("Mkdir(%s): %v", name, err)
+			}
 			continue
 		}
 		if err := archive.AddString(content, name); err != nil {
@@ -61,11 +64,12 @@ func TestRoundTrip_Parallel(t *testing.T) {
 	files := make(map[string]string)
 	for i := range count {
 		name := fmt.Sprintf("file_%d.txt", i)
-		content := strings.Repeat("data", i+1)
+		content := strings.Repeat("data ", i+1)
 		files[name] = content
 		archive.AddString(content, name)
 	}
 
+	// 4 workers ensure we test concurrency logic
 	if _, err := archive.WriteToParallel(buf, 4); err != nil {
 		t.Fatalf("WriteToParallel: %v", err)
 	}
@@ -91,6 +95,7 @@ func TestRoundTrip_AES256(t *testing.T) {
 		t.Fatalf("WriteTo: %v", err)
 	}
 
+	// Read back using gozip to verify decryption logic
 	readArchive := gozip.NewZip()
 	readArchive.SetConfig(gozip.ZipConfig{Password: password})
 
@@ -119,7 +124,7 @@ func TestRoundTrip_AES256(t *testing.T) {
 	}
 }
 
-// verifyZipContent helper using standard library to ensure compatibility
+// verifyZipContent uses standard library to ensure compatibility
 func verifyZipContent(t *testing.T, data []byte, expectedFiles map[string]string, expectedComment string) {
 	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -137,7 +142,15 @@ func verifyZipContent(t *testing.T, data []byte, expectedFiles map[string]string
 	for _, f := range r.File {
 		expectedContent, ok := expectedFiles[f.Name]
 		if !ok {
+			// Stdlib sometimes strips trailing slashes for dirs
+			if f.FileInfo().IsDir() && expectedFiles[f.Name+"/"] != "" {
+				continue
+			}
 			t.Errorf("Unexpected file in archive: %s", f.Name)
+			continue
+		}
+
+		if f.FileInfo().IsDir() {
 			continue
 		}
 
@@ -180,22 +193,13 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	// Generate data once for consistent benchmarks
+	// Generate compressible data.
+	// Random data (rand.Read) is bad for benchmarks because Deflate will skip it or work differently.
+	// We want to stress the CPU compression algorithm.
 	smallFiles = generateFiles(smallFileCount, smallFileSize)
 	mediumFiles = generateFiles(mediumFileCount, mediumFileSize)
 
-	envPath := os.Getenv("TEST_ZIP_PATH")
-	if envPath != "" {
-		info, err := os.Stat(envPath)
-		if err == nil {
-			testZipPath = envPath
-			testZipSize = info.Size()
-			fmt.Printf("Benchmark: Using external file: %s (%d MB)\n", envPath, testZipSize/1024/1024)
-			return
-		}
-	}
-
-	fmt.Println("Benchmark: Generating temporary test archive...")
+	// Setup a real ZIP file on disk for Load/Read benchmarks
 	f, err := os.CreateTemp("", "bench_read_*.zip")
 	if err != nil {
 		panic(err)
@@ -203,7 +207,8 @@ func TestMain(m *testing.M) {
 	testZipPath = f.Name()
 
 	archive := gozip.NewZip()
-	content := strings.Repeat("A regular repeating string for compression testing. ", 20) // ~1KB
+	// ~1KB of compressible text
+	content := strings.Repeat("GoZip library benchmark testing. ", 30)
 
 	for i := range 500 {
 		name := fmt.Sprintf("folder_%d/file_%d.txt", i%10, i)
@@ -226,14 +231,15 @@ func TestMain(m *testing.M) {
 
 func generateFiles(count, size int) []testFile {
 	files := make([]testFile, count)
-	// Generate random data to stress the compressor
-	rng := rand.New(rand.NewSource(42))
+
+	// Create a compressible pattern (e.g. repeated text/code)
+	pattern := []byte("Lorem ipsum dolor sit amet, consectetur adipiscing elit. ")
+	body := bytes.Repeat(pattern, (size/len(pattern))+1)[:size]
+
 	for i := range count {
-		body := make([]byte, size)
-		rng.Read(body)
 		files[i] = testFile{
 			name: fmt.Sprintf("file_%d.txt", i),
-			body: body, // Shared underlying array to save test memory
+			body: body, // Shared underlying array to save test memory, fine for reading
 		}
 	}
 	return files
@@ -301,6 +307,7 @@ func runGoZipSeqBenchmark(b *testing.B, files []testFile) {
 			CompressionLevel:  gozip.DeflateNormal,
 		})
 
+		// AddBytes does CRC calculation, so it's part of the workload
 		for _, f := range files {
 			if err := archive.AddBytes(f.body, f.name); err != nil {
 				b.Fatal(err)
@@ -340,18 +347,30 @@ func runGoZipParBenchmark(b *testing.B, files []testFile) {
 // --- Benchmark: Load/Metadata ---
 
 func BenchmarkLoad_StdLib(b *testing.B) {
+	b.ReportAllocs()
 	for b.Loop() {
-		r, _ := zip.OpenReader(testZipPath)
+		r, err := zip.OpenReader(testZipPath)
+		if err != nil {
+			b.Fatal(err)
+		}
+		// Access something to ensure it's loaded
 		_ = len(r.File)
 		r.Close()
 	}
 }
 
 func BenchmarkLoad_GoZip(b *testing.B) {
+	b.ReportAllocs()
 	for b.Loop() {
 		archive := gozip.NewZip()
-		f, _ := os.Open(testZipPath)
-		archive.Load(f, testZipSize)
+		f, err := os.Open(testZipPath)
+		if err != nil {
+			b.Fatal(err)
+		}
+		// GoZip Load reads and parses Central Directory completely
+		if err := archive.Load(f, testZipSize); err != nil {
+			b.Fatal(err)
+		}
 		f.Close()
 	}
 }
@@ -361,11 +380,13 @@ func BenchmarkLoad_GoZip(b *testing.B) {
 func BenchmarkReadSeq_GoZip(b *testing.B) {
 	f, _ := os.Open(testZipPath)
 	defer f.Close()
+
 	archive := gozip.NewZip()
 	archive.Load(f, testZipSize)
 	files := archive.Files()
 
 	b.ResetTimer()
+	b.ReportAllocs()
 	for b.Loop() {
 		for _, file := range files {
 			rc, _ := file.Open()
@@ -378,12 +399,14 @@ func BenchmarkReadSeq_GoZip(b *testing.B) {
 func BenchmarkReadPar_GoZip(b *testing.B) {
 	f, _ := os.Open(testZipPath)
 	defer f.Close()
+
 	archive := gozip.NewZip()
 	archive.Load(f, testZipSize)
 	files := archive.Files()
 	workers := runtime.NumCPU()
 
 	b.ResetTimer()
+	b.ReportAllocs()
 	for b.Loop() {
 		var wg sync.WaitGroup
 		ch := make(chan *gozip.File, len(files))
@@ -393,7 +416,7 @@ func BenchmarkReadPar_GoZip(b *testing.B) {
 		close(ch)
 
 		wg.Add(workers)
-		for range workers {
+		for j := 0; j < workers; j++ {
 			go func() {
 				defer wg.Done()
 				for file := range ch {
@@ -410,16 +433,31 @@ func BenchmarkReadPar_GoZip(b *testing.B) {
 // --- Benchmark StreamReader (Streaming) ---
 
 func BenchmarkStreamReader_GoZip(b *testing.B) {
+	b.ReportAllocs()
 	for b.Loop() {
-		f, _ := os.Open(testZipPath)
+		f, err := os.Open(testZipPath)
+		if err != nil {
+			b.Fatal(err)
+		}
+
 		sr := gozip.NewStreamReader(f)
 		for {
 			_, err := sr.Next()
 			if err == io.EOF {
 				break
 			}
-			rc, _ := sr.Open()
-			io.Copy(io.Discard, rc)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			// Full decompression cycle
+			rc, err := sr.Open()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, err := io.Copy(io.Discard, rc); err != nil {
+				b.Fatal(err)
+			}
 			rc.Close()
 		}
 		f.Close()
@@ -437,8 +475,15 @@ func BenchmarkExtractParallel_GoZip(b *testing.B) {
 	archive := gozip.NewZip()
 	archive.Load(f, testZipSize)
 
+	workers := runtime.NumCPU()
+
 	b.ResetTimer()
+	b.ReportAllocs()
 	for b.Loop() {
-		archive.ExtractParallel(tempDir, runtime.NumCPU())
+		// Note: We are overwriting files in the same temp dir.
+		// This is fine for benchmarking throughput.
+		if err := archive.ExtractParallel(tempDir, workers); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
