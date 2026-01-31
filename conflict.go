@@ -10,7 +10,7 @@ const (
 	// ActionSkip ignores the new entry, keeping the existing one.
 	ActionSkip
 
-	// ActionError reports ErrDuplicateEntry and skips the new entry.
+	// ActionError reports [ErrDuplicateEntry] and skips the new entry.
 	ActionError
 
 	// ActionRename adds the new entry under a different name provided by the resolver.
@@ -19,7 +19,7 @@ const (
 
 // ConflictHandler determines how to handle name collisions.
 // It receives the existing file (already in archive) and the new file (being loaded).
-// It returns the action to take and an optional new name (used only with ActionRename).
+// It returns the action to take and an optional new name (used only with [ActionRename]).
 type ConflictHandler func(existing, new *File) (ConflictAction, string)
 
 // DefaultConflictHandler replaces existing files (Last Write Wins).

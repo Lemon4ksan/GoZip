@@ -19,7 +19,7 @@ func GetFileMetadata(stat os.FileInfo) map[string]interface{} {
 
 	return map[string]interface{}{
 		"LastAccessTime": unixNanoToWinFiletime(int64(s.Atim.Sec), int64(s.Atim.Nsec)),
-		"LastWriteTime": unixNanoToWinFiletime(int64(s.Mtim.Sec), int64(s.Mtim.Nsec)),
+		"LastWriteTime":  unixNanoToWinFiletime(int64(s.Mtim.Sec), int64(s.Mtim.Nsec)),
 		// Linux syscall.Stat_t typically does not expose "BirthTime" (Creation Time).
 		// Note: s.Ctim is "Change Time" (metadata change), NOT creation time.
 	}
