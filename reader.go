@@ -535,21 +535,40 @@ type StreamReader struct {
 	skipCRC bool
 }
 
+// StreamOption applies the option to StreamReader.
+type StreamOption func(s *StreamReader)
+
+// StreamWithPassword sets the stream password.
+func StreamWithPassword(pwd string) StreamOption {
+	return func(s *StreamReader) {
+		s.password = pwd
+	}
+}
+
+// StreamWithDecoder sets the stream [TextDecoder].
+func StreamWithDecoder(d TextDecoder) StreamOption {
+	return func(s *StreamReader) {
+		s.textDecoder = d
+	}
+}
+
 // NewStreamReader returns a new StreamReader reading from source.
-func NewStreamReader(src io.Reader) *StreamReader {
-	return &StreamReader{
+func NewStreamReader(src io.Reader, options ...StreamOption) *StreamReader {
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+
+	r := &StreamReader{
 		readerBase: newReaderBase(nil, ZipConfig{}),
 		src:        src,
 		br:         bufio.NewReaderSize(src, 32*1024),
 	}
-}
-
-// NewStreamReader returns a new StreamReader reading from source with given password.
-func NewStreamReaderWithPassword(src io.Reader, pwd string) *StreamReader {
-	return &StreamReader{
-		readerBase: newReaderBase(nil, ZipConfig{Password: pwd}),
-		br:         bufio.NewReaderSize(src, 32*1024),
+	for _, opt := range options {
+		opt(r)
 	}
+	for k, v := range globalDecompressors {
+		r.decompressors[k] = v
+	}
+	return r
 }
 
 // RegisterDecompressor adds support for reading a custom compression method.

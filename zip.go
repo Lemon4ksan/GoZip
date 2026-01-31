@@ -135,6 +135,27 @@ import (
 	"time"
 )
 
+// Global codecs registry
+var (
+	globalFactories     = make(map[CompressionMethod]CompressorFactory)
+	globalDecompressors = make(map[CompressionMethod]Decompressor)
+	globalMu            sync.RWMutex
+)
+
+// RegisterCompressor registers a compressor at the global level.
+func RegisterCompressor(method CompressionMethod, factory CompressorFactory) {
+	globalMu.Lock()
+	defer globalMu.Unlock()
+	globalFactories[method] = factory
+}
+
+// RegisterDecompressor registers a decompressor at the global level.
+func RegisterDecompressor(method CompressionMethod, d Decompressor) {
+	globalMu.Lock()
+	defer globalMu.Unlock()
+	globalDecompressors[method] = d
+}
+
 // SizeUnknown is a sentinel value used when the data size
 // cannot be determined before writing (e.g., streaming from [io.Reader]).
 const SizeUnknown int64 = -1
@@ -354,6 +375,47 @@ func WithoutDir(dirPath string) Filter {
 	}
 }
 
+// DefaultStoreExtensions is an extended list of formats that are
+// already compressed and do not require reprocessing.
+var DefaultStoreExtensions = map[string]struct{}{
+	"7z": {}, "aar": {}, "ace": {}, "apk": {}, "arc": {}, "arj": {},
+	"br": {}, "bz2": {}, "cab": {}, "deb": {}, "dmg": {}, "epub": {},
+	"gz": {}, "jar": {}, "lz4": {}, "lzma": {}, "lzo": {}, "rar": {},
+	"rpm": {}, "tar": {}, "tgz": {}, "war": {}, "xz": {}, "zip": {},
+	"zst": {},
+	// Media Files
+	"mp4": {}, "mkv": {}, "avi": {}, "mov": {}, "webm": {},
+	"jpg": {}, "jpeg": {}, "png": {}, "gif": {}, "webp": {},
+	"mp3": {}, "ogg": {}, "flac": {},
+	// Documents
+	"pdf": {}, "docx": {}, "xlsx": {}, "pptx": {},
+}
+
+// WithSmartStore disables compression for files whose extensions are in the list.
+// Passed extensions are merged with [DefaultStoreExtensions].
+// This filter changes the state of [File] objects in the archive.
+func WithSmartStore(exts ...string) Filter {
+	extMap := make(map[string]struct{}, len(DefaultStoreExtensions)+len(exts))
+	for k := range DefaultStoreExtensions {
+		extMap[k] = struct{}{}
+	}
+	for _, ext := range exts {
+		extMap[strings.ToLower(strings.TrimPrefix(ext, "."))] = struct{}{}
+	}
+	return func(files []*File) []*File {
+		for _, f := range files {
+			if f.isDir {
+				continue
+			}
+			ext := strings.ToLower(strings.TrimPrefix(path.Ext(f.name), "."))
+			if _, ok := extMap[ext]; ok {
+				f.SetCompression(Store, 0)
+			}
+		}
+		return files
+	}
+}
+
 // CompressorFactory creates a [Compressor] instance for a specific compression level.
 // The level parameter is typically 0-9, but interpretations vary by algorithm.
 // Implementations should normalize invalid levels to defaults.
@@ -402,7 +464,10 @@ type Zip struct {
 // NewZip creates a ready-to-use empty ZIP archive.
 // Default support includes [Store] (No Compression) and [Deflate].
 func NewZip() *Zip {
-	return &Zip{
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+
+	z := &Zip{
 		files:         make([]*File, 0),
 		lookup:        make(map[string]*File),
 		factories:     make(factoriesMap),
@@ -414,6 +479,13 @@ func NewZip() *Zip {
 			},
 		},
 	}
+	for k, v := range globalFactories {
+		z.factories[k] = v
+	}
+	for k, v := range globalDecompressors {
+		z.decompressors[k] = v
+	}
+	return z
 }
 
 // Config returns current global zip configuration.
