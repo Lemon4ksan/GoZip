@@ -12,7 +12,6 @@ import (
 	"hash/crc32"
 	"io"
 	"io/fs"
-	"math"
 	"testing"
 
 	"github.com/lemon4ksan/gozip/internal"
@@ -128,9 +127,9 @@ func TestFindEOCD_BufferBoundary(t *testing.T) {
 
 func TestNewFileFromCentralDir_Zip64(t *testing.T) {
 	cd := internal.CentralDirectory{
-		UncompressedSize:  math.MaxUint32,
-		CompressedSize:    math.MaxUint32,
-		LocalHeaderOffset: math.MaxUint32,
+		UncompressedSize:  StandardSizeLimit,
+		CompressedSize:    StandardSizeLimit,
+		LocalHeaderOffset: StandardSizeLimit,
 		Filename:          "large_file.dat",
 		ExtraField:        make([]byte, 0),
 	}
@@ -204,7 +203,7 @@ func TestParseFileExternalAttributes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := parseFileExternalAttributes(tt.entry)
+			got := internal.ParseFileMode(tt.entry)
 			if got != tt.wantMode {
 				t.Errorf("parseFileExternalAttributes() = %v, want %v", got, tt.wantMode)
 			}

@@ -8,7 +8,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math"
+	"io/fs"
+	"strings"
+
+	"github.com/lemon4ksan/gozip/internal/sys"
 )
 
 // Each record type must be identified using a header signature that identifies the record type.
@@ -24,6 +27,17 @@ const (
 	DataDescriptorSignature   uint32 = 0x08074b50
 )
 
+const (
+	MaxUint16 = 1<<16 - 1
+	MaxUint32 = 1<<32 - 1
+)
+
+const (
+	Zip64ExtraFieldTag uint16 = 0x0001
+	NTFSFieldTag       uint16 = 0x000A
+	AESEncryptionTag   uint16 = 0x9901
+)
+
 type LocalFileHeader struct {
 	VersionNeededToExtract uint16
 	GeneralPurposeBitFlag  uint16
@@ -37,28 +51,6 @@ type LocalFileHeader struct {
 	ExtraFieldLength       uint16
 	Filename               string
 	ExtraField             []byte
-}
-
-func (h LocalFileHeader) Encode() []byte {
-	size := 30 + h.FilenameLength + h.ExtraFieldLength
-	buf := make([]byte, size)
-
-	binary.LittleEndian.PutUint32(buf[0:4], LocalFileHeaderSignature)
-	binary.LittleEndian.PutUint16(buf[4:6], h.VersionNeededToExtract)
-	binary.LittleEndian.PutUint16(buf[6:8], h.GeneralPurposeBitFlag)
-	binary.LittleEndian.PutUint16(buf[8:10], h.CompressionMethod)
-	binary.LittleEndian.PutUint16(buf[10:12], h.LastModFileTime)
-	binary.LittleEndian.PutUint16(buf[12:14], h.LastModFileDate)
-	binary.LittleEndian.PutUint32(buf[14:18], h.CRC32)
-	binary.LittleEndian.PutUint32(buf[18:22], h.CompressedSize)
-	binary.LittleEndian.PutUint32(buf[22:26], h.UncompressedSize)
-	binary.LittleEndian.PutUint16(buf[26:28], h.FilenameLength)
-	binary.LittleEndian.PutUint16(buf[28:30], h.ExtraFieldLength)
-
-	copy(buf[30:], h.Filename)
-	copy(buf[30+h.FilenameLength:], h.ExtraField)
-
-	return buf
 }
 
 func ReadLocalFileHeader(src io.Reader) (LocalFileHeader, error) {
@@ -96,6 +88,28 @@ func ReadLocalFileHeader(src io.Reader) (LocalFileHeader, error) {
 	}
 
 	return entry, nil
+}
+
+func (h LocalFileHeader) Encode() []byte {
+	size := 30 + h.FilenameLength + h.ExtraFieldLength
+	buf := make([]byte, size)
+
+	binary.LittleEndian.PutUint32(buf[0:4], LocalFileHeaderSignature)
+	binary.LittleEndian.PutUint16(buf[4:6], h.VersionNeededToExtract)
+	binary.LittleEndian.PutUint16(buf[6:8], h.GeneralPurposeBitFlag)
+	binary.LittleEndian.PutUint16(buf[8:10], h.CompressionMethod)
+	binary.LittleEndian.PutUint16(buf[10:12], h.LastModFileTime)
+	binary.LittleEndian.PutUint16(buf[12:14], h.LastModFileDate)
+	binary.LittleEndian.PutUint32(buf[14:18], h.CRC32)
+	binary.LittleEndian.PutUint32(buf[18:22], h.CompressedSize)
+	binary.LittleEndian.PutUint32(buf[22:26], h.UncompressedSize)
+	binary.LittleEndian.PutUint16(buf[26:28], h.FilenameLength)
+	binary.LittleEndian.PutUint16(buf[28:30], h.ExtraFieldLength)
+
+	copy(buf[30:], h.Filename)
+	copy(buf[30+h.FilenameLength:], h.ExtraField)
+
+	return buf
 }
 
 type CentralDirectory struct {
@@ -213,25 +227,7 @@ type EOCD struct {
 	Comment                         string
 }
 
-func EncodeEOCD(entriesNum int, centralDirSize uint64, centralDirOffset uint64, comment string) []byte {
-	commentLen := min(len(comment), math.MaxUint16)
-	buf := make([]byte, 22+commentLen)
-
-	binary.LittleEndian.PutUint32(buf[0:4], EOCDSignature)
-	binary.LittleEndian.PutUint16(buf[4:6], 0)
-	binary.LittleEndian.PutUint16(buf[6:8], 0)
-	binary.LittleEndian.PutUint16(buf[8:10], uint16(min(math.MaxUint16, entriesNum)))
-	binary.LittleEndian.PutUint16(buf[10:12], uint16(min(math.MaxUint16, entriesNum)))
-	binary.LittleEndian.PutUint32(buf[12:16], uint32(min(math.MaxUint32, centralDirSize)))
-	binary.LittleEndian.PutUint32(buf[16:20], uint32(min(math.MaxUint32, centralDirOffset)))
-	binary.LittleEndian.PutUint16(buf[20:22], uint16(commentLen))
-
-	copy(buf[22:], comment[:commentLen])
-
-	return buf
-}
-
-func ReadEndOfCentralDir(src io.Reader) (EOCD, error) {
+func ReadEOCD(src io.Reader) (EOCD, error) {
 	var buf [18]byte
 	if _, err := io.ReadFull(src, buf[:]); err != nil {
 		return EOCD{}, fmt.Errorf("read source: %w", err)
@@ -254,6 +250,24 @@ func ReadEndOfCentralDir(src io.Reader) (EOCD, error) {
 	}
 
 	return end, nil
+}
+
+func EncodeEOCD(entriesNum int, centralDirSize int64, centralDirOffset int64, comment string) []byte {
+	commentLen := min(len(comment), MaxUint16)
+	buf := make([]byte, 22+commentLen)
+
+	binary.LittleEndian.PutUint32(buf[0:4], EOCDSignature)
+	binary.LittleEndian.PutUint16(buf[4:6], 0)
+	binary.LittleEndian.PutUint16(buf[6:8], 0)
+	binary.LittleEndian.PutUint16(buf[8:10], uint16(min(MaxUint16, entriesNum)))
+	binary.LittleEndian.PutUint16(buf[10:12], uint16(min(MaxUint32, entriesNum)))
+	binary.LittleEndian.PutUint32(buf[12:16], uint32(min(MaxUint32, centralDirSize)))
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(min(MaxUint32, centralDirOffset)))
+	binary.LittleEndian.PutUint16(buf[20:22], uint16(commentLen))
+
+	copy(buf[22:], comment[:commentLen])
+
+	return buf
 }
 
 type Zip64EOCD struct {
@@ -286,21 +300,19 @@ func ReadZip64EOCD(src io.Reader) (Zip64EOCD, error) {
 	}, nil
 }
 
-func EncodeZip64EOCDRecord(entriesNum uint64, centralDirSize uint64, centralDirOffset uint64) []byte {
-	buf := make([]byte, 56)
-
+func EncodeZip64EOCDRecord(entriesNum int, centralDirSize int64, centralDirOffset int64) []byte {
+	var buf [56]byte
 	binary.LittleEndian.PutUint32(buf[0:4], Zip64EOCDSignature)
 	binary.LittleEndian.PutUint64(buf[4:12], 44)
 	binary.LittleEndian.PutUint16(buf[12:14], 45)
 	binary.LittleEndian.PutUint16(buf[14:16], 45)
 	binary.LittleEndian.PutUint32(buf[16:20], 0)
 	binary.LittleEndian.PutUint32(buf[20:24], 0)
-	binary.LittleEndian.PutUint64(buf[24:32], entriesNum)
-	binary.LittleEndian.PutUint64(buf[32:40], entriesNum)
-	binary.LittleEndian.PutUint64(buf[40:48], centralDirSize)
-	binary.LittleEndian.PutUint64(buf[48:56], centralDirOffset)
-
-	return buf
+	binary.LittleEndian.PutUint64(buf[24:32], uint64(entriesNum))
+	binary.LittleEndian.PutUint64(buf[32:40], uint64(entriesNum))
+	binary.LittleEndian.PutUint64(buf[40:48], uint64(centralDirSize))
+	binary.LittleEndian.PutUint64(buf[48:56], uint64(centralDirOffset))
+	return buf[:]
 }
 
 type Zip64EOCDLocator struct {
@@ -321,15 +333,13 @@ func ReadZip64EOCDLocator(src io.Reader) (Zip64EOCDLocator, error) {
 	}, nil
 }
 
-func EncodeZip64EOCDLocator(endOfCentralDirOffset uint64) []byte {
-	buf := make([]byte, 20)
-
+func EncodeZip64EOCDLocator(eocdOffset int64) []byte {
+	var buf [20]byte
 	binary.LittleEndian.PutUint32(buf[0:4], Zip64EOCDLocatorSignature)
 	binary.LittleEndian.PutUint32(buf[4:8], 0)
-	binary.LittleEndian.PutUint64(buf[8:16], endOfCentralDirOffset)
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(eocdOffset))
 	binary.LittleEndian.PutUint32(buf[16:20], 1)
-
-	return buf
+	return buf[:]
 }
 
 type SharedEntry struct {
@@ -381,4 +391,171 @@ func SharedEntryFromCD(entry CentralDirectory) SharedEntry {
 		Filename:               entry.Filename,
 		ExtraField:             entry.ExtraField,
 	}
+}
+
+func ParseExtraField(extraField []byte) map[uint16][]byte {
+	m := make(map[uint16][]byte)
+
+	for offset := 0; offset < len(extraField); {
+		if offset+4 > len(extraField) {
+			break
+		}
+
+		tag := binary.LittleEndian.Uint16(extraField[offset : offset+2])
+		size := int(binary.LittleEndian.Uint16(extraField[offset+2 : offset+4]))
+
+		offset += 4
+		if offset+size > len(extraField) {
+			break
+		}
+
+		m[tag] = extraField[offset-4 : offset+size]
+		offset += size
+	}
+	return m
+}
+
+func EncodeZip64ExtraField(uncompSize, compSize, headerOffset int64) []byte {
+	data := make([]byte, 4, 28)
+
+	binary.LittleEndian.PutUint16(data[0:2], Zip64ExtraFieldTag)
+
+	if uncompSize > MaxUint32 {
+		data = binary.LittleEndian.AppendUint64(data, uint64(uncompSize))
+	}
+	if compSize > MaxUint32 {
+		data = binary.LittleEndian.AppendUint64(data, uint64(compSize))
+	}
+	if headerOffset > MaxUint32 {
+		data = binary.LittleEndian.AppendUint64(data, uint64(headerOffset))
+	}
+
+	binary.LittleEndian.PutUint16(data[2:4], uint16(len(data)-4))
+	return data
+}
+
+func EncodeZip64LocalExtraField(uncompSize, compSize int64) []byte {
+	var data [20]byte
+	binary.LittleEndian.PutUint16(data[0:2], Zip64ExtraFieldTag)
+	binary.LittleEndian.PutUint16(data[2:4], 16) // Size of payload
+	binary.LittleEndian.PutUint64(data[4:12], uint64(uncompSize))
+	binary.LittleEndian.PutUint64(data[12:20], uint64(compSize))
+	return data[:]
+}
+
+func ParseNTFSExtraField(data []byte) map[string]interface{} {
+	return map[string]interface{}{
+		"LastWriteTime":  binary.LittleEndian.Uint64(data[12:20]),
+		"LastAccessTime": binary.LittleEndian.Uint64(data[12:20]),
+		"CreationTime":   binary.LittleEndian.Uint64(data[28:36]),
+	}
+}
+
+func EncodeNTFSExtraField(metadata map[string]interface{}) []byte {
+	var mtime, atime, ctime uint64
+	if val, ok := metadata["LastWriteTime"]; ok {
+		if t, ok := val.(uint64); ok {
+			mtime = t
+		}
+	}
+	if val, ok := metadata["LastAccessTime"]; ok {
+		if t, ok := val.(uint64); ok {
+			atime = t
+		}
+	}
+	if val, ok := metadata["CreationTime"]; ok {
+		if t, ok := val.(uint64); ok {
+			ctime = t
+		}
+	}
+
+	// Tag(2) + Size(2) + Reserved(4) + Attr1(2) + Size1(2) + Mtime(8) + Atime(8) + Ctime(8)
+	var data [36]byte
+	binary.LittleEndian.PutUint16(data[0:2], NTFSFieldTag)
+	binary.LittleEndian.PutUint16(data[2:4], 32)
+	binary.LittleEndian.PutUint32(data[4:8], 0)
+	binary.LittleEndian.PutUint16(data[8:10], 1)
+	binary.LittleEndian.PutUint16(data[10:12], 24)
+	binary.LittleEndian.PutUint64(data[12:20], mtime)
+	binary.LittleEndian.PutUint64(data[20:28], atime)
+	binary.LittleEndian.PutUint64(data[28:36], ctime)
+	return data[:]
+}
+
+func ParseFileMode(entry CentralDirectory) fs.FileMode {
+	var mode fs.FileMode
+	hostSystem := sys.HostSystem(entry.VersionMadeBy >> 8)
+
+	if hostSystem.IsUnix() {
+		unixMode := uint32(entry.ExternalFileAttributes >> 16)
+		mode = fs.FileMode(unixMode & 0777)
+
+		switch unixMode & sys.S_IFMT {
+		case sys.S_IFDIR:
+			mode |= fs.ModeDir
+		case sys.S_IFLNK:
+			mode |= fs.ModeSymlink
+		case sys.S_IFSOCK:
+			mode |= fs.ModeSocket
+		case sys.S_IFIFO:
+			mode |= fs.ModeNamedPipe
+		case sys.S_IFCHR:
+			mode |= fs.ModeCharDevice
+		case sys.S_IFBLK:
+			mode |= fs.ModeDevice
+		}
+		return mode
+	}
+
+	if hostSystem.IsWindows() {
+		isDir := strings.HasSuffix(entry.Filename, "/") || (entry.ExternalFileAttributes&0x10 != 0)
+
+		if isDir {
+			mode = 0755 | fs.ModeDir
+		} else {
+			mode = 0644
+		}
+
+		if entry.ExternalFileAttributes&0x01 != 0 {
+			mode &^= 0222 // Remove write permission (a-w)
+		}
+		return mode
+	}
+
+	if strings.HasSuffix(entry.Filename, "/") {
+		return 0755 | fs.ModeDir
+	}
+	return 0644
+}
+
+func EncodeDataDescriptor(crc uint32, compSize, uncompSize int64) []byte {
+	if compSize > MaxUint32 || uncompSize > MaxUint32 {
+		// ZIP64 Data Descriptor: Sig(4) + CRC(4) + Comp(8) + Uncomp(8)
+		var buf [24]byte
+		binary.LittleEndian.PutUint32(buf[0:4], DataDescriptorSignature)
+		binary.LittleEndian.PutUint32(buf[4:8], crc)
+		binary.LittleEndian.PutUint64(buf[8:16], uint64(compSize))
+		binary.LittleEndian.PutUint64(buf[16:24], uint64(uncompSize))
+		return buf[:]
+	}
+
+	// Standard Data Descriptor: Sig(4) + CRC(4) + Comp(4) + Uncomp(4)
+	var buf [16]byte
+	binary.LittleEndian.PutUint32(buf[0:4], DataDescriptorSignature)
+	binary.LittleEndian.PutUint32(buf[4:8], crc)
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(compSize))
+	binary.LittleEndian.PutUint32(buf[12:16], uint32(uncompSize))
+	return buf[:]
+}
+
+func EncodeAESExtraField(compMethod uint16) []byte {
+	var data [11]byte
+	binary.LittleEndian.PutUint16(data[0:2], AESEncryptionTag)
+	binary.LittleEndian.PutUint16(data[2:4], 7)
+	binary.LittleEndian.PutUint16(data[4:6], 0x0002) // Version 2
+	data[6] = 'A'
+	data[7] = 'E'
+	data[8] = 0x03 // AES-256
+	binary.LittleEndian.PutUint16(data[9:11], compMethod)
+	return data[:]
 }

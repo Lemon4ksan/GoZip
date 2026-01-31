@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"math"
 	"os"
 	"sync"
 
@@ -21,15 +20,15 @@ import (
 
 // zipWriter handles the low-level writing of ZIP archive structure.
 type zipWriter struct {
-	mu               sync.RWMutex
-	dest             io.Writer      // Target stream (usually a byteCountWriter)
-	config           ZipConfig      // Archive-wide configuration settings
-	factories        factoriesMap   // Registry of compressors factories
-	compressors      compressorsMap // Registry of available compressors
-	entriesNum       int            // Number of files written to the archive
-	sizeOfCentralDir int64          // Cumulative size of central directory entries
-	headerOffset     int64          // Current write position for local file headers
-	centralDir       *spillBuffer   // Buffer for accumulating central directory before final write
+	mu             sync.RWMutex
+	dest           io.Writer      // Target stream (usually a byteCountWriter)
+	config         ZipConfig      // Archive-wide configuration settings
+	factories      factoriesMap   // Registry of compressors factories
+	compressors    compressorsMap // Registry of available compressors
+	entriesNum     int            // Number of files written to the archive
+	centralDirSize int64          // Cumulative size of central directory entries
+	headerOffset   int64          // Current write position for local file headers
+	centralDir     *spillBuffer   // Buffer for accumulating central directory before final write
 }
 
 // newZipWriter creates and initializes a new zipWriter instance.
@@ -107,25 +106,19 @@ func (zw *zipWriter) flushCentralDirectory() error {
 
 // requiresZip64 returns true if variables exceed their standard limit.
 func (zw *zipWriter) requiresZip64() bool {
-	return zw.sizeOfCentralDir > math.MaxUint32 ||
-		zw.headerOffset > math.MaxUint32 ||
-		zw.entriesNum > math.MaxUint16
+	return zw.centralDirSize > StandardSizeLimit ||
+		zw.headerOffset > StandardSizeLimit ||
+		zw.entriesNum > StandardEntriesLimit
 }
 
 // writeZip64EndRecords writes the ZIP64 EOCD Record and Locator.
 func (zw *zipWriter) writeZip64EndRecords() error {
-	zip64EOCD := internal.EncodeZip64EOCDRecord(
-		uint64(zw.entriesNum),
-		uint64(zw.sizeOfCentralDir),
-		uint64(zw.headerOffset),
-	)
+	zip64EOCD := internal.EncodeZip64EOCDRecord(zw.entriesNum, zw.centralDirSize, zw.headerOffset)
 	if _, err := zw.dest.Write(zip64EOCD); err != nil {
 		return fmt.Errorf("write zip64 end of central directory: %w", err)
 	}
 
-	zip64EOCDLocator := internal.EncodeZip64EOCDLocator(
-		uint64(zw.headerOffset + zw.sizeOfCentralDir),
-	)
+	zip64EOCDLocator := internal.EncodeZip64EOCDLocator(zw.headerOffset + zw.centralDirSize)
 	if _, err := zw.dest.Write(zip64EOCDLocator); err != nil {
 		return fmt.Errorf("write zip64 end of central directory locator: %w", err)
 	}
@@ -137,8 +130,8 @@ func (zw *zipWriter) writeZip64EndRecords() error {
 func (zw *zipWriter) writeEOCD() error {
 	eocd := internal.EncodeEOCD(
 		zw.entriesNum,
-		uint64(zw.sizeOfCentralDir),
-		uint64(zw.headerOffset),
+		zw.centralDirSize,
+		zw.headerOffset,
 		zw.config.Comment,
 	)
 	if _, err := zw.dest.Write(eocd); err != nil {
@@ -157,6 +150,10 @@ func (zw *zipWriter) writeStream(f *File) error {
 		f.flags |= 0x08 // Set Bit 3
 	}
 
+	if f.config.CompressionMethod == Store {
+		f.compressedSize = f.uncompressedSize
+	}
+
 	if err := zw.writeFileHeader(f); err != nil {
 		return err
 	}
@@ -167,15 +164,22 @@ func (zw *zipWriter) writeStream(f *File) error {
 	zw.headerOffset += f.compressedSize
 
 	if isSeeker {
-		if f.compressedSize > math.MaxUint32 || f.uncompressedSize > math.MaxUint32 {
-			// This can only happen if compressed size is greater that 4GB
-			// which is unexpected behavior from compressor
+		if f.compressedSize > StandardSizeLimit || f.uncompressedSize > StandardSizeLimit {
+			// This can only happen if compressed size is greater than
+			// uncompressed size, which is unexpected from compressor
 			return errors.New("file too large for stream mode (zip64 field required but data already written)")
 		}
 		return zw.updateLocalHeader(f)
 	}
 
-	return zw.writeDataDescriptor(f)
+	dd := internal.EncodeDataDescriptor(f.crc32, f.compressedSize, f.uncompressedSize)
+	if n, err := zw.dest.Write(dd); err != nil {
+		return fmt.Errorf("write data descriptor: %w", err)
+	} else {
+		zw.headerOffset += int64(n)
+	}
+
+	return nil
 }
 
 // writeTemp compresses/encrypts to a temporary file, then copies to destination.
@@ -202,37 +206,6 @@ func (zw *zipWriter) writeTemp(f *File) error {
 		return fmt.Errorf("copy buffer: %w", err)
 	}
 	zw.headerOffset += f.compressedSize
-
-	return nil
-}
-
-func (zw *zipWriter) writeDataDescriptor(f *File) error {
-	var data []byte
-
-	if f.RequiresZip64() {
-		// ZIP64 Data Descriptor: Sig(4) + CRC(4) + Comp(8) + Uncomp(8)
-		var buf [24]byte
-		binary.LittleEndian.PutUint32(buf[0:4], internal.DataDescriptorSignature)
-		binary.LittleEndian.PutUint32(buf[4:8], f.crc32)
-		binary.LittleEndian.PutUint64(buf[8:16], uint64(f.compressedSize))
-		binary.LittleEndian.PutUint64(buf[16:24], uint64(f.uncompressedSize))
-		data = buf[:]
-	} else {
-		// Standard Data Descriptor: Sig(4) + CRC(4) + Comp(4) + Uncomp(4)
-		var buf [16]byte
-		binary.LittleEndian.PutUint32(buf[0:4], internal.DataDescriptorSignature)
-		binary.LittleEndian.PutUint32(buf[4:8], f.crc32)
-		binary.LittleEndian.PutUint32(buf[8:12], uint32(f.compressedSize))
-		binary.LittleEndian.PutUint32(buf[12:16], uint32(f.uncompressedSize))
-		data = buf[:]
-	}
-
-	if _, err := zw.dest.Write(data); err != nil {
-		return fmt.Errorf("write data descriptor: %w", err)
-	}
-
-	// Track offset for Central Directory (though usually CD offset calculation handles this)
-	zw.headerOffset += int64(len(data))
 
 	return nil
 }
@@ -471,19 +444,19 @@ func (zw *zipWriter) addCentralDirEntry(f *File) error {
 	}
 
 	if f.config.EncryptionMethod == AES256 {
-		f.SetExtraField(AESEncryptionTag, encodeAESExtraField(f))
+		f.SetExtraField(AESEncryptionTag, internal.EncodeAESExtraField(uint16(f.config.CompressionMethod)))
 	}
 	if f.RequiresZip64() {
-		f.SetExtraField(Zip64ExtraFieldTag, encodeZip64ExtraField(f))
+		f.SetExtraField(Zip64ExtraFieldTag, internal.EncodeZip64ExtraField(f.uncompressedSize, f.compressedSize, f.localHeaderOffset))
 	}
-	addFilesystemExtraField(f)
+	addFSExtraField(f)
 
 	cdData := newZipHeaders(f).CentralDirEntry()
 
 	if n, err := zw.centralDir.Write(cdData.Encode()); err != nil {
 		return err
 	} else {
-		zw.sizeOfCentralDir += int64(n)
+		zw.centralDirSize += int64(n)
 		zw.entriesNum++
 	}
 
@@ -913,12 +886,12 @@ func (mb *memoryBuffer) Reset() {
 	mb.pos = 0
 }
 
-func addFilesystemExtraField(f *File) {
+func addFSExtraField(f *File) {
 	if f.metadata == nil {
 		return
 	}
 	if hasPreciseTimestamps(f.metadata) {
-		f.SetExtraField(NTFSFieldTag, encodeNTFSExtraField(f.metadata))
+		f.SetExtraField(NTFSFieldTag, internal.EncodeNTFSExtraField(f.metadata))
 	}
 }
 
@@ -1015,65 +988,4 @@ func (sb *spillBuffer) Close() error {
 	}
 	sb.mem = nil
 	return nil
-}
-
-func encodeZip64ExtraField(f *File) []byte {
-	data := make([]byte, 4, 28)
-	binary.LittleEndian.PutUint16(data[0:2], Zip64ExtraFieldTag)
-
-	if f.uncompressedSize > math.MaxUint32 {
-		data = binary.LittleEndian.AppendUint64(data, uint64(f.uncompressedSize))
-	}
-	if f.compressedSize > math.MaxUint32 {
-		data = binary.LittleEndian.AppendUint64(data, uint64(f.compressedSize))
-	}
-	if f.localHeaderOffset > math.MaxUint32 {
-		data = binary.LittleEndian.AppendUint64(data, uint64(f.localHeaderOffset))
-	}
-
-	binary.LittleEndian.PutUint16(data[2:4], uint16(len(data)-4))
-	return data
-}
-
-func encodeNTFSExtraField(metadata map[string]interface{}) []byte {
-	var mtime, atime, ctime uint64
-	if val, ok := metadata["LastWriteTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			mtime = t
-		}
-	}
-	if val, ok := metadata["LastAccessTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			atime = t
-		}
-	}
-	if val, ok := metadata["CreationTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			ctime = t
-		}
-	}
-
-	// Tag(2) + Size(2) + Reserved(4) + Attr1(2) + Size1(2) + Mtime(8) + Atime(8) + Ctime(8)
-	var data [36]byte
-	binary.LittleEndian.PutUint16(data[0:2], NTFSFieldTag)
-	binary.LittleEndian.PutUint16(data[2:4], 32)
-	binary.LittleEndian.PutUint32(data[4:8], 0)
-	binary.LittleEndian.PutUint16(data[8:10], 1)
-	binary.LittleEndian.PutUint16(data[10:12], 24)
-	binary.LittleEndian.PutUint64(data[12:20], mtime)
-	binary.LittleEndian.PutUint64(data[20:28], atime)
-	binary.LittleEndian.PutUint64(data[28:36], ctime)
-	return data[:]
-}
-
-func encodeAESExtraField(file *File) []byte {
-	var data [11]byte
-	binary.LittleEndian.PutUint16(data[0:2], AESEncryptionTag)
-	binary.LittleEndian.PutUint16(data[2:4], 7)
-	binary.LittleEndian.PutUint16(data[4:6], 0x0002) // Version 2
-	data[6] = 'A'
-	data[7] = 'E'
-	data[8] = 0x03 // AES-256
-	binary.LittleEndian.PutUint16(data[9:11], uint16(file.config.CompressionMethod))
-	return data[:]
 }

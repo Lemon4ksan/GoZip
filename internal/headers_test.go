@@ -212,8 +212,8 @@ func TestCentralDirectory_Encode(t *testing.T) {
 // TestEndOfCentralDir_Encode tests the EOCD record encoding including the comment
 func TestEndOfCentralDir_Encode(t *testing.T) {
 	entries := 5
-	size := uint64(1024)
-	offset := uint64(2048)
+	size := int64(1024)
+	offset := int64(2048)
 	comment := "End of Archive"
 
 	// Action

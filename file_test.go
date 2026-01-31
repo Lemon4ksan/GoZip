@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
-	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -225,14 +224,14 @@ func TestFile_RequiresZip64(t *testing.T) {
 			name: "Large uncompressed size",
 			file: &File{
 				compressedSize:   100,
-				uncompressedSize: math.MaxUint32 + 1,
+				uncompressedSize: StandardSizeLimit + 1,
 			},
 			expected: true,
 		},
 		{
 			name: "Large compressed size",
 			file: &File{
-				compressedSize:   math.MaxUint32 + 1,
+				compressedSize:   StandardSizeLimit + 1,
 				uncompressedSize: 100,
 			},
 			expected: true,
@@ -240,7 +239,7 @@ func TestFile_RequiresZip64(t *testing.T) {
 		{
 			name: "Large offset",
 			file: &File{
-				localHeaderOffset: math.MaxUint32 + 1,
+				localHeaderOffset: StandardSizeLimit + 1,
 			},
 			expected: true,
 		},

@@ -14,8 +14,6 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
-	"io/fs"
-	"math"
 	"path"
 	"strings"
 	"sync"
@@ -120,29 +118,32 @@ func (rb *readerBase) wrapDecompression(src io.Reader, method CompressionMethod)
 func parseZip64(f *File, data []byte, entry internal.SharedEntry) {
 	var pos int
 
-	if entry.UncompressedSize == math.MaxUint32 {
+	if entry.UncompressedSize == StandardSizeLimit {
 		if len(data) >= pos+8 {
 			f.uncompressedSize = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
 			pos += 8
 		}
 	}
-	if entry.CompressedSize == math.MaxUint32 {
+	if entry.CompressedSize == StandardSizeLimit {
 		if len(data) >= pos+8 {
 			f.compressedSize = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
 			pos += 8
 		}
 	}
-	if entry.LocalHeaderOffset == math.MaxUint32 {
+	if entry.LocalHeaderOffset == StandardSizeLimit {
 		if len(data) >= pos+8 {
 			f.localHeaderOffset = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
 		}
 	}
 }
 
-// getFileMethod returns the correct compression and encryption method based on entry fields and extra field data.
-func getFileMethod(f *File, entry internal.SharedEntry) (CompressionMethod, EncryptionMethod) {
-	var encryptionMethod EncryptionMethod
-	compressionMethod := entry.CompressionMethod
+// parseEntryConf sets the correct compression and encryption method based on entry fields and extra field data.
+func parseEntryConf(f *File, entry internal.SharedEntry) {
+	f.config.CompressionMethod = CompressionMethod(entry.CompressionMethod)
+
+	if (entry.GeneralPurposeBitFlag & 0x1) != 0 {
+		f.config.EncryptionMethod = ZipCrypto
+	}
 
 	for offset := 0; offset < len(entry.ExtraField); {
 		if offset+4 > len(entry.ExtraField) {
@@ -164,67 +165,21 @@ func getFileMethod(f *File, entry internal.SharedEntry) (CompressionMethod, Encr
 			f.hasZip64Extra = true
 			parseZip64(f, data, entry)
 
+		case NTFSFieldTag:
+			if len(data) == 36 {
+				f.metadata = internal.ParseNTFSExtraField(data)
+			}
 		case AESEncryptionTag:
 			if len(data) >= 7 {
-				compressionMethod = binary.LittleEndian.Uint16(data[5:7])
-				encryptionMethod = AES256
+				meth := binary.LittleEndian.Uint16(data[5:7])
+				f.config.CompressionMethod = CompressionMethod(meth)
+				f.config.EncryptionMethod = AES256
 			}
 		}
 
 		offset += size
 	}
 
-	if (entry.GeneralPurposeBitFlag&0x1) != 0 && encryptionMethod == NotEncrypted {
-		encryptionMethod = ZipCrypto
-	}
-
-	return CompressionMethod(compressionMethod), encryptionMethod
-}
-
-func parseFileExternalAttributes(entry internal.CentralDirectory) fs.FileMode {
-	var mode fs.FileMode
-	hostSystem := sys.HostSystem(entry.VersionMadeBy >> 8)
-
-	if hostSystem.IsUnix() {
-		unixMode := uint32(entry.ExternalFileAttributes >> 16)
-		mode = fs.FileMode(unixMode & 0777)
-
-		switch unixMode & sys.S_IFMT {
-		case sys.S_IFDIR:
-			mode |= fs.ModeDir
-		case sys.S_IFLNK:
-			mode |= fs.ModeSymlink
-		case sys.S_IFSOCK:
-			mode |= fs.ModeSocket
-		case sys.S_IFIFO:
-			mode |= fs.ModeNamedPipe
-		case sys.S_IFCHR:
-			mode |= fs.ModeCharDevice
-		case sys.S_IFBLK:
-			mode |= fs.ModeDevice
-		}
-		return mode
-	}
-
-	if hostSystem.IsWindows() {
-		isDir := strings.HasSuffix(entry.Filename, "/") || (entry.ExternalFileAttributes&0x10 != 0)
-
-		if isDir {
-			mode = 0755 | fs.ModeDir
-		} else {
-			mode = 0644
-		}
-
-		if entry.ExternalFileAttributes&0x01 != 0 {
-			mode &^= 0222 // Remove write permission (a-w)
-		}
-		return mode
-	}
-
-	if strings.HasSuffix(entry.Filename, "/") {
-		return 0755 | fs.ModeDir
-	}
-	return 0644
 }
 
 // zipReader handles low-level reading of ZIP archive structure.
@@ -252,7 +207,7 @@ func newZipReader(src io.ReaderAt, size int64, dcm decompressorsMap, cfg ZipConf
 func (zr *zipReader) ReadFiles(ctx context.Context, eocd internal.EOCD) ([]*File, error) {
 	offset, entriesNum := uint64(eocd.CentralDirOffset), uint64(eocd.EntriesNum)
 
-	if eocd.CentralDirOffset == math.MaxUint32 || eocd.EntriesNum == math.MaxUint16 {
+	if eocd.CentralDirOffset == StandardSizeLimit || eocd.EntriesNum == StandardEntriesLimit {
 		zip64EOCD, err := zr.findAndReadZip64EOCD(eocd.CommentLength)
 		if err != nil {
 			return nil, err
@@ -327,7 +282,7 @@ func (zr *zipReader) tryReadSignature(readSize int64, readPos int64, buf []byte)
 
 			// Calculate start of the record (skip signature 4 bytes)
 			sr := io.NewSectionReader(zr.src, recordOffset+4, zr.fileSize-(recordOffset+4))
-			eocd, err := internal.ReadEndOfCentralDir(sr)
+			eocd, err := internal.ReadEOCD(sr)
 
 			if err == nil && int64(eocd.CommentLength) == expectedCommentLen {
 				return eocd, true
@@ -419,7 +374,7 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 	f := &File{
 		name:              filename,
 		isDir:             isDir,
-		mode:              parseFileExternalAttributes(entry),
+		mode:              internal.ParseFileMode(entry),
 		uncompressedSize:  int64(entry.UncompressedSize),
 		compressedSize:    int64(entry.CompressedSize),
 		crc32:             entry.CRC32,
@@ -427,16 +382,15 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 		hostSystem:        sys.HostSystem(entry.VersionMadeBy >> 8),
 		modTime:           msDosToTime(entry.LastModFileDate, entry.LastModFileTime),
 		extraFieldRaw:     entry.ExtraField,
+		config: FileConfig{
+			Password: zr.password,
+			Comment:  comment,
+		},
 	}
 
 	shared := internal.SharedEntryFromCD(entry)
-	compressionMethod, encryptionMethod := getFileMethod(f, shared)
-	f.config = FileConfig{
-		CompressionMethod: compressionMethod,
-		EncryptionMethod:  encryptionMethod,
-		Password:          zr.password,
-		Comment:           comment,
-	}
+	parseEntryConf(f, shared)
+
 	f.srcConfig = f.config
 
 	f.openFunc = func() (io.ReadCloser, error) {
@@ -620,14 +574,19 @@ func (sr *StreamReader) SetTextDecoder(td TextDecoder) {
 	sr.textDecoder = td
 }
 
-// IsValidArchive checks the first 4 bytes of the reader for a ZIP signature.
-func IsValidArchive(r io.Reader) (bool, error) {
+// IsZipStream checks if the data stream starts with the ZIP local header signature.
+// This is a necessary condition for [StreamReader] to work, as it cannot
+// scan the file for the central directory.
+func IsZipStream(r io.Reader) (bool, error) {
 	br, ok := r.(*bufio.Reader)
 	if !ok {
 		br = bufio.NewReader(r)
 	}
 	buf, err := br.Peek(4)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
 		return false, err
 	}
 	return binary.LittleEndian.Uint32(buf) == internal.LocalFileHeaderSignature, nil
@@ -642,7 +601,7 @@ func IsValidArchive(r io.Reader) (bool, error) {
 //
 // Behavior with Data Descriptors:
 //   - If the previous file uses a Data Descriptor (bit 3 set) and the compression
-//     method is Store, Next scans the stream for the signature (PK\07\08).
+//     method is Store, Next scans the stream for the signature (PK\07\08) if the exact size is unknown.
 //   - For compressed data, it relies on the decompressor to find the end of the stream.
 //   - The CRC32 checksum is verified only after the stream is fully consumed.
 //
@@ -733,11 +692,15 @@ func (sr *StreamReader) OpenRaw() (io.Reader, error) {
 		return nil, errors.New("no current file")
 	}
 
+	if sr.curFile.config.CompressionMethod == Store {
+		sr.curFile.compressedSize = sr.curFile.uncompressedSize
+	}
+
 	var raw io.Reader
 
-	if sr.curFile.flags&0x8 != 0 { // Data Descriptor
+	if sr.curFile.flags&0x8 != 0 && sr.curFile.compressedSize == 0 {
 		if sr.curFile.config.CompressionMethod == Store {
-			raw = newSignatureReader(sr.br, internal.DataDescriptorSignature)
+			raw = newSignatureReader(sr.br, internal.DataDescriptorSignature) // Unsafe path
 		} else {
 			// The decompressor should automatically detect the end of the compressed block
 			raw = sr.br
@@ -789,15 +752,13 @@ func (sr *StreamReader) newFileFromLocalHeader(entry internal.LocalFileHeader) *
 		crc32:            entry.CRC32,
 		modTime:          msDosToTime(entry.LastModFileDate, entry.LastModFileTime),
 		extraFieldRaw:    entry.ExtraField,
+		config: FileConfig{
+			Password: sr.password,
+		},
 	}
 
 	shared := internal.SharedEntryFromLocal(entry)
-	compressionMethod, encryptionMethod := getFileMethod(f, shared)
-	f.config = FileConfig{
-		CompressionMethod: compressionMethod,
-		EncryptionMethod:  encryptionMethod,
-		Password:          sr.password,
-	}
+	parseEntryConf(f, shared)
 	f.srcConfig = f.config
 
 	return f
