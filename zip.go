@@ -932,17 +932,17 @@ func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, filters ..
 //
 // Performance:
 //   - Scales linearly with CPU cores for compression-heavy tasks (Deflate/AES).
-//   - Uses a "Fan-out / Fan-in" pattern to ensure data is written to dest
-//     in the correct order, preserving deterministic output.
+//   - Uses a "Pipeline of Futures" pattern to ensure data is written to dest
+//     in the correct order, preserving deterministic output and providing
+//     natural backpressure.
 //
 // Memory Usage:
-//   - Workers use a shared buffer pool. Peak memory usage is primarily governed by
-//     the number of in-flight files (maxWorkers * 2) and the MemoryThreshold (default 10MB).
+//   - Workers use a shared buffer pool. Peak memory usage is strictly bounded
+//     by the pipeline capacity (maxWorkers * 2) and the MemoryThreshold (default 10MB).
 //   - Estimated peak RAM: ~ (MaxWorkers * 2 * MemoryThreshold).
-//   - Actual usage is often higher as the Go Garbage Collector does not reclaim
-//     memory from pools immediately.
 //   - Efficiency Note: Processing files in descending order of size ([SortSizeDescending])
-//     significantly reduces memory peaks by reusing large buffers more effectively, but it's usually slower.
+//     helps finish long-running compression tasks early and can stabilize memory
+//     usage, though it may be slightly slower for small archives.
 //   - For memory-constrained environments, reduce maxWorkers or MemoryThreshold.
 //
 // Returns the total bytes written to dest.
@@ -1369,7 +1369,7 @@ func (z *Zip) normalizePath(name string) string {
 
 	// Check whether any changes are needed at all (Zero-alloc check)
 	needsFix := false
-	for i := 0; i < len(name); i++ {
+	for i := range len(name) {
 		char := name[i]
 		if char == '\\' || (char == '/' && i+1 < len(name) && name[i+1] == '/') {
 			needsFix = true

@@ -570,60 +570,75 @@ func newParallelZipWriter(config ZipConfig, factories factoriesMap, dest io.Writ
 
 // zipResult holds the outcome of a compression job
 type zipResult struct {
-	file     *File
-	src      io.Reader // Compressed data stream
-	err      error
-	acquired bool // Indicates if inflightSem slot was acquired
+	index int
+	file  *File
+	src   io.Reader // Compressed data stream
+	err   error
 }
 
 // WriteFiles processes multiple files in parallel and writes them to the ZIP archive.
 // It uses a back pressure mechanism to ensure memory usage remains bounded,
 // even if files are processed out of order or vary significantly in size.
 func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []error {
-	results := make([]chan zipResult, len(files))
-	for i := range results {
-		results[i] = make(chan zipResult, 1)
-	}
-
-	maxInFlight := cap(pzw.sem) * 2
-	inflightSem := make(chan struct{}, maxInFlight)
+	pipeline := make(chan chan zipResult, cap(pzw.sem)*2)
 
 	var wg sync.WaitGroup
 	var errs []error
 
-	go func() {
-		for i, f := range files {
-			pzw.spawnWorker(ctx, f, results[i], inflightSem, &wg)
-		}
-	}()
+	wg.Go(func() {
+		defer close(pipeline)
 
-	var stopWriting bool
-	for _, resultChan := range results {
+		for _, f := range files {
+			resultChan := make(chan zipResult, 1)
+
+			select {
+			case <-ctx.Done():
+				return
+			case pipeline <- resultChan:
+			}
+
+			select {
+			case <-ctx.Done():
+				resultChan <- zipResult{file: f, err: ctx.Err()}
+				close(resultChan)
+				return
+			case pzw.sem <- struct{}{}:
+			}
+
+			wg.Add(1)
+			go func(file *File, ch chan<- zipResult) {
+				defer func() { <-pzw.sem; wg.Done() }()
+
+				src, err := pzw.compressFile(ctx, file)
+
+				ch <- zipResult{file: file, src: src, err: err}
+				close(ch)
+			}(f, resultChan)
+
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	})
+
+	stopWriting := false
+
+	for resultChan := range pipeline {
 		res, ok := <-resultChan
 		if !ok {
+			// unreachable
 			continue
 		}
 
-		if res.acquired {
-			<-inflightSem
+		if ctx.Err() != nil || stopWriting {
+			pzw.cleanupBuf(res.src)
+			continue
 		}
 
 		if res.err != nil {
-			if ctx.Err() == nil {
-				errs = append(errs, res.err)
-			}
-			stopWriting = true
-			continue
-		}
-
-		if stopWriting {
+			errs = append(errs, res.err)
 			pzw.cleanupBuf(res.src)
-			continue
-		}
-
-		if err := ctx.Err(); err != nil {
 			stopWriting = true
-			pzw.cleanupBuf(res.src)
 			continue
 		}
 
@@ -652,45 +667,6 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 	}
 
 	return errs
-}
-
-func (pzw *parallelZipWriter) spawnWorker(
-	ctx context.Context,
-	f *File,
-	resChan chan<- zipResult,
-	inflightSem chan struct{},
-	wg *sync.WaitGroup,
-) {
-	acquired := false
-	select {
-	case <-ctx.Done():
-	case inflightSem <- struct{}{}:
-		acquired = true
-	}
-
-	if err := ctx.Err(); err != nil {
-		resChan <- zipResult{file: f, err: err, acquired: acquired}
-		close(resChan)
-		return
-	}
-
-	wg.Go(func() {
-		select {
-		case <-ctx.Done():
-			resChan <- zipResult{file: f, err: ctx.Err(), acquired: true}
-			close(resChan)
-			return
-		case pzw.sem <- struct{}{}:
-		}
-		defer func() { <-pzw.sem }()
-
-		src, err := pzw.compressFile(ctx, f)
-		if err != nil {
-			err = wrapErr("compress", f, err)
-		}
-		resChan <- zipResult{file: f, src: src, err: err, acquired: true}
-		close(resChan)
-	})
 }
 
 // compressFile compresses a single file to memory or temp file.
