@@ -421,7 +421,7 @@ func TestStreamReader_RoundTrip(t *testing.T) {
 	}
 
 	for name, content := range testFiles {
-		if err := archive.AddString(content, name); err != nil {
+		if _, err := archive.AddString(content, name); err != nil {
 			t.Fatalf("AddString failed: %v", err)
 		}
 	}

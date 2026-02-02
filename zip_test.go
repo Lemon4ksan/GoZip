@@ -39,12 +39,12 @@ func TestRoundTrip_Sequential(t *testing.T) {
 
 	for name, content := range testFiles {
 		if strings.HasSuffix(name, "/") {
-			if err := archive.Mkdir(name); err != nil {
+			if _, err := archive.Mkdir(name); err != nil {
 				t.Fatalf("Mkdir(%s): %v", name, err)
 			}
 			continue
 		}
-		if err := archive.AddString(content, name); err != nil {
+		if _, err := archive.AddString(content, name); err != nil {
 			t.Fatalf("AddString(%s): %v", name, err)
 		}
 	}
@@ -309,7 +309,7 @@ func runGoZipSeqBenchmark(b *testing.B, files []testFile) {
 
 		// AddBytes does CRC calculation, so it's part of the workload
 		for _, f := range files {
-			if err := archive.AddBytes(f.body, f.name); err != nil {
+			if _, err := archive.AddBytes(f.body, f.name); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -333,7 +333,7 @@ func runGoZipParBenchmark(b *testing.B, files []testFile) {
 		})
 
 		for _, f := range files {
-			if err := archive.AddBytes(f.body, f.name); err != nil {
+			if _, err := archive.AddBytes(f.body, f.name); err != nil {
 				b.Fatal(err)
 			}
 		}

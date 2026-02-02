@@ -129,7 +129,7 @@ func newFileFromPath(filePath string) (*File, error) {
 	}
 
 	isSymlink := info.Mode()&fs.ModeSymlink != 0
-	var uncompressedSize int64
+	var size int64
 	var linkTarget string
 
 	if isSymlink {
@@ -137,14 +137,14 @@ func newFileFromPath(filePath string) (*File, error) {
 		if err != nil {
 			return nil, err
 		}
-		uncompressedSize = int64(len(linkTarget))
+		size = int64(len(linkTarget))
 	} else if !info.IsDir() {
-		uncompressedSize = info.Size()
+		size = info.Size()
 	}
 
 	f := &File{
 		name:             info.Name(),
-		uncompressedSize: uncompressedSize,
+		uncompressedSize: size,
 		modTime:          info.ModTime(),
 		isDir:            info.IsDir(),
 		mode:             info.Mode(),
@@ -209,11 +209,19 @@ func newDirectoryFile(name string) (*File, error) {
 
 // newFileFromFS creates a File object from an fs.FS entry.
 func newFileFromFS(fs fs.FS, filePath string, info fs.FileInfo) (*File, error) {
+	size := info.Size()
+	if info.IsDir() {
+		size = 0
+	}
+	if size < 0 && size != SizeUnknown {
+		return nil, fmt.Errorf("%w: size cannot be negative", ErrFileEntry)
+	}
+
 	return &File{
 		name:             filePath,
-		uncompressedSize: info.Size(),
+		isDir:            info.IsDir(),
+		uncompressedSize: size,
 		modTime:          info.ModTime(),
-		isDir:            false,
 		mode:             info.Mode(),
 		hostSystem:       sys.DefaultHostSystem,
 		extraField:       make(map[uint16][]byte),
@@ -273,6 +281,11 @@ func (f *File) FsTime() (mtime, atime, ctime time.Time) {
 	return
 }
 
+// IsEncrypted checks wether the data from the original archive is encrypted.
+func (f *File) IsEncrypted() bool {
+	return f.srcConfig.EncryptionMethod != NotEncrypted
+}
+
 // Open returns an io.ReadCloser for reading the uncompressed content of the file.
 //
 // Behavior:
@@ -309,32 +322,84 @@ func (f *File) OpenRaw() (*io.SectionReader, error) {
 	return f.srcFunc()
 }
 
-// SetSourcePassword updates the password used to read (decrypt) this specific file
-// from the original archive in case if the archive-wide password was incorrect
-// or if different files have different passwords.
-func (f *File) SetSourcePassword(pwd string) {
-	f.srcConfig.Password = pwd
-}
-
-// DisableEncryption sets encryption method to [NotEncrypted] and removes the password for this file.
-// This does not affect configuration for decompressing file from an existing archive.
-func (f *File) DisableEncryption() {
-	f.config.EncryptionMethod = NotEncrypted
-	f.config.Password = ""
-}
-
 // SetCompression replaces the compression method and level with the specified ones.
 // This does not affect configuration for decompressing file from an existing archive.
-func (f *File) SetCompression(method CompressionMethod, level int) {
+func (f *File) SetCompression(method CompressionMethod, level int) *File {
 	f.config.CompressionMethod = method
 	f.config.CompressionLevel = level
+	return f
 }
 
 // SetEncryption replaces the encryption method and password with the specified ones.
 // This does not affect configuration for decompressing file from an existing archive.
-func (f *File) SetEncryption(method EncryptionMethod, pwd string) {
+func (f *File) SetEncryption(method EncryptionMethod, pwd string) *File {
 	f.config.EncryptionMethod = method
 	f.config.Password = pwd
+	return f
+}
+
+// SetSourcePassword updates the password used to encrypt/decrypt this specific file.
+// If current encryption is [NotEncrypted] it defaults to [AES256].
+func (f *File) SetPassword(pwd string) *File {
+	if f.config.EncryptionMethod == NotEncrypted {
+		f.config.EncryptionMethod = AES256
+	}
+	f.config.Password = pwd
+	return f
+}
+
+// SetSourcePassword updates the password used to read (decrypt) this specific file
+// from the original archive in case if the archive-wide password was incorrect
+// or if different files have different passwords.
+func (f *File) SetSourcePassword(pwd string) *File {
+	f.srcConfig.Password = pwd
+	return f
+}
+
+// DisableEncryption sets encryption method to [NotEncrypted] and removes the password for this file.
+// This does not affect configuration for decompressing file from an existing archive.
+func (f *File) DisableEncryption() *File {
+	f.config.EncryptionMethod = NotEncrypted
+	f.config.Password = ""
+	return f
+}
+
+// SetMode updates the Unix-style file permission bits.
+func (f *File) SetMode(mode fs.FileMode) *File {
+	f.mode = mode
+	return f
+}
+
+// SetModTime sets the file's last modification time.
+func (f *File) SetModTime(modTime time.Time) *File {
+	f.modTime = modTime
+	return f
+}
+
+func (f *File) SetComment(c string) *File {
+	f.config.Comment = c
+	return f
+}
+
+// SetConfig applies a FileConfig to this file, overriding individual properties.
+func (f *File) SetConfig(config FileConfig) *File {
+	if !f.isDir {
+		f.config.CompressionMethod = config.CompressionMethod
+		f.config.CompressionLevel = config.CompressionLevel
+		f.config.EncryptionMethod = config.EncryptionMethod
+		f.config.Password = config.Password
+	}
+	f.config.Comment = config.Comment
+	return f
+}
+
+// SetOpenFunc replaces the function used to open the
+// file's content and sets the size to [SizeUnknown].
+func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) *File {
+	f.srcFunc = nil
+	f.openFunc = openFunc
+	f.uncompressedSize = SizeUnknown
+	return f
 }
 
 // HasExtraField checks whether an extra field with the specified tag exists.
@@ -348,25 +413,6 @@ func (f *File) HasExtraField(tag uint16) bool {
 func (f *File) GetExtraField(tag uint16) []byte {
 	f.ensureExtraParsed()
 	return f.extraField[tag]
-}
-
-// SetConfig applies a FileConfig to this file, overriding individual properties.
-func (f *File) SetConfig(config FileConfig) {
-	if !f.isDir {
-		f.config.CompressionMethod = config.CompressionMethod
-		f.config.CompressionLevel = config.CompressionLevel
-		f.config.EncryptionMethod = config.EncryptionMethod
-		f.config.Password = config.Password
-	}
-	f.config.Comment = config.Comment
-}
-
-// SetOpenFunc replaces the function used to open the
-// file's content and sets the size to [SizeUnknown].
-func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) {
-	f.srcFunc = nil
-	f.openFunc = openFunc
-	f.uncompressedSize = SizeUnknown
 }
 
 // SetExtraField adds or replaces an extra field entry for this file.

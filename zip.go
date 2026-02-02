@@ -351,22 +351,22 @@ func (z *Zip) FS() fs.FS {
 //   - To replace a file, use [Zip.Remove] before adding.
 //
 // Options can be used to override compression, encryption, or file attributes.
-func (z *Zip) AddFile(path string, options ...AddOption) error {
+func (z *Zip) AddFile(path string, options ...AddOption) (*File, error) {
 	fileEntry, err := newFileFromPath(path)
 	if err != nil {
-		return wrapErr("add", nil, err)
+		return nil, wrapErr("add", nil, err)
 	}
-	return wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
+	return fileEntry, wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
 }
 
 // AddOSFile adds an open *os.File to the archive. Uses native OS metadata.
 // The whole file content will be processed with [io.SectionReader].
-func (z *Zip) AddOSFile(f *os.File, options ...AddOption) error {
+func (z *Zip) AddOSFile(f *os.File, options ...AddOption) (*File, error) {
 	fileEntry, err := newFileFromOS(f)
 	if err != nil {
-		return wrapErr("add", nil, err)
+		return nil, wrapErr("add", nil, err)
 	}
-	return wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
+	return fileEntry, wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
 }
 
 // AddDir recursively adds a directory and its contents to the archive.
@@ -376,15 +376,15 @@ func (z *Zip) AddOSFile(f *os.File, options ...AddOption) error {
 //     AddDir continues processing others but returns a joined error at the end.
 //   - Symlinks inside the directory are stored as links, not followed.
 //   - Use [WithoutDir] or [FromDir] options during extraction, not here.
-func (z *Zip) AddDir(path string, options ...AddOption) error {
+func (z *Zip) AddDir(path string, options ...AddOption) ([]*File, error) {
 	var errs []error
+	var files []*File
 
 	walkErr := filepath.WalkDir(path, func(walkPath string, _ fs.DirEntry, err error) error {
 		if err != nil {
 			errs = append(errs, wrapErr("add", nil, fmt.Errorf("scan %s: %w", walkPath, err)))
 			return nil
 		}
-
 		if walkPath == path {
 			return nil
 		}
@@ -392,14 +392,17 @@ func (z *Zip) AddDir(path string, options ...AddOption) error {
 		relPath, err := filepath.Rel(path, walkPath)
 		if err != nil {
 			errs = append(errs, wrapErr("add", nil, err))
+			return nil
 		}
 
 		pathOpt := WithPath(filepath.ToSlash(filepath.Dir(relPath)))
 		fileOpts := append([]AddOption{pathOpt}, options...)
 
-		if err := z.AddFile(walkPath, fileOpts...); err != nil {
+		f, err := z.AddFile(walkPath, fileOpts...)
+		if err != nil {
 			errs = append(errs, err)
-			return nil
+		} else {
+			files = append(files, f)
 		}
 
 		return nil
@@ -409,40 +412,52 @@ func (z *Zip) AddDir(path string, options ...AddOption) error {
 		errs = append(errs, wrapErr("add", nil, walkErr))
 	}
 
-	return errors.Join(errs...)
+	return files, errors.Join(errs...)
 }
 
 // AddFS adds files from an [fs.FS] (e.g., [embed.FS], [os.DirFS]) to the archive.
-// It recursively walks the file system and adds all entries.
-func (z *Zip) AddFS(fileSystem fs.FS, options ...AddOption) error {
-	return fs.WalkDir(fileSystem, ".", func(filePath string, d fs.DirEntry, err error) error {
+// It recursively walks the file system and adds all entries using "Best Effort" strategy.
+func (z *Zip) AddFS(fileSystem fs.FS, options ...AddOption) ([]*File, error) {
+	var errs []error
+	var files []*File
+
+	walkErr := fs.WalkDir(fileSystem, ".", func(walkPath string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			errs = append(errs, wrapErr("add", nil, fmt.Errorf("scan %s: %w", walkPath, err)))
+			return nil
 		}
-		if filePath == "." {
+		if walkPath == "." {
 			return nil
 		}
 
 		info, err := d.Info()
 		if err != nil {
-			return err
+			return nil
 		}
 
-		pathOpt := WithPath(path.Dir(filePath))
-
+		pathOpt := WithPath(path.Dir(walkPath))
 		fileOpts := append([]AddOption{pathOpt}, options...)
 
-		if d.IsDir() {
-			return z.Mkdir(filePath, fileOpts...)
-		}
-
-		fileEntry, err := newFileFromFS(fileSystem, filePath, info)
+		f, err := newFileFromFS(fileSystem, walkPath, info)
 		if err != nil {
-			return wrapErr("create", fileEntry, err)
+			return wrapErr("create", f, err)
 		}
 
-		return wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
+		err = wrapErr("add", f, z.addEntry(f, fileOpts))
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			files = append(files, f)
+		}
+
+		return nil
 	})
+
+	if walkErr != nil {
+		errs = append(errs, wrapErr("add", nil, walkErr))
+	}
+
+	return files, errors.Join(errs...)
 }
 
 // AddReader appends a file from an [io.Reader] stream.
@@ -457,12 +472,12 @@ func (z *Zip) AddFS(fileSystem fs.FS, options ...AddOption) error {
 //     headers before writing. To avoid this, provide the exact size if possible.
 //
 // Returns [ErrFileEntry] if an invalid argument is passed.
-func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...AddOption) error {
+func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...AddOption) (*File, error) {
 	fileEntry, err := newFileFromReader(r, filename, size)
 	if err != nil {
-		return wrapErr("add", nil, err)
+		return nil, wrapErr("add", nil, err)
 	}
-	return wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
+	return fileEntry, wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
 }
 
 // AddLazy adds a file entry whose content is opened only when writing the archive.
@@ -493,13 +508,13 @@ func (z *Zip) AddLazy(name string, openFunc func() (io.ReadCloser, error), optio
 
 // AddBytes creates a file from a byte slice.
 // See [Zip.AddReader] for full documentation.
-func (z *Zip) AddBytes(data []byte, filename string, options ...AddOption) error {
+func (z *Zip) AddBytes(data []byte, filename string, options ...AddOption) (*File, error) {
 	return z.AddReader(bytes.NewReader(data), filename, int64(len(data)), options...)
 }
 
 // AddString creates a file from a string.
 // See [Zip.AddReader] for full documentation.
-func (z *Zip) AddString(content string, filename string, options ...AddOption) error {
+func (z *Zip) AddString(content string, filename string, options ...AddOption) (*File, error) {
 	return z.AddReader(strings.NewReader(content), filename, int64(len(content)), options...)
 }
 
@@ -507,12 +522,12 @@ func (z *Zip) AddString(content string, filename string, options ...AddOption) e
 // Note: Directories are created implicitly by file paths;
 // this is used for empty directories or specific metadata.
 // Returns [ErrFileEntry] if invalid name is passed.
-func (z *Zip) Mkdir(name string, options ...AddOption) error {
+func (z *Zip) Mkdir(name string, options ...AddOption) (*File, error) {
 	dirEntry, err := newDirectoryFile(name)
 	if err != nil {
-		return wrapErr("add", nil, err)
+		return nil, wrapErr("add", nil, err)
 	}
-	return wrapErr("add", dirEntry, z.addEntry(dirEntry, options))
+	return dirEntry, wrapErr("add", dirEntry, z.addEntry(dirEntry, options))
 }
 
 // Remove deletes a file or directory from the archive.

@@ -80,7 +80,7 @@ func FuzzWriteRead(f *testing.F) {
 
 		archive := NewZip()
 
-		err := archive.AddBytes(content, filename)
+		_, err := archive.AddBytes(content, filename)
 		if err != nil {
 			return
 		}
@@ -130,7 +130,7 @@ func FuzzZipSlip(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, pathName string) {
 		archive := NewZip()
-		err := archive.AddBytes([]byte("data"), pathName)
+		_, err := archive.AddBytes([]byte("data"), pathName)
 		if err != nil {
 			return
 		}
