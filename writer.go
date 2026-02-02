@@ -29,6 +29,8 @@ type zipWriter struct {
 	centralDirSize int64          // Cumulative size of central directory entries
 	headerOffset   int64          // Current write position for local file headers
 	centralDir     *spillBuffer   // Buffer for accumulating central directory before final write
+	onRead         func(*File, int)
+	onCompressed   func(*File, int)
 }
 
 // newZipWriter creates and initializes a new zipWriter instance.
@@ -229,7 +231,7 @@ func (zw *zipWriter) encodeToAndUpdate(f *File, dest io.Writer) error {
 	}
 	defer src.Close()
 
-	stats, err := zw.encodeTo(src, dest, f.config)
+	stats, err := zw.encodeTo(zw.wrapReader(f, src), zw.wrapWriter(f, dest), f.config)
 	if err != nil {
 		return err
 	}
@@ -243,6 +245,22 @@ func (zw *zipWriter) encodeToAndUpdate(f *File, dest io.Writer) error {
 	f.crc32 = stats.crc32
 
 	return nil
+}
+
+// wrapReader returns the original reader if onRead is not specified.
+func (zw *zipWriter) wrapReader(f *File, r io.ReadCloser) io.Reader {
+	if zw.onRead == nil {
+		return r
+	}
+	return &progressReader{r, f, zw.onRead}
+}
+
+// wrapWriter returns the original writer if onCompressed is not set.
+func (zw *zipWriter) wrapWriter(f *File, w io.Writer) io.Writer {
+	if zw.onCompressed == nil {
+		return w
+	}
+	return &progressWriter{w: w, f: f, onWrite: zw.onCompressed}
 }
 
 type encodingStats struct {
@@ -549,14 +567,13 @@ type parallelZipWriter struct {
 	onFileProcessed func(*File, error)
 }
 
-func newParallelZipWriter(config ZipConfig, factories factoriesMap, dest io.Writer, workers int) *parallelZipWriter {
+func newParallelZipWriter(zw *zipWriter, workers int) *parallelZipWriter {
 	var threshold int64 = 10 * 1024 * 1024 // 10MB
-	if config.MemoryThreshold > 0 {
-		threshold = config.MemoryThreshold
+	if zw.config.MemoryThreshold > 0 {
+		threshold = zw.config.MemoryThreshold
 	}
-
 	return &parallelZipWriter{
-		zw:              newZipWriter(config, factories, dest),
+		zw:              zw,
 		sem:             make(chan struct{}, workers),
 		memoryThreshold: threshold,
 		bufferPool: sync.Pool{
@@ -564,7 +581,7 @@ func newParallelZipWriter(config ZipConfig, factories factoriesMap, dest io.Writ
 				return newMemoryBuffer(64 * 1024)
 			},
 		},
-		onFileProcessed: config.OnFileProcessed,
+		onFileProcessed: zw.config.OnFileDone,
 	}
 }
 
@@ -661,11 +678,6 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 	}
 
 	wg.Wait()
-
-	if err := ctx.Err(); err != nil {
-		errs = append(errs, err)
-	}
-
 	return errs
 }
 
@@ -719,7 +731,11 @@ func (pzw *parallelZipWriter) compressFile(ctx context.Context, f *File) (io.Rea
 		defer src.Close()
 
 		// Encode to the buffer
-		stats, err := pzw.zw.encodeTo(&contextReader{ctx: ctx, r: src}, fileBuffer, f.config)
+		stats, err := pzw.zw.encodeTo(
+			&contextReader{ctx, pzw.zw.wrapReader(f, src)},
+			pzw.zw.wrapWriter(f, fileBuffer),
+			f.config,
+		)
 		if err != nil {
 			pzw.cleanupBuf(fileBuffer)
 			return nil, fmt.Errorf("encode: %w", err)

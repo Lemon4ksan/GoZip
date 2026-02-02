@@ -70,7 +70,7 @@ func TestRoundTrip_Parallel(t *testing.T) {
 	}
 
 	// 4 workers ensure we test concurrency logic
-	if _, err := archive.WriteToParallel(buf, 4); err != nil {
+	if _, err := archive.WriteTo(buf, gozip.WithWorkers(4)); err != nil {
 		t.Fatalf("WriteToParallel: %v", err)
 	}
 
@@ -338,7 +338,7 @@ func runGoZipParBenchmark(b *testing.B, files []testFile) {
 			}
 		}
 
-		if _, err := archive.WriteToParallelWithContext(ctx, io.Discard, workers); err != nil {
+		if _, err := archive.WriteToWithContext(ctx, io.Discard, gozip.WithWorkers(workers)); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -482,7 +482,7 @@ func BenchmarkExtractParallel_GoZip(b *testing.B) {
 	for b.Loop() {
 		// Note: We are overwriting files in the same temp dir.
 		// This is fine for benchmarking throughput.
-		if err := archive.ExtractParallel(tempDir, workers); err != nil {
+		if err := archive.ExtractTo(tempDir, gozip.WithWorkers(workers)); err != nil {
 			b.Fatal(err)
 		}
 	}

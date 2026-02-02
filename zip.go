@@ -11,9 +11,8 @@
 //
 // # Key Features
 //
-// 1. Concurrency: Unlike the standard library, gozip supports parallel compression
-// (WriteToParallel) and parallel extraction (ExtractParallel), scaling linearly
-// with CPU cores.
+// 1. Concurrency: Unlike the standard library, gozip supports parallel compression and
+// parallel extraction, offering significant speedups by utilizing all available CPU cores.
 //
 // 2. Security: Native support for WinZip AES-256 encryption (reading and writing)
 // and built-in "Zip Slip" protection during extraction to prevent directory
@@ -55,7 +54,7 @@
 //
 // # Basic Usage
 //
-// Creating an archive sequentially:
+// Creating an archive:
 //
 //	archive := gozip.NewZip()
 //	archive.AddFile("file.txt")
@@ -63,11 +62,6 @@
 //
 //	f, _ := os.Create("output.zip")
 //	archive.WriteTo(f)
-//
-// Creating an archive in parallel (faster for multiple files):
-//
-//	// compress using 8 workers
-//	archive.WriteToParallel(f, 8)
 //
 // Modifying an existing archive:
 //
@@ -101,7 +95,7 @@
 //
 //	// Save changes to a new writer
 //	dest, _ := os.Create("new.zip")
-//	archive.WriteTo(dest)
+//	archive.WriteTo(dest, gozip.WithWorkers(runtime.NumCPU()))
 //
 //	// Close source after the work is done
 //	src.Close()
@@ -132,6 +126,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -196,7 +191,7 @@ type ZipConfig struct {
 	// Default: [DecodeCP437] (IBM PC).
 	TextEncoding TextDecoder
 
-	// OnFileProcessed is a callback triggered after a file is written, read, or extracted.
+	// OnFileDone is a callback triggered after a file is written, read, or extracted.
 	// Errors are not wrapped in [FileError], because file instance is passed separately.
 	//
 	// Advanced Usage (Fail-Fast):
@@ -205,7 +200,7 @@ type ZipConfig struct {
 	// The library will catch the cancellation and perform a graceful shutdown.
 	//
 	// WARNING: In parallel operations, this callback is triggered concurrently.
-	OnFileProcessed func(*File, error)
+	OnFileDone func(*File, error)
 
 	// MemoryThreshold determines the maximum file size in bytes that can be buffered in memory.
 	// If the file size exceeds this threshold, a temporary file will be used. The default value is 10 MB.
@@ -233,187 +228,6 @@ type FileConfig struct {
 
 	// Comment is a file-specific comment (max 65535 bytes).
 	Comment string
-}
-
-// AddOption is a functional option for configuring file entries during addition.
-type AddOption func(f *File)
-
-// WithConfig applies a complete [FileConfig], overwriting existing settings.
-func WithConfig(c FileConfig) AddOption {
-	return func(f *File) {
-		f.SetConfig(c)
-	}
-}
-
-// WithCompression sets the compression method and level for a regular file.
-// Ignored for directories.
-func WithCompression(c CompressionMethod, lvl int) AddOption {
-	return func(f *File) {
-		if !f.isDir {
-			f.config.CompressionMethod = c
-			f.config.CompressionLevel = lvl
-		}
-	}
-}
-
-// WithEncryption sets the encryption method and password for a regular file.
-// Ignored for directories.
-func WithEncryption(e EncryptionMethod, pwd string) AddOption {
-	return func(f *File) {
-		if !f.isDir {
-			f.config.EncryptionMethod = e
-			f.config.Password = pwd
-		}
-	}
-}
-
-// WithPassword sets the encryption password for a specific file.
-// If no encryption method is specified, it defaults to [AES256].
-// Ignored for directories.
-func WithPassword(pwd string) AddOption {
-	return func(f *File) {
-		if !f.isDir {
-			f.config.Password = pwd
-		}
-	}
-}
-
-// WithName overrides the destination filename within the archive.
-// The name is automatically normalized to use forward slashes.
-func WithName(name string) AddOption {
-	return func(f *File) {
-		if name != "" {
-			f.name = name
-		}
-	}
-}
-
-// WithPath prepends a directory path to the file's name.
-// The path is automatically normalized to use forward slashes.
-func WithPath(p string) AddOption {
-	return func(f *File) {
-		if p != "" && p != "." {
-			f.name = path.Join(p, f.name)
-		}
-	}
-}
-
-// WithMode sets the Unix-style permission bits.
-// This affects the external attributes field in the ZIP header.
-func WithMode(mode fs.FileMode) AddOption {
-	return func(f *File) {
-		f.mode = mode
-	}
-}
-
-// Filter filters out the files.
-type Filter func(files []*File) []*File
-
-// WithFiles filters the operation to only the specific files provided.
-func WithFiles(files []*File) Filter {
-	return func(_ []*File) []*File { return files }
-}
-
-// FromDir restricts operation to files nested under the specified path.
-func FromDir(dirPath string) Filter {
-	return func(files []*File) []*File {
-		if dirPath == "" || dirPath == "." {
-			return files
-		}
-
-		prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
-		if !strings.HasSuffix(prefix, "/") {
-			prefix += "/"
-		}
-		dirEntryName := strings.TrimSuffix(prefix, "/")
-
-		n := 0
-		for _, f := range files {
-			fName := f.entryName()
-			if strings.HasPrefix(fName, prefix) || fName == dirEntryName {
-				files[n] = f
-				n++
-			}
-		}
-
-		for i := n; i < len(files); i++ {
-			files[i] = nil
-		}
-
-		return files[:n]
-	}
-}
-
-// WithoutDir excludes a directory and its contents from operation.
-func WithoutDir(dirPath string) Filter {
-	return func(files []*File) []*File {
-		if dirPath == "" || dirPath == "." {
-			return nil
-		}
-
-		prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
-		if !strings.HasSuffix(prefix, "/") {
-			prefix += "/"
-		}
-		dirEntryName := strings.TrimSuffix(prefix, "/")
-
-		n := 0
-		for _, f := range files {
-			fName := f.entryName()
-			if strings.HasPrefix(fName, prefix) || fName == dirEntryName {
-				continue
-			}
-			files[n] = f
-			n++
-		}
-
-		for i := n; i < len(files); i++ {
-			files[i] = nil
-		}
-
-		return files[:n]
-	}
-}
-
-// DefaultStoreExtensions is an extended list of formats that are
-// already compressed and do not require reprocessing.
-var DefaultStoreExtensions = map[string]struct{}{
-	"7z": {}, "aar": {}, "ace": {}, "apk": {}, "arc": {}, "arj": {},
-	"br": {}, "bz2": {}, "cab": {}, "deb": {}, "dmg": {}, "epub": {},
-	"gz": {}, "jar": {}, "lz4": {}, "lzma": {}, "lzo": {}, "rar": {},
-	"rpm": {}, "tar": {}, "tgz": {}, "war": {}, "xz": {}, "zip": {},
-	"zst": {},
-	// Media Files
-	"mp4": {}, "mkv": {}, "avi": {}, "mov": {}, "webm": {},
-	"jpg": {}, "jpeg": {}, "png": {}, "gif": {}, "webp": {},
-	"mp3": {}, "ogg": {}, "flac": {},
-	// Documents
-	"pdf": {}, "docx": {}, "xlsx": {}, "pptx": {},
-}
-
-// WithSmartStore disables compression for files whose extensions are in the list.
-// Passed extensions are merged with [DefaultStoreExtensions].
-// This filter changes the state of [File] objects in the archive.
-func WithSmartStore(exts ...string) Filter {
-	extMap := make(map[string]struct{}, len(DefaultStoreExtensions)+len(exts))
-	for k := range DefaultStoreExtensions {
-		extMap[k] = struct{}{}
-	}
-	for _, ext := range exts {
-		extMap[strings.ToLower(strings.TrimPrefix(ext, "."))] = struct{}{}
-	}
-	return func(files []*File) []*File {
-		for _, f := range files {
-			if f.isDir {
-				continue
-			}
-			ext := strings.ToLower(strings.TrimPrefix(path.Ext(f.name), "."))
-			if _, ok := extMap[ext]; ok {
-				f.SetCompression(Store, 0)
-			}
-		}
-		return files
-	}
 }
 
 // CompressorFactory creates a [Compressor] instance for a specific compression level.
@@ -765,12 +579,12 @@ func (z *Zip) Remove(name string) error {
 // Example: Rename("logs/old.txt", "new.txt") -> "logs/new.txt"
 //
 // Behavior:
-//   - For Directories: Recursively renames all nested files and subdirectories
+//   - For Directories, recursively renames all nested files and subdirectories
 //     to reflect the new parent name.
-//   - Atomicity: This operation is atomic. It performs a "dry run" check of all
+//   - This operation is atomic. It performs a "dry run" check of all
 //     resulting paths. If any path (including children) exceeds ZIP limits
 //     or conflicts with existing entries, no changes are applied to the archive.
-//   - Pathing: The 'new' parameter should be the new base name, not a full path.
+//   - The 'new' parameter is expected to be the new base name, not a full path.
 //
 // Errors:
 //   - Returns [ErrFileEntry] if the newName is empty or contains slashes.
@@ -809,10 +623,10 @@ func (z *Zip) Rename(old, newName string) error {
 // Example: Move("file.txt", "backup/docs") -> "backup/docs/file.txt".
 //
 // Behavior:
-//   - For Directories: Moves the entire directory tree recursively to the new location.
-//   - Implicit Creation: Automatically creates any missing parent directories
+//   - For Directories, moves the entire directory tree recursively to the new location.
+//   - Automatically creates any missing parent directories
 //     in the destination path.
-//   - Atomicity: Like Rename, this operation is atomic. It validates all
+//   - Like Rename, this operation is atomic. It validates all
 //     resulting child paths before modifying the archive structure.
 //
 // Errors returned match [Zip.Rename].
@@ -862,6 +676,27 @@ func (z *Zip) Files() []*File {
 	return result
 }
 
+// SafePath returns a clean, absolute path for a zip entry within the destination directory.
+// It ensures that the resulting path is inside the destDir (prevents Zip Slip).
+func (z *Zip) SafePath(destDir, fileName string) (string, error) {
+	cleanedName := path.Clean("/" + fileName)
+	cleanedName = strings.TrimPrefix(cleanedName, "/")
+
+	if strings.ContainsAny(cleanedName, "\x00\r\n\t") {
+		return "", fmt.Errorf("%w: filename contains control characters", ErrInsecurePath)
+	}
+
+	destDir = filepath.Clean(destDir)
+	fullPath := filepath.Join(destDir, filepath.FromSlash(cleanedName))
+
+	rel, err := filepath.Rel(destDir, fullPath)
+	if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return "", fmt.Errorf("%w: path escapes destination directory", ErrInsecurePath)
+	}
+
+	return fullPath, nil
+}
+
 // Exists checks if a file or directory exists in the archive.
 // Returns true if an exact file match is found.
 func (z *Zip) Exists(name string) bool {
@@ -888,6 +723,20 @@ func (z *Zip) OpenFile(name string) (io.ReadCloser, error) {
 		return nil, wrapErr("open", nil, ErrFileNotFound)
 	}
 	return f.Open()
+}
+
+// Select returns a list of files that satisfy the given condition.
+func (z *Zip) Select(cond Predicate) []*File {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+
+	matches := make([]*File, 0)
+	for _, f := range z.files {
+		if cond(f) {
+			matches = append(matches, f)
+		}
+	}
+	return matches
 }
 
 // Glob returns all files file whose name matches the [path.Match] pattern.
@@ -942,71 +791,18 @@ func (z *Zip) Find(pattern string) ([]*File, error) {
 	return matches, nil
 }
 
-// WriteTo serializes the archive to the specified writer sequentially.
+// WriteTo serializes the archive to the specified writer.
 //
 // Behavior:
 //   - Processes files using "Best Effort" strategy.
 //   - Writes Central Directory and End of Central Directory (EOCD) records.
 //   - Automatically handles Zip64 if files exceed 4GB or 65535 count.
 //
-// Returns the total number of bytes written.
-func (z *Zip) WriteTo(dest io.Writer, filters ...Filter) (int64, error) {
-	return z.WriteToWithContext(context.Background(), dest, filters...)
-}
-
-// WriteToWithContext writes the archive with context support.
-// Cancelling the context stops processing the remaining files and results in a valid archive.
-func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, filters ...Filter) (int64, error) {
-	files := z.Files()
-	for _, filter := range filters {
-		files = filter(files)
-	}
-	files = SortFilesOptimized(files, z.config.FileSortStrategy)
-
-	counter := &byteCountWriter{dest: dest}
-
-	var writerDest io.Writer = counter
-
-	if seeker, ok := dest.(io.WriteSeeker); ok {
-		writerDest = &byteCountWriteSeeker{
-			byteCountWriter: counter,
-			seeker:          seeker,
-		}
-	}
-
-	writer := newZipWriter(z.config, z.factories, writerDest)
-
-	var errs []error
-	for _, file := range files {
-		if err := ctx.Err(); err != nil {
-			errs = append(errs, err)
-			break
-		}
-
-		err := writer.WriteFile(file)
-		if err != nil {
-			errs = append(errs, wrapErr("write", file, err))
-		}
-
-		if z.config.OnFileProcessed != nil {
-			z.config.OnFileProcessed(file, err)
-		}
-	}
-
-	if err := writer.WriteCentralDirAndEndRecords(); err != nil {
-		errs = append(errs, fmt.Errorf("zip: finalize: %w", err))
-	}
-
-	return counter.bytesWritten, errors.Join(errs...)
-}
-
-// WriteToParallel writes the archive using multiple concurrent workers.
-//
-// Performance:
-//   - Scales linearly with CPU cores for compression-heavy tasks (Deflate/AES).
-//   - Uses a "Pipeline of Futures" pattern to ensure data is written to dest
-//     in the correct order, preserving deterministic output and providing
-//     natural backpressure.
+// Parallel:
+//   - Use [WithWorkers] option to speed the compression significantly.
+//   - Speed scales efficiently with CPU cores for compression-heavy tasks (Deflate/AES).
+//   - Writer uses a "Pipeline of Futures" pattern to ensure data is written in the
+//     correct order, preserving deterministic output and providing natural backpressure.
 //
 // Memory Usage:
 //   - Workers use a shared buffer pool. Peak memory usage is strictly bounded
@@ -1017,34 +813,69 @@ func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, filters ..
 //     usage, though it may be slightly slower for small archives.
 //   - For memory-constrained environments, reduce maxWorkers or MemoryThreshold.
 //
-// Returns the total bytes written to dest.
-func (z *Zip) WriteToParallel(dest io.Writer, maxWorkers int, filters ...Filter) (int64, error) {
-	return z.WriteToParallelWithContext(context.Background(), dest, maxWorkers, filters...)
+// Returns the total number of bytes written.
+func (z *Zip) WriteTo(dest io.Writer, opts ...Option) (int64, error) {
+	return z.WriteToWithContext(context.Background(), dest, opts...)
 }
 
-// WriteToParallelWithContext writes concurrently with context support.
+// WriteToWithContext writes the archive with context support.
 // Cancelling the context stops processing the remaining files and results in a valid archive.
-func (z *Zip) WriteToParallelWithContext(ctx context.Context, dest io.Writer, maxWorkers int, filters ...Filter) (int64, error) {
-	files := z.Files()
-	for _, filter := range filters {
-		files = filter(files)
-	}
+func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, opts ...Option) (int64, error) {
+	cfg := z.applyOptions(opts)
+	files := z.applyFilters(z.Files(), cfg.filters)
 	files = SortFilesOptimized(files, z.config.FileSortStrategy)
 
-	if err := ctx.Err(); err != nil {
-		return 0, err
+	tracker := &atomicCounterWriter{w: dest}
+	var writerDest io.Writer = tracker
+	if seeker, ok := dest.(io.WriteSeeker); ok {
+		writerDest = &atomicCounterWriteSeeker{atomicCounterWriter: tracker, seeker: seeker}
+	}
+	writer := newZipWriter(z.config, z.factories, writerDest)
+
+	stats := z.initProgressStats(files, cfg)
+	onFileDone := func(f *File, err error) {
+		if stats != nil {
+			atomic.AddInt64(&stats.ProcessedFiles, 1)
+			if err != nil {
+				atomic.AddInt64(&stats.Errors, 1)
+			}
+			cfg.onProgress(z.snapshotStats(stats, f, tracker.Count()))
+			atomic.StoreInt64(&stats.CurrentRead, 0)
+		}
+		if z.config.OnFileDone != nil {
+			z.config.OnFileDone(f, err)
+		}
+	}
+	if stats != nil {
+		writer.onRead = func(f *File, n int) {
+			atomic.AddInt64(&stats.CurrentRead, int64(n))
+			atomic.AddInt64(&stats.TotalRead, int64(n))
+			cfg.onProgress(z.snapshotStats(stats, f, tracker.Count()))
+		}
+		writer.onCompressed = func(f *File, n int) {
+			atomic.AddInt64(&stats.TotalCompressed, int64(n))
+		}
 	}
 
-	counter := &byteCountWriter{dest: dest}
-	writer := newParallelZipWriter(z.config, z.factories, counter, maxWorkers)
+	var errs []error
+	if workers := z.getWorkers(cfg, files); workers > 1 {
+		errs = z.execParallelWrite(ctx, files, writer, workers, onFileDone)
+	} else {
+		errs = z.execSequentialWrite(ctx, files, writer, onFileDone)
+	}
 
-	errs := writer.WriteFiles(ctx, files)
+	if err := writer.WriteCentralDirAndEndRecords(); err != nil {
+		errs = append(errs, fmt.Errorf("zip: finalize: %w", err))
+	}
+	if stats != nil {
+		cfg.onProgress(z.snapshotStats(stats, nil, tracker.Count()))
+	}
 
-	if err := writer.zw.WriteCentralDirAndEndRecords(); err != nil {
+	if err := ctx.Err(); err != nil {
 		errs = append(errs, err)
 	}
 
-	return counter.bytesWritten, errors.Join(errs...)
+	return tracker.Count(), errors.Join(errs...)
 }
 
 // Load parses an existing ZIP archive's central directory and merges
@@ -1073,10 +904,6 @@ func (z *Zip) Load(src io.ReaderAt, size int64) error {
 // LoadWithContext parses an archive with context support.
 // Cancelling the context stops processing the remaining files.
 func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
 	reader := newZipReader(src, size, z.decompressors, z.config)
 	eocd, err := reader.FindAndReadEOCD(ctx)
 	if err != nil {
@@ -1115,8 +942,8 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 			errs = append(errs, wrapErr("load", file, err))
 		}
 
-		if added && z.config.OnFileProcessed != nil {
-			z.config.OnFileProcessed(file, err)
+		if added && z.config.OnFileDone != nil {
+			z.config.OnFileDone(file, err)
 		}
 	}
 
@@ -1143,7 +970,7 @@ func (z *Zip) LoadFromFileWithContext(ctx context.Context, f *os.File) error {
 	return z.LoadWithContext(ctx, f, stat.Size())
 }
 
-// Extract unpacks the archive to the specified destination directory using "Best Effort" strategy.
+// ExtractTo unpacks the archive to the specified destination directory using "Best Effort" strategy.
 //
 // Security (Zip Slip):
 //   - Protects against directory traversal attacks. Attempts to extract files
@@ -1154,75 +981,60 @@ func (z *Zip) LoadFromFileWithContext(ctx context.Context, f *os.File) error {
 //   - Restores file modification times and permissions (chmod).
 //   - Automatically creates missing directory structures.
 //   - Supports decryption if passwords are set in [ZipConfig] or per-file.
-func (z *Zip) Extract(path string, filters ...Filter) error {
-	return z.ExtractWithContext(context.Background(), path, filters...)
+//
+// Parallel:
+//   - Use [WithWorkers] option to speed up the extraction.
+//   - Recommended for SSDs or systems with high I/O throughput.
+//   - faster than [Zip.ExtractTo] for archives with many encrypted or compressed files
+//     due to parallel CPU decryption/decompression.
+func (z *Zip) ExtractTo(path string, opts ...Option) error {
+	return z.ExtractToWithContext(context.Background(), path, opts...)
 }
 
-// ExtractWithContext extracts files with context support.
+// ExtractToWithContext extracts files with context support.
 // Context cancellation stops the extraction process.
-func (z *Zip) ExtractWithContext(ctx context.Context, path string, filters ...Filter) error {
+func (z *Zip) ExtractToWithContext(ctx context.Context, path string, opts ...Option) error {
 	path = filepath.Clean(path)
+	cfg := z.applyOptions(opts)
+	files := z.applyFilters(z.Files(), cfg.filters)
+	sortAlphabetical(files)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	stats := z.initProgressStats(files, cfg)
+	var onRead func(*File, int)
+	var onWrite func(*File, int)
+	if stats != nil {
+		onRead = func(f *File, n int) {
+			atomic.AddInt64(&stats.CurrentRead, int64(n))
+			atomic.AddInt64(&stats.TotalRead, int64(n))
+			cfg.onProgress(z.snapshotStats(stats, f, atomic.LoadInt64(&stats.TotalWritten)))
+		}
+		onWrite = func(f *File, n int) {
+			atomic.AddInt64(&stats.TotalWritten, int64(n))
+		}
+	}
+	onDone := func(f *File, err error) {
+		if stats != nil {
+			atomic.AddInt64(&stats.ProcessedFiles, 1)
+			if err != nil {
+				atomic.AddInt64(&stats.Errors, 1)
+			}
+			cfg.onProgress(z.snapshotStats(stats, f, 0))
+			atomic.StoreInt64(&stats.CurrentRead, 0)
+		}
+		if z.config.OnFileDone != nil {
+			z.config.OnFileDone(f, err)
+		}
+	}
+
 	var errs []error
 	var dirsToRestore []*File
-
-	files := z.Files()
-	for _, filter := range filters {
-		files = filter(files)
-	}
-	sortAlphabetical(files)
-
-	callback := func(f *File, err error) {
-		if z.config.OnFileProcessed != nil {
-			z.config.OnFileProcessed(f, err)
-		}
-	}
-
-	for _, f := range files {
-		if ctx.Err() != nil {
-			break
-		}
-
-		if f.config.Password == "" {
-			f.config.Password = z.config.Password
-		}
-		fpath := filepath.Join(path, f.name)
-
-		// Zip Slip Protection
-		rel, err := filepath.Rel(path, fpath)
-		if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
-			errs = append(errs, wrapErr("extract", f, ErrInsecurePath))
-			callback(f, ErrInsecurePath)
-			continue
-		}
-
-		if f.isDir {
-			err := os.MkdirAll(fpath, 0755)
-			if err != nil {
-				errs = append(errs, wrapErr("extract", f, err))
-			} else {
-				dirsToRestore = append(dirsToRestore, f)
-			}
-			callback(f, err)
-			continue
-		}
-
-		if err := os.MkdirAll(filepath.Dir(fpath), 0755); err != nil {
-			errs = append(errs, wrapErr("extract", f, err))
-			callback(f, err)
-			continue
-		}
-
-		err = z.extractFile(ctx, f, fpath)
-		if err != nil {
-			if ctx.Err() != nil {
-				break
-			}
-			if errors.Is(err, ErrPasswordMismatch) {
-				f.config.Password = ""
-			}
-			errs = append(errs, wrapErr("extract", f, err))
-		}
-		callback(f, err)
+	if workers := z.getWorkers(cfg, files); workers > 1 {
+		dirsToRestore, errs = z.execParallelExtract(ctx, files, path, workers, onDone, onRead, onWrite)
+	} else {
+		dirsToRestore, errs = z.execSequentialExtract(ctx, files, path, onDone, onRead, onWrite)
 	}
 
 	for i := len(dirsToRestore) - 1; i >= 0; i-- {
@@ -1237,58 +1049,90 @@ func (z *Zip) ExtractWithContext(ctx context.Context, path string, filters ...Fi
 	return errors.Join(errs...)
 }
 
-// ExtractParallel unpacks files using concurrent workers.
-//
-// Use Case:
-//   - Recommended for SSDs or systems with high I/O throughput.
-//   - faster than [Zip.Extract] for archives with many encrypted or compressed files
-//     due to parallel CPU decryption/decompression.
-func (z *Zip) ExtractParallel(path string, workers int, filters ...Filter) error {
-	return z.ExtractParallelWithContext(context.Background(), path, workers, filters...)
-}
-
-// ExtractParallelWithContext extracts files concurrently with context support.
-func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, workers int, filters ...Filter) error {
-	path = filepath.Clean(path)
-
-	files := z.Files()
-	for _, filter := range filters {
-		files = filter(files)
-	}
-	sortAlphabetical(files)
-
-	filesToExtract := make([]*File, 0, len(files))
+func (z *Zip) execSequentialExtract(
+	ctx context.Context, files []*File, destDir string,
+	onDone func(*File, error), onRead, onWrite func(*File, int),
+) ([]*File, []error) {
+	var errs []error
 	dirsToRestore := make([]*File, 0, len(files)/2)
 
-	callback := func(f *File, err error) {
-		if z.config.OnFileProcessed != nil {
-			z.config.OnFileProcessed(f, err)
+	for _, f := range files {
+		if ctx.Err() != nil {
+			break
 		}
+
+		if f.config.Password == "" {
+			f.config.Password = z.config.Password
+		}
+
+		fpath, err := z.SafePath(destDir, f.name)
+		if err != nil {
+			errs = append(errs, wrapErr("extract", f, err))
+			onDone(f, err)
+			continue
+		}
+
+		if f.isDir {
+			err := os.MkdirAll(fpath, 0755)
+			if err != nil {
+				errs = append(errs, wrapErr("extract", f, err))
+			} else {
+				dirsToRestore = append(dirsToRestore, f)
+			}
+			onDone(f, err)
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(fpath), 0755); err != nil {
+			errs = append(errs, wrapErr("extract", f, err))
+			onDone(f, err)
+			continue
+		}
+
+		err = z.extractFile(ctx, f, fpath, onRead, onWrite)
+		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			if errors.Is(err, ErrPasswordMismatch) {
+				f.config.Password = ""
+			}
+			errs = append(errs, wrapErr("extract", f, err))
+		}
+		onDone(f, err)
 	}
+
+	return dirsToRestore, errs
+}
+
+func (z *Zip) execParallelExtract(
+	ctx context.Context, files []*File, destDir string, workers int,
+	onDone func(*File, error), onRead, onWrite func(*File, int),
+) ([]*File, []error) {
+	filesToExtract := make([]*File, 0, len(files))
+	dirsToRestore := make([]*File, 0, len(files)/2)
 
 	var errs []error
 	for _, f := range files {
 		if f.config.Password == "" {
 			f.config.Password = z.config.Password
 		}
-		fpath := filepath.Join(path, f.name)
 
-		// Zip Slip Protection
-		rel, err := filepath.Rel(path, fpath)
-		if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
-			errs = append(errs, wrapErr("extract", f, ErrInsecurePath))
-			if z.config.OnFileProcessed != nil {
-				z.config.OnFileProcessed(f, err)
-			}
+		fpath, err := z.SafePath(destDir, f.name)
+		if err != nil {
+			errs = append(errs, wrapErr("extract", f, err))
+			onDone(f, err)
 			continue
 		}
 
 		if f.isDir {
-			if err := os.MkdirAll(fpath, 0755); err != nil {
+			err := os.MkdirAll(fpath, 0755)
+			if err != nil {
 				errs = append(errs, wrapErr("extract", f, err))
 			} else {
 				dirsToRestore = append(dirsToRestore, f)
 			}
+			onDone(f, err)
 			continue
 		}
 
@@ -1296,7 +1140,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 	}
 
 	if len(errs) > 0 {
-		return errors.Join(errs...)
+		return dirsToRestore, errs
 	}
 
 	sem := make(chan struct{}, workers)
@@ -1314,7 +1158,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 		go func(f *File) {
 			defer func() { <-sem; wg.Done() }()
 
-			err := z.extractFile(ctx, f, filepath.Join(path, f.name))
+			err := z.extractFile(ctx, f, filepath.Join(destDir, f.name), onRead, onWrite)
 			if err != nil {
 				if ctx.Err() == nil {
 					errChan <- wrapErr("extract", f, err)
@@ -1323,7 +1167,7 @@ func (z *Zip) ExtractParallelWithContext(ctx context.Context, path string, worke
 					f.config.Password = ""
 				}
 			}
-			callback(f, err)
+			onDone(f, err)
 		}(f)
 	}
 
@@ -1331,23 +1175,26 @@ Finish:
 	wg.Wait()
 	close(errChan)
 
-	for i := len(dirsToRestore) - 1; i >= 0; i-- {
-		dir := dirsToRestore[i]
-		os.Chtimes(filepath.Join(path, dir.name), time.Now(), dir.modTime)
-	}
-
 	for err := range errChan {
 		errs = append(errs, err)
 	}
 
-	if err := ctx.Err(); err != nil {
-		errs = append(errs, err)
-	}
-
-	return errors.Join(errs...)
+	return dirsToRestore, errs
 }
 
 // Internal helpers
+
+// initProgressStats initializes stats struct for tracking progress
+func (z *Zip) initProgressStats(files []*File, cfg processConfig) *ProgressStats {
+	if cfg.onProgress == nil {
+		return nil
+	}
+	s := &ProgressStats{TotalFiles: int64(len(files))}
+	for _, f := range files {
+		s.ExpectedRead += f.UncompressedSize()
+	}
+	return s
+}
 
 // addEntry validates and adds a file to the archive.
 func (z *Zip) addEntry(f *File, options []AddOption) error {
@@ -1542,6 +1389,27 @@ func (z *Zip) applyPathTransform(f *File, newPath string) error {
 	return nil
 }
 
+func (z *Zip) execSequentialWrite(ctx context.Context, files []*File, writer *zipWriter, onDone func(*File, error)) []error {
+	var errs []error
+	for _, file := range files {
+		if ctx.Err() != nil {
+			break
+		}
+		err := writer.WriteFile(file)
+		if err != nil {
+			errs = append(errs, wrapErr("write", file, err))
+		}
+		onDone(file, err)
+	}
+	return errs
+}
+
+func (z *Zip) execParallelWrite(ctx context.Context, files []*File, writer *zipWriter, workers int, onDone func(*File, error)) []error {
+	pzw := newParallelZipWriter(writer, workers)
+	pzw.onFileProcessed = onDone
+	return pzw.WriteFiles(ctx, files)
+}
+
 // prepareInternalStorage optimizes allocations if the archive was empty.
 func (z *Zip) prepareInternalStorage(newFilesCount int) {
 	if len(z.files) == 0 {
@@ -1615,7 +1483,7 @@ func (z *Zip) replaceEntry(old, new *File) {
 
 // extractFile handles low-level extraction logic.
 // It uses the shared buffer pool and attempts to restore file metadata (times/perms).
-func (z *Zip) extractFile(ctx context.Context, f *File, path string) error {
+func (z *Zip) extractFile(ctx context.Context, f *File, path string, onRead, onWrite func(*File, int)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1630,19 +1498,29 @@ func (z *Zip) extractFile(ctx context.Context, f *File, path string) error {
 	}
 	defer src.Close()
 
-	dst, err := os.Create(path)
+	dest, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer dst.Close()
+	defer dest.Close()
+
+	var r io.Reader = src
+	if onRead != nil {
+		r = &progressReader{src, f, onRead}
+	}
+
+	var w io.Writer = dest
+	if onWrite != nil {
+		w = &progressWriter{dest, f, onWrite}
+	}
 
 	if f.uncompressedSize > 0 {
-		if err := dst.Truncate(f.uncompressedSize); err != nil {
+		if err := dest.Truncate(f.uncompressedSize); err != nil {
 			return err
 		}
 
 		bufPtr := z.bufferPool.Get().(*[]byte)
-		_, err = io.CopyBuffer(dst, &contextReader{ctx: ctx, r: src}, *bufPtr)
+		_, err = io.CopyBuffer(w, &contextReader{ctx, r}, *bufPtr)
 		z.bufferPool.Put(bufPtr)
 
 		if err != nil {
@@ -1660,4 +1538,43 @@ func (z *Zip) extractFile(ctx context.Context, f *File, path string) error {
 	_ = os.Chtimes(path, time.Now(), f.modTime)
 
 	return nil
+}
+
+func (z *Zip) snapshotStats(s *ProgressStats, current *File, written int64) ProgressStats {
+	return ProgressStats{
+		CurrentFile:     current,
+		TotalRead:       atomic.LoadInt64(&s.TotalRead),
+		TotalCompressed: atomic.LoadInt64(&s.TotalCompressed),
+		ProcessedFiles:  atomic.LoadInt64(&s.ProcessedFiles),
+		Errors:          atomic.LoadInt64(&s.Errors),
+		ExpectedRead:    s.ExpectedRead, // const
+		TotalFiles:      s.TotalFiles,   // const
+		TotalWritten:    written,
+	}
+}
+
+func (z *Zip) applyOptions(opts []Option) processConfig {
+	cfg := processConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
+
+func (z *Zip) applyFilters(files []*File, filters []Filter) []*File {
+	for _, filter := range filters {
+		files = filter(files)
+	}
+	return files
+}
+
+func (z *Zip) getWorkers(cfg processConfig, files []*File) int {
+	workers := cfg.workers
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(files) {
+		workers = len(files)
+	}
+	return workers
 }

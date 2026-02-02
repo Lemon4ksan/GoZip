@@ -145,7 +145,7 @@ func FuzzZipSlip(f *testing.F) {
 			return
 		}
 
-		err = extractArch.Extract("output_dir")
+		err = extractArch.ExtractTo("output_dir")
 
 		if err != nil {
 			t.Logf("Got expected error for %s: %v", pathName, err)

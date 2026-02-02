@@ -185,19 +185,19 @@ func parseEntryConf(f *File, entry internal.SharedEntry) {
 // zipReader handles low-level reading of ZIP archive structure.
 type zipReader struct {
 	readerBase
-	src             io.ReaderAt        // Source stream for reading archive data
-	fileSize        int64              // Total size of the archive
-	onFileProcessed func(*File, error) // Callback after reading
+	src        io.ReaderAt        // Source stream for reading archive data
+	fileSize   int64              // Total size of the archive
+	onFileDone func(*File, error) // Callback after reading
 }
 
 // newZipReader creates and initializes a new zipReader instance.
 // decompressors map can be nil - built-in Stored and Deflated decompressors are registered automatically.
 func newZipReader(src io.ReaderAt, size int64, dcm decompressorsMap, cfg ZipConfig) *zipReader {
 	return &zipReader{
-		readerBase:      newReaderBase(dcm, cfg),
-		src:             src,
-		fileSize:        size,
-		onFileProcessed: cfg.OnFileProcessed,
+		readerBase: newReaderBase(dcm, cfg),
+		src:        src,
+		fileSize:   size,
+		onFileDone: cfg.OnFileDone,
 	}
 }
 
@@ -352,8 +352,8 @@ func (zr *zipReader) readCentralDir(ctx context.Context, offset uint64, entriesN
 		file := zr.newFileFromCentralDir(entry)
 		files = append(files, file)
 
-		if zr.onFileProcessed != nil {
-			zr.onFileProcessed(file, nil)
+		if zr.onFileDone != nil {
+			zr.onFileDone(file, nil)
 		}
 	}
 

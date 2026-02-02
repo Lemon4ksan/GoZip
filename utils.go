@@ -7,6 +7,7 @@ package gozip
 import (
 	"context"
 	"io"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,14 +23,30 @@ func (w *byteCountWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// byteCountWriteSeeker is an extension of byteCountWriter that supports seeking.
-type byteCountWriteSeeker struct {
-	*byteCountWriter
-	seeker io.WriteSeeker
+type atomicCounterWriter struct {
+	w     io.Writer
+	count int64
 }
 
-func (w *byteCountWriteSeeker) Seek(offset int64, whence int) (int64, error) {
-	return w.seeker.Seek(offset, whence)
+func (acw *atomicCounterWriter) Write(p []byte) (int, error) {
+	n, err := acw.w.Write(p)
+	if n > 0 {
+		atomic.AddInt64(&acw.count, int64(n))
+	}
+	return n, err
+}
+
+func (acw *atomicCounterWriter) Count() int64 {
+	return atomic.LoadInt64(&acw.count)
+}
+
+type atomicCounterWriteSeeker struct {
+	*atomicCounterWriter
+	seeker io.Seeker
+}
+
+func (acw *atomicCounterWriteSeeker) Seek(offset int64, whence int) (int64, error) {
+	return acw.seeker.Seek(offset, whence)
 }
 
 // contextReader wraps an io.Reader to make it respect context cancellation.
@@ -125,8 +142,8 @@ func winFiletimeToTime(ft uint64) time.Time {
 
 // hasMeta checks if the string contains pattern matching characters.
 func hasMeta(path string) bool {
-	for i := 0; i < len(path); i++ {
-		switch path[i] {
+	for _, c := range path {
+		switch c {
 		case '*', '?', '[', '\\':
 			return true
 		}

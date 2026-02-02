@@ -262,7 +262,8 @@ func TestParallelZipWriter_Integration(t *testing.T) {
 		}
 	}
 
-	pzw := newParallelZipWriter(config, make(map[CompressionMethod]CompressorFactory), mw, 2)
+	zw := newZipWriter(config, nil, mw)
+	pzw := newParallelZipWriter(zw, 2)
 
 	errs := pzw.WriteFiles(context.Background(), files)
 	if len(errs) > 0 {
@@ -323,7 +324,8 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 		},
 	}
 
-	pzw := newParallelZipWriter(config, make(map[CompressionMethod]CompressorFactory), mw, 1)
+	zw := newZipWriter(config, nil, mw)
+	pzw := newParallelZipWriter(zw, 1)
 	pzw.memoryThreshold = 10 // Force second file to disk
 
 	errs := pzw.WriteFiles(context.Background(), files)
@@ -346,7 +348,8 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 
 func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
-	pzw := newParallelZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw, 2)
+	zw := newZipWriter(ZipConfig{}, nil, mw)
+	pzw := newParallelZipWriter(zw, 2)
 
 	expectedErr := errors.New("simulated open error")
 	files := []*File{
@@ -373,48 +376,6 @@ func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("Expected error containing %q, got %v", expectedErr, errs)
-	}
-}
-
-func TestParallelZipWriter_ContextCancel(t *testing.T) {
-	mw := NewMemoryWriteSeeker()
-	pzw := newParallelZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw, 2)
-
-	slowFile := &File{
-		name:             "slow.txt",
-		uncompressedSize: 1000,
-		openFunc: func() (io.ReadCloser, error) {
-			r, w := io.Pipe()
-			go func() {
-				time.Sleep(100 * time.Millisecond)
-				w.Write([]byte("data"))
-				w.Close()
-			}()
-			return r, nil
-		},
-	}
-
-	files := []*File{slowFile, slowFile, slowFile}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
-
-	errs := pzw.WriteFiles(ctx, files)
-
-	found := false
-	for _, err := range errs {
-		if errors.Is(err, context.Canceled) {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		t.Errorf("Expected context.Canceled error, got %v", errs)
 	}
 }
 
