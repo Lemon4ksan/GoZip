@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"path"
 	"strings"
+	"sync/atomic"
 )
 
 // AddOption is a functional option for configuring file entries during addition.
@@ -82,6 +83,7 @@ type processConfig struct {
 	filters    []Filter
 	workers    int
 	onProgress func(stats ProgressStats)
+	onFileDone func(*File, error)
 }
 
 type Option func(*processConfig)
@@ -94,6 +96,13 @@ func WithWorkers(n int) Option {
 		} else {
 			pc.workers = n
 		}
+	}
+}
+
+// WithOnFileDone overrides global [ZipConfig.OnFileDone]
+func WithOnFileDone(fn func(*File, error)) Option {
+	return func(pc *processConfig) {
+		pc.onFileDone = fn
 	}
 }
 
@@ -264,32 +273,145 @@ func WithProgress(cb func(ProgressStats)) Option {
 	}
 }
 
+type signalFunc func(f *File, n int, fileRead int64)
+
+// statsCollector encapsulates metrics tracking and thread-safe updates.
+type statsCollector struct {
+	stats       *ProgressStats
+	onProgress  func(ProgressStats)
+	onFileDone  func(*File, error) // User defined callback from config
+	destCounter *atomicCounterWriter
+}
+
+func newStatsCollector(cfg processConfig, files []*File, destCounter *atomicCounterWriter) *statsCollector {
+	if cfg.onProgress == nil && cfg.onFileDone == nil {
+		return &statsCollector{destCounter: destCounter}
+	}
+
+	s := &ProgressStats{TotalFiles: int64(len(files))}
+	for _, f := range files {
+		s.ExpectedRead += f.UncompressedSize()
+	}
+
+	return &statsCollector{
+		stats:       s,
+		onProgress:  cfg.onProgress,
+		onFileDone:  cfg.onFileDone,
+		destCounter: destCounter,
+	}
+}
+
+func (c *statsCollector) OnRead(f *File, n int, fileRead int64) {
+	if c.stats == nil {
+		return
+	}
+	atomic.StoreInt64(&c.stats.CurrentRead, fileRead)
+	atomic.AddInt64(&c.stats.TotalRead, int64(n))
+	if c.destCounter != nil {
+		atomic.StoreInt64(&c.stats.TotalWritten, c.destCounter.Count())
+	}
+	c.notify(f)
+}
+
+// OnCompressed handles updates when bytes are compressed.
+func (c *statsCollector) OnCompressed(_ *File, n int, compressed int64) {
+	if c.stats == nil {
+		return
+	}
+	atomic.AddInt64(&c.stats.TotalCompressed, int64(n))
+	atomic.StoreInt64(&c.stats.CurrentCompressed, compressed)
+}
+
+// OnFileDone handles completion of a single file processing.
+func (c *statsCollector) OnFileDone(f *File, err error) {
+	if c.stats != nil {
+		atomic.AddInt64(&c.stats.ProcessedFiles, 1)
+		if err != nil {
+			atomic.AddInt64(&c.stats.Errors, 1)
+		}
+		c.notify(f)
+		atomic.StoreInt64(&c.stats.CurrentRead, 0)
+	}
+
+	if c.onFileDone != nil {
+		c.onFileDone(f, err)
+	}
+}
+
+// Finish sends the final progress event.
+func (c *statsCollector) Finish() {
+	if c.stats != nil && c.onProgress != nil {
+		c.notify(nil)
+	}
+}
+
+// notify creates a snapshot and calls the user callback.
+func (c *statsCollector) notify(f *File) {
+	if c.onProgress == nil {
+		return
+	}
+	c.onProgress(c.snapshotStats(f))
+}
+
+func (c *statsCollector) snapshotStats(current *File) ProgressStats {
+	return ProgressStats{
+		CurrentFile:       current,
+		CurrentRead:       atomic.LoadInt64(&c.stats.CurrentRead),
+		CurrentCompressed: atomic.LoadInt64(&c.stats.CurrentCompressed),
+		TotalRead:         atomic.LoadInt64(&c.stats.TotalRead),
+		TotalCompressed:   atomic.LoadInt64(&c.stats.TotalCompressed),
+		ProcessedFiles:    atomic.LoadInt64(&c.stats.ProcessedFiles),
+		Errors:            atomic.LoadInt64(&c.stats.Errors),
+		ExpectedRead:      c.stats.ExpectedRead, // const
+		TotalFiles:        c.stats.TotalFiles,   // const
+		TotalWritten:      atomic.LoadInt64(&c.stats.TotalWritten),
+	}
+}
+
 // progressReader wraps file reading to update statistics
 type progressReader struct {
-	r      io.Reader
-	f      *File
-	onRead func(*File, int)
+	r         io.Reader
+	onRead    func(n int, localTotal int64)
+	processed int64
+}
+
+func newProgressReader(r io.Reader, f *File, onRead signalFunc) *progressReader {
+	return &progressReader{r: r, onRead: func(n int, localTotal int64) {
+		onRead(f, n, localTotal)
+	}}
 }
 
 func (pr *progressReader) Read(p []byte) (int, error) {
 	n, err := pr.r.Read(p)
 	if n > 0 {
-		pr.onRead(pr.f, n)
+		pr.processed += int64(n)
+		if pr.onRead != nil {
+			pr.onRead(n, pr.processed)
+		}
 	}
 	return n, err
 }
 
 // progressWriter wraps the write to the archive to update global statistics
 type progressWriter struct {
-	w       io.Writer
-	f       *File
-	onWrite func(*File, int)
+	w         io.Writer
+	onWrite   func(n int, localTotal int64)
+	processed int64
+}
+
+func newProgressWriter(w io.Writer, f *File, onWrite signalFunc) *progressWriter {
+	return &progressWriter{w: w, onWrite: func(n int, localTotal int64) {
+		onWrite(f, n, localTotal)
+	}}
 }
 
 func (pw *progressWriter) Write(p []byte) (int, error) {
 	n, err := pw.w.Write(p)
 	if n > 0 {
-		pw.onWrite(pw.f, n)
+		pw.processed += int64(n)
+		if pw.onWrite != nil {
+			pw.onWrite(n, pw.processed)
+		}
 	}
 	return n, err
 }

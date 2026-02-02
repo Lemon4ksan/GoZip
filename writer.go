@@ -29,8 +29,8 @@ type zipWriter struct {
 	centralDirSize int64          // Cumulative size of central directory entries
 	headerOffset   int64          // Current write position for local file headers
 	centralDir     *spillBuffer   // Buffer for accumulating central directory before final write
-	onRead         func(*File, int)
-	onCompressed   func(*File, int)
+	onRead         signalFunc
+	onCompressed   signalFunc
 }
 
 // newZipWriter creates and initializes a new zipWriter instance.
@@ -252,7 +252,7 @@ func (zw *zipWriter) wrapReader(f *File, r io.ReadCloser) io.Reader {
 	if zw.onRead == nil {
 		return r
 	}
-	return &progressReader{r, f, zw.onRead}
+	return newProgressReader(r, f, zw.onRead)
 }
 
 // wrapWriter returns the original writer if onCompressed is not set.
@@ -260,7 +260,7 @@ func (zw *zipWriter) wrapWriter(f *File, w io.Writer) io.Writer {
 	if zw.onCompressed == nil {
 		return w
 	}
-	return &progressWriter{w: w, f: f, onWrite: zw.onCompressed}
+	return newProgressWriter(w, f, zw.onCompressed)
 }
 
 type encodingStats struct {
@@ -564,7 +564,7 @@ type parallelZipWriter struct {
 	sem             chan struct{}
 	memoryThreshold int64
 	bufferPool      sync.Pool
-	onFileProcessed func(*File, error)
+	onFileDone      func(*File, error)
 }
 
 func newParallelZipWriter(zw *zipWriter, workers int) *parallelZipWriter {
@@ -581,7 +581,6 @@ func newParallelZipWriter(zw *zipWriter, workers int) *parallelZipWriter {
 				return newMemoryBuffer(64 * 1024)
 			},
 		},
-		onFileProcessed: zw.config.OnFileDone,
 	}
 }
 
@@ -670,8 +669,8 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 			}
 		}
 
-		if pzw.onFileProcessed != nil {
-			pzw.onFileProcessed(res.file, err)
+		if pzw.onFileDone != nil {
+			pzw.onFileDone(res.file, err)
 		}
 
 		pzw.cleanupBuf(res.src)
