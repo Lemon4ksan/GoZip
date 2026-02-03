@@ -48,7 +48,7 @@ func FuzzLoad(f *testing.F) {
 		archive := NewZip()
 		reader := bytes.NewReader(data)
 
-		err := archive.Load(reader, int64(len(data)))
+		_, err := archive.Load(reader, int64(len(data)))
 		if err != nil {
 			return
 		}
@@ -92,7 +92,7 @@ func FuzzWriteRead(f *testing.F) {
 		}
 
 		readArchive := NewZip()
-		err = readArchive.Load(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+		_, err = readArchive.Load(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 		if err != nil {
 			t.Fatalf("failed to load generated archive: %v", err)
 		}
@@ -141,7 +141,7 @@ func FuzzZipSlip(f *testing.F) {
 		}
 
 		extractArch := NewZip()
-		if err := extractArch.Load(bytes.NewReader(buf.Bytes()), int64(buf.Len())); err != nil {
+		if _, err := extractArch.Load(bytes.NewReader(buf.Bytes()), int64(buf.Len())); err != nil {
 			return
 		}
 

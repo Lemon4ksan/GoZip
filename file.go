@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lemon4ksan/gozip/internal"
@@ -61,32 +62,36 @@ const (
 // and content access mechanisms. Each File object corresponds to one entry in the
 // ZIP central directory and can represent either a regular file or a directory.
 type File struct {
-	name       string      // File path within the archive (using forward slashes)
-	isDir      bool        // True if this entry represents a directory
-	isImplicit bool        // True if dir was created automatically.
-	mode       fs.FileMode // Unix-style file permissions and type bits
+	mu sync.RWMutex // Protects name, config, extraField, metadata
 
-	openFunc func() (io.ReadCloser, error)     // Factory function for reading decompressed content
-	srcFunc  func() (*io.SectionReader, error) // Factory function for reading compressed content
+	// Static
+	isDir      bool                              // True if this entry represents a directory
+	isImplicit bool                              // True if dir was created automatically.
+	openFunc   func() (io.ReadCloser, error)     // Factory function for reading decompressed content
+	srcFunc    func() (*io.SectionReader, error) // Factory function for reading compressed content
+	srcConfig  FileConfig
 
-	uncompressedSize int64  // Size of original content before compression in bytes
-	compressedSize   int64  // Size of compressed data within archive in bytes
-	crc32            uint32 // CRC-32 checksum of uncompressed data
+	// Atomic
+	uncompressedSize  int64  // Size of original content before compression in bytes
+	compressedSize    int64  // Size of compressed data within archive in bytes
+	localHeaderOffset int64  // Byte offset of this file's local header within archive
+	crc32             uint32 // CRC-32 checksum of uncompressed data
+	flags             uint16 // Internal flags state
+
+	// Require mu
+	name       string         // File path within the archive (using forward slashes)
+	mode       fs.FileMode    // Unix-style file permissions and type bits
+	modTime    time.Time      // File modification time (best available precision)
+	hostSystem sys.HostSystem // Operating system that created the file (for attribute mapping)
 
 	// Per-file configuration overriding archive defaults
-	config    FileConfig
-	srcConfig FileConfig
+	config        FileConfig
+	metadata      map[string]interface{} // Platform-specific metadata (NTFS timestamps, etc.)
+	extraField    map[uint16][]byte      // ZIP extra fields for extended functionality
+	extraFieldRaw []byte                 // Raw extra field data
 
-	hasZip64Extra     bool           // True if 0x0001 tag is present in local header or cd
-	flags             uint16         // Internal flags state
-	localHeaderOffset int64          // Byte offset of this file's local header within archive
-	hostSystem        sys.HostSystem // Operating system that created the file (for attribute mapping)
-
-	modTime        time.Time              // File modification time (best available precision)
-	metadata       map[string]interface{} // Platform-specific metadata (NTFS timestamps, etc.)
-	extraField     map[uint16][]byte      // ZIP extra fields for extended functionality
-	extraFieldRaw  []byte                 // Raw extra field data
-	extraParseOnce sync.Once              // Sync for map initialization
+	extraParseOnce sync.Once // Sync for map initialization
+	hasZip64Extra  bool      // True if 0x0001 tag is present in local header or cd
 }
 
 // newFileFromOS creates a File object from an already opened os.File handle.
@@ -232,7 +237,11 @@ func newFileFromFS(fs fs.FS, filePath string, info fs.FileInfo) (*File, error) {
 }
 
 // Name returns the file's path within the ZIP archive.
-func (f *File) Name() string { return f.name }
+func (f *File) Name() string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.name
+}
 
 // IsDir returns true if the file represents a directory entry.
 func (f *File) IsDir() bool { return f.isDir }
@@ -244,16 +253,29 @@ func (f *File) IsImplicit() bool { return f.isImplicit }
 func (f *File) Mode() fs.FileMode { return f.mode }
 
 // UncompressedSize returns the size of the original file content before compression.
-func (f *File) UncompressedSize() int64 { return f.uncompressedSize }
+func (f *File) UncompressedSize() int64 {
+	return atomic.LoadInt64(&f.uncompressedSize)
+}
 
 // CompressedSize returns the size of the compressed data within the archive.
-func (f *File) CompressedSize() int64 { return f.compressedSize }
+func (f *File) CompressedSize() int64 {
+	return atomic.LoadInt64(&f.compressedSize)
+}
+
+// LocalHeaderOffset returns file entry offset inside the archive.
+func (f *File) LocalHeaderOffset() int64 {
+	return atomic.LoadInt64(&f.localHeaderOffset)
+}
 
 // CRC32 returns the CRC-32 checksum of the uncompressed file data.
 func (f *File) CRC32() uint32 { return f.crc32 }
 
 // Config returns archive file entry configuration.
-func (f *File) Config() FileConfig { return f.config }
+func (f *File) Config() FileConfig {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.config
+}
 
 // HostSystem returns the system file was created in.
 func (f *File) HostSystem() sys.HostSystem { return f.hostSystem }
@@ -322,9 +344,17 @@ func (f *File) OpenRaw() (*io.SectionReader, error) {
 	return f.srcFunc()
 }
 
+// SetUncompressed size sets the file uncompressed size atomically.
+func (f *File) SetUncompressedSize(size int64) {
+	atomic.StoreInt64(&f.uncompressedSize, size)
+}
+
 // SetCompression replaces the compression method and level with the specified ones.
 // This does not affect configuration for decompressing file from an existing archive.
 func (f *File) SetCompression(method CompressionMethod, level int) *File {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.config.CompressionMethod = method
 	f.config.CompressionLevel = level
 	return f
@@ -333,6 +363,9 @@ func (f *File) SetCompression(method CompressionMethod, level int) *File {
 // SetEncryption replaces the encryption method and password with the specified ones.
 // This does not affect configuration for decompressing file from an existing archive.
 func (f *File) SetEncryption(method EncryptionMethod, pwd string) *File {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.config.EncryptionMethod = method
 	f.config.Password = pwd
 	return f
@@ -341,6 +374,9 @@ func (f *File) SetEncryption(method EncryptionMethod, pwd string) *File {
 // SetSourcePassword updates the password used to encrypt/decrypt this specific file.
 // If current encryption is [NotEncrypted] it defaults to [AES256].
 func (f *File) SetPassword(pwd string) *File {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.config.EncryptionMethod == NotEncrypted {
 		f.config.EncryptionMethod = AES256
 	}
@@ -352,6 +388,9 @@ func (f *File) SetPassword(pwd string) *File {
 // from the original archive in case if the archive-wide password was incorrect
 // or if different files have different passwords.
 func (f *File) SetSourcePassword(pwd string) *File {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.srcConfig.Password = pwd
 	return f
 }
@@ -359,6 +398,9 @@ func (f *File) SetSourcePassword(pwd string) *File {
 // DisableEncryption sets encryption method to [NotEncrypted] and removes the password for this file.
 // This does not affect configuration for decompressing file from an existing archive.
 func (f *File) DisableEncryption() *File {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.config.EncryptionMethod = NotEncrypted
 	f.config.Password = ""
 	return f
@@ -366,36 +408,51 @@ func (f *File) DisableEncryption() *File {
 
 // SetMode updates the Unix-style file permission bits.
 func (f *File) SetMode(mode fs.FileMode) *File {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.mode = mode
 	return f
 }
 
 // SetModTime sets the file's last modification time.
 func (f *File) SetModTime(modTime time.Time) *File {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.modTime = modTime
 	return f
 }
 
 func (f *File) SetComment(c string) *File {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.config.Comment = c
 	return f
 }
 
 // SetConfig applies a FileConfig to this file, overriding individual properties.
-func (f *File) SetConfig(config FileConfig) *File {
+func (f *File) SetConfig(c FileConfig) *File {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if !f.isDir {
-		f.config.CompressionMethod = config.CompressionMethod
-		f.config.CompressionLevel = config.CompressionLevel
-		f.config.EncryptionMethod = config.EncryptionMethod
-		f.config.Password = config.Password
+		f.config.CompressionMethod = c.CompressionMethod
+		f.config.CompressionLevel = c.CompressionLevel
+		f.config.EncryptionMethod = c.EncryptionMethod
+		f.config.Password = c.Password
 	}
-	f.config.Comment = config.Comment
+	f.config.Comment = c.Comment
 	return f
 }
 
 // SetOpenFunc replaces the function used to open the
 // file's content and sets the size to [SizeUnknown].
 func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) *File {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.srcFunc = nil
 	f.openFunc = openFunc
 	f.uncompressedSize = SizeUnknown
@@ -450,9 +507,17 @@ func (f *File) SetExtraField(tag uint16, data []byte) error {
 
 // RequiresZip64 determines whether this file requires ZIP64 format extensions.
 func (f *File) RequiresZip64() bool {
-	return f.compressedSize > StandardSizeLimit ||
-		f.uncompressedSize > StandardSizeLimit ||
-		f.localHeaderOffset > StandardSizeLimit
+	return f.CompressedSize() > StandardSizeLimit ||
+		f.UncompressedSize() > StandardSizeLimit ||
+		f.LocalHeaderOffset() > StandardSizeLimit
+}
+
+func (f *File) setCompressedSize(size int64) {
+	atomic.StoreInt64(&f.compressedSize, size)
+}
+
+func (f *File) setCRC32(crc uint32) {
+	atomic.StoreUint32(&f.crc32, crc)
 }
 
 // getExtraFieldLength calculates the total size of all extra field entries.
@@ -511,19 +576,121 @@ func (f *File) ensureExtraParsed() {
 	})
 }
 
-// zipHeaders is responsible for generating ZIP format headers from File metadata.
-type zipHeaders struct {
-	file *File
+// FileSnapshot represents an immutable point-in-time copy of File metadata.
+type FileSnapshot struct {
+	file *File // internal reference
+
+	Name       string
+	IsDir      bool
+	Mode       fs.FileMode
+	ModTime    time.Time
+	HostSystem sys.HostSystem
+
+	// Configuration (Snapshot of FileConfig)
+	Config FileConfig
+
+	// State (Values read from atomics at the moment of snapshot)
+	UncompressedSize  int64
+	CompressedSize    int64
+	LocalHeaderOffset int64
+	CRC32             uint32
+	Flags             uint16
+
+	// Extra Fields (Deep copy or flattened representation)
+	Metadata      map[string]interface{}
+	ExtraField    map[uint16][]byte
+	ExtraFieldRaw []byte
 }
 
-func newZipHeaders(f *File) *zipHeaders {
-	return &zipHeaders{file: f}
+// Snapshot creates an immutable copy of the file's metadata.
+func (f *File) Snapshot() *FileSnapshot {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	// Ensure extra fields are parsed before copying
+	f.ensureExtraParsed()
+
+	// Deep copy extra fields to avoid race conditions on map access
+	var extraCopy map[uint16][]byte
+	if f.extraField != nil {
+		extraCopy = make(map[uint16][]byte, len(f.extraField))
+		for k, v := range f.extraField {
+			// Copying the slice content is safer if the original slice is modified
+			// though typically extra fields are replaced, not mutated in place.
+			vCopy := make([]byte, len(v))
+			copy(vCopy, v)
+			extraCopy[k] = vCopy
+		}
+	}
+	var metadata map[string]interface{}
+	if f.metadata != nil {
+		metadataCopy := make(map[string]interface{}, len(f.metadata))
+		for k, v := range f.metadata {
+			metadataCopy[k] = v
+		}
+	}
+
+	snap := &FileSnapshot{
+		file:       f,
+		Name:       f.name,
+		IsDir:      f.isDir,
+		Mode:       f.mode,
+		ModTime:    f.modTime,
+		HostSystem: f.hostSystem,
+
+		Config: f.config,
+
+		UncompressedSize:  atomic.LoadInt64(&f.uncompressedSize),
+		CompressedSize:    atomic.LoadInt64(&f.compressedSize),
+		LocalHeaderOffset: atomic.LoadInt64(&f.localHeaderOffset),
+		CRC32:             atomic.LoadUint32(&f.crc32),
+		Flags:             f.flags,
+
+		Metadata:      metadata,
+		ExtraField:    extraCopy,
+		ExtraFieldRaw: f.extraFieldRaw, // Copy slice header is enough if content is immutable
+	}
+
+	return snap
+}
+
+// RequiresZip64 checks if Zip64 format is needed based on the snapshot values.
+func (s *FileSnapshot) RequiresZip64() bool {
+	return s.CompressedSize > StandardSizeLimit ||
+		s.UncompressedSize > StandardSizeLimit ||
+		s.LocalHeaderOffset > StandardSizeLimit
+}
+
+// ResetEncodeOptions resets file encode options to default
+func (s *FileSnapshot) ResetEncodeOptions() {
+	s.Config.CompressionMethod = Store
+	s.Config.CompressionLevel = 0
+	s.Config.EncryptionMethod = NotEncrypted
+	s.Config.Password = ""
+}
+
+// entryName returns the normalized filename for the header.
+func (s *FileSnapshot) entryName() string {
+	if s.IsDir {
+		return s.Name + "/"
+	}
+	return s.Name
+}
+
+// zipHeaders is responsible for generating ZIP format headers from a FileHeaderSnapshot.
+type zipHeaders struct {
+	snap *FileSnapshot
+}
+
+// newZipHeaders accepts a snapshot instead of a raw File.
+func newZipHeaders(snap *FileSnapshot) *zipHeaders {
+	return &zipHeaders{snap: snap}
 }
 
 // LocalHeader generates the local file header that precedes the file data.
 func (zh *zipHeaders) LocalHeader() internal.LocalFileHeader {
-	dosDate, dosTime := timeToMsDos(zh.file.modTime)
-	filename := zh.file.entryName()
+	dosDate, dosTime := timeToMsDos(zh.snap.ModTime)
+	filename := zh.snap.entryName()
 	localExtra := zh.buildLocalExtraData()
 
 	return internal.LocalFileHeader{
@@ -532,9 +699,9 @@ func (zh *zipHeaders) LocalHeader() internal.LocalFileHeader {
 		CompressionMethod:      zh.getCompressionMethod(),
 		LastModFileTime:        dosTime,
 		LastModFileDate:        dosDate,
-		CRC32:                  zh.file.crc32,
-		CompressedSize:         uint32(min(StandardSizeLimit, zh.file.compressedSize)),
-		UncompressedSize:       uint32(min(StandardSizeLimit, zh.file.uncompressedSize)),
+		CRC32:                  zh.snap.CRC32,
+		CompressedSize:         uint32(min(StandardSizeLimit, zh.snap.CompressedSize)),
+		UncompressedSize:       uint32(min(StandardSizeLimit, zh.snap.UncompressedSize)),
 		FilenameLength:         uint16(len(filename)),
 		ExtraFieldLength:       uint16(len(localExtra)),
 		Filename:               filename,
@@ -544,11 +711,12 @@ func (zh *zipHeaders) LocalHeader() internal.LocalFileHeader {
 
 // CentralDirEntry generates the central directory entry for this file.
 func (zh *zipHeaders) CentralDirEntry() internal.CentralDirectory {
-	dosDate, dosTime := timeToMsDos(zh.file.modTime)
-	filename := zh.file.entryName()
+	dosDate, dosTime := timeToMsDos(zh.snap.ModTime)
+	filename := zh.snap.entryName()
+
 	var extraField []byte
-	if zh.file.extraField == nil {
-		extraField = zh.file.extraFieldRaw
+	if zh.snap.ExtraField == nil {
+		extraField = zh.snap.ExtraFieldRaw
 	} else {
 		extraField = zh.buildExtraFieldBytes()
 	}
@@ -560,53 +728,52 @@ func (zh *zipHeaders) CentralDirEntry() internal.CentralDirectory {
 		CompressionMethod:      zh.getCompressionMethod(),
 		LastModFileTime:        dosTime,
 		LastModFileDate:        dosDate,
-		CRC32:                  zh.file.crc32,
-		CompressedSize:         uint32(min(StandardSizeLimit, zh.file.compressedSize)),
-		UncompressedSize:       uint32(min(StandardSizeLimit, zh.file.uncompressedSize)),
+		CRC32:                  zh.snap.CRC32,
+		CompressedSize:         uint32(min(StandardSizeLimit, zh.snap.CompressedSize)),
+		UncompressedSize:       uint32(min(StandardSizeLimit, zh.snap.UncompressedSize)),
 		FilenameLength:         uint16(len(filename)),
 		ExtraFieldLength:       uint16(len(extraField)),
-		FileCommentLength:      uint16(len(zh.file.config.Comment)),
+		FileCommentLength:      uint16(len(zh.snap.Config.Comment)),
 		DiskNumberStart:        0,
 		InternalFileAttributes: 0,
 		ExternalFileAttributes: zh.getExternalFileAttributes(),
-		LocalHeaderOffset:      uint32(min(StandardSizeLimit, zh.file.localHeaderOffset)),
+		LocalHeaderOffset:      uint32(min(StandardSizeLimit, zh.snap.LocalHeaderOffset)),
 		Filename:               filename,
 		ExtraField:             extraField,
-		Comment:                zh.file.config.Comment,
+		Comment:                zh.snap.Config.Comment,
 	}
 }
 
 func (zh *zipHeaders) getVersionNeededToExtract() uint16 {
-	if zh.file.config.CompressionMethod == LZMA {
+	if zh.snap.Config.CompressionMethod == LZMA {
 		return 63
 	}
-	if zh.file.config.EncryptionMethod == AES256 {
+	if zh.snap.Config.EncryptionMethod == AES256 {
 		return 51
 	}
-	if zh.file.config.CompressionMethod == BZIP2 {
+	if zh.snap.Config.CompressionMethod == BZIP2 {
 		return 46
 	}
-	if zh.file.RequiresZip64() {
+	if zh.snap.RequiresZip64() {
 		return 45
 	}
-	if zh.file.config.CompressionMethod == Deflate64 {
+	if zh.snap.Config.CompressionMethod == Deflate64 {
 		return 21
 	}
-	if zh.file.config.CompressionMethod == Deflate {
+	if zh.snap.Config.CompressionMethod == Deflate {
 		return 20
 	}
-	if zh.file.isDir || strings.Contains(zh.file.name, "/") {
+	if zh.snap.IsDir || strings.Contains(zh.snap.Name, "/") {
 		return 20
 	}
-	if zh.file.config.EncryptionMethod == ZipCrypto {
+	if zh.snap.Config.EncryptionMethod == ZipCrypto {
 		return 20
 	}
 	return 10
 }
 
 func (zh *zipHeaders) getVersionMadeBy() uint16 {
-	fs := zh.file.hostSystem
-	// Normalize NTFS to FAT for broader compatibility if needed
+	fs := zh.snap.HostSystem
 	if fs == sys.HostSystemNTFS {
 		fs = sys.HostSystemFAT
 	}
@@ -614,45 +781,40 @@ func (zh *zipHeaders) getVersionMadeBy() uint16 {
 }
 
 func (zh *zipHeaders) getFileBitFlag() uint16 {
-	flag := zh.file.flags
+	flag := zh.snap.Flags
 
-	if zh.file.config.EncryptionMethod != NotEncrypted {
+	if zh.snap.Config.EncryptionMethod != NotEncrypted {
 		flag |= 0x1
 	}
 
-	if zh.file.config.CompressionMethod == Deflate && zh.file.uncompressedSize != 0 {
+	if zh.snap.Config.CompressionMethod == Deflate && zh.snap.UncompressedSize != 0 {
 		flag |= zh.getCompressionLevelBits()
 	}
 
-	// Always set Bit 11 (Language encoding flag / EFS)
-	// This indicates that Filename and Comment are encoded in UTF-8.
-	// Go strings are always UTF-8, so this is technically always correct
-	// and ensures compatibility with modern archivers (WinRAR, 7-Zip, macOS).
-	flag |= 0x800
-
+	flag |= 0x800 // UTF-8 flag
 	return flag
 }
 
 func (zh *zipHeaders) getCompressionMethod() uint16 {
-	if zh.file.uncompressedSize == 0 {
+	if zh.snap.UncompressedSize == 0 {
 		return uint16(Store)
 	}
-	if zh.file.config.EncryptionMethod == AES256 {
+	if zh.snap.Config.EncryptionMethod == AES256 {
 		return winZipAESMarker
 	}
-	return uint16(zh.file.config.CompressionMethod)
+	return uint16(zh.snap.Config.CompressionMethod)
 }
 
 func (zh *zipHeaders) getExternalFileAttributes() uint32 {
 	var externalAttrs uint32
 
-	switch zh.file.hostSystem {
+	switch zh.snap.HostSystem {
 	case sys.HostSystemUNIX, sys.HostSystemDarwin:
-		mode := uint32(zh.file.mode & fs.ModePerm)
+		mode := uint32(zh.snap.Mode & fs.ModePerm)
 		switch {
-		case zh.file.isDir:
+		case zh.snap.IsDir:
 			mode |= sys.S_IFDIR
-		case zh.file.mode&fs.ModeSymlink != 0:
+		case zh.snap.Mode&fs.ModeSymlink != 0:
 			mode |= sys.S_IFLNK
 		default:
 			mode |= sys.S_IFREG
@@ -660,20 +822,20 @@ func (zh *zipHeaders) getExternalFileAttributes() uint32 {
 		externalAttrs = mode << 16
 
 	case sys.HostSystemFAT, sys.HostSystemNTFS:
-		if zh.file.isDir {
-			externalAttrs |= 0x10 // DOS Directory
+		if zh.snap.IsDir {
+			externalAttrs |= 0x10
 		} else {
-			externalAttrs |= 0x20 // DOS Archive
+			externalAttrs |= 0x20
 		}
-		if zh.file.mode&0200 == 0 {
-			externalAttrs |= 0x01 // DOS ReadOnly
+		if zh.snap.Mode&0200 == 0 {
+			externalAttrs |= 0x01 // ReadOnly
 		}
 	}
 	return externalAttrs
 }
 
 func (zh *zipHeaders) getCompressionLevelBits() uint16 {
-	level := zh.file.config.CompressionLevel
+	level := zh.snap.Config.CompressionLevel
 	if level == 0 {
 		level = DeflateNormal
 	}
@@ -692,27 +854,33 @@ func (zh *zipHeaders) getCompressionLevelBits() uint16 {
 func (zh *zipHeaders) buildLocalExtraData() []byte {
 	var buf []byte
 
-	// ZIP64: Only if dimensions exceed 32-bit (Local Header specific version)
-	if zh.file.uncompressedSize > StandardSizeLimit || zh.file.compressedSize > StandardSizeLimit {
-		buf = append(buf, internal.EncodeZip64LocalExtraField(zh.file.uncompressedSize, zh.file.compressedSize)...)
+	if zh.snap.UncompressedSize > StandardSizeLimit || zh.snap.CompressedSize > StandardSizeLimit {
+		buf = append(buf, internal.EncodeZip64LocalExtraField(zh.snap.UncompressedSize, zh.snap.CompressedSize)...)
 	}
 
-	// AES Encryption
-	if zh.file.config.EncryptionMethod == AES256 {
-		buf = append(buf, internal.EncodeAESExtraField(uint16(zh.file.config.CompressionMethod))...)
+	if zh.snap.Config.EncryptionMethod == AES256 {
+		buf = append(buf, internal.EncodeAESExtraField(uint16(zh.snap.Config.CompressionMethod))...)
 	}
 
 	return buf
 }
 
 func (zh *zipHeaders) buildExtraFieldBytes() []byte {
-	if zh.file.extraField == nil {
-		return zh.file.extraFieldRaw
+	// Works with snapshot's pre-copied map
+	if len(zh.snap.ExtraField) == 0 {
+		return nil
 	}
+
+	// Deterministic sorting is still needed for binary stability
+	keys := make([]uint16, 0, len(zh.snap.ExtraField))
+	for key := range zh.snap.ExtraField {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
 	var buf []byte
-	sorted := getSortedExtraField(zh.file.extraField)
-	for _, b := range sorted {
-		buf = append(buf, b...)
+	for _, key := range keys {
+		buf = append(buf, zh.snap.ExtraField[key]...)
 	}
 	return buf
 }

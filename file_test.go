@@ -182,7 +182,7 @@ func TestFile_ExtraFields(t *testing.T) {
 	f.SetExtraField(tag2, data2)
 
 	// Force parse/build via private method access (since we are in same package)
-	headers := newZipHeaders(f)
+	headers := newZipHeaders(f.Snapshot())
 	rawBytes := headers.buildExtraFieldBytes()
 
 	// Parse manually to verify order
@@ -309,7 +309,7 @@ func TestZipHeaders_AttributesAndFlags(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newZipHeaders(tt.file)
+			h := newZipHeaders(tt.file.Snapshot())
 			lh := h.LocalHeader()
 			cd := h.CentralDirEntry()
 
@@ -338,7 +338,7 @@ func TestZipHeaders(t *testing.T) {
 		},
 	}
 
-	headers := newZipHeaders(file)
+	headers := newZipHeaders(file.Snapshot())
 	localHeader := headers.LocalHeader()
 
 	if localHeader.CompressionMethod != uint16(Deflate) {
@@ -357,7 +357,7 @@ func TestZipHeaders_Directory(t *testing.T) {
 		isDir: true,
 	}
 
-	headers := newZipHeaders(file)
+	headers := newZipHeaders(file.Snapshot())
 	localHeader := headers.LocalHeader()
 
 	// "archive/docs" + "/" = 13 bytes
@@ -488,7 +488,7 @@ func TestIntegration_FileToHeaders(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// 1. Create headers using the logic in file.go
-			h := newZipHeaders(tt.file)
+			h := newZipHeaders(tt.file.Snapshot())
 
 			// 2. Encode Local Header
 			localEncoded := h.LocalHeader().Encode()

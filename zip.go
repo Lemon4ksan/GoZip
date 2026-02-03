@@ -496,13 +496,13 @@ func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...Add
 //     (e.g. database connections) inside the closure or after WriteTo finishes.
 //
 // Returns [ErrFileEntry] if an invalid name is passed.
-func (z *Zip) AddLazy(name string, openFunc func() (io.ReadCloser, error), options ...AddOption) error {
+func (z *Zip) AddLazy(name string, openFunc func() (io.ReadCloser, error), options ...AddOption) (*File, error) {
 	fileEntry, err := newFileFromReader(io.LimitReader(nil, 0), name, SizeUnknown)
 	if err != nil {
-		return wrapErr("add", nil, err)
+		return nil, wrapErr("add", nil, err)
 	}
 	fileEntry.openFunc = openFunc
-	return wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
+	return fileEntry, wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
 }
 
 // AddBytes creates a file from a byte slice.
@@ -890,17 +890,17 @@ func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, opts ...Op
 //
 // Errors:
 //   - Returns [ErrFormat] if the source is not a valid ZIP archive.
-func (z *Zip) Load(src io.ReaderAt, size int64) error {
+func (z *Zip) Load(src io.ReaderAt, size int64) ([]*File, error) {
 	return z.LoadWithContext(context.Background(), src, size)
 }
 
 // LoadWithContext parses an archive with context support.
 // Cancelling the context stops processing the remaining files.
-func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) error {
+func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) ([]*File, error) {
 	reader := newZipReader(src, size, z.decompressors, z.config)
 	eocd, err := reader.FindAndReadEOCD(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if z.config.Comment == "" {
@@ -909,7 +909,7 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 
 	files, err := reader.ReadFiles(ctx, eocd)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	z.mu.Lock()
@@ -944,21 +944,21 @@ func (z *Zip) LoadWithContext(ctx context.Context, src io.ReaderAt, size int64) 
 		errs = append(errs, err)
 	}
 
-	return errors.Join(errs...)
+	return files, errors.Join(errs...)
 }
 
 // LoadFromFile parses a ZIP from a local os.File.
 // See [Zip.Load] for for full documentation.
-func (z *Zip) LoadFromFile(f *os.File) error {
+func (z *Zip) LoadFromFile(f *os.File) ([]*File, error) {
 	return z.LoadFromFileWithContext(context.Background(), f)
 }
 
 // LoadFromFile parses a ZIP from a local os.File with context support.
 // See [Zip.LoadWithContext] for for full documentation.
-func (z *Zip) LoadFromFileWithContext(ctx context.Context, f *os.File) error {
+func (z *Zip) LoadFromFileWithContext(ctx context.Context, f *os.File) ([]*File, error) {
 	stat, err := f.Stat()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	return z.LoadWithContext(ctx, f, stat.Size())
 }
@@ -1084,9 +1084,6 @@ func (z *Zip) execSequentialExtract(
 			if ctx.Err() != nil {
 				break
 			}
-			if errors.Is(err, ErrPasswordMismatch) {
-				f.config.Password = ""
-			}
 			errs = append(errs, wrapErr("extract", f, err))
 		}
 		collector.OnFileDone(f, err)
@@ -1151,9 +1148,6 @@ func (z *Zip) execParallelExtract(
 			if err != nil {
 				if ctx.Err() == nil {
 					errChan <- wrapErr("extract", f, err)
-				}
-				if errors.Is(err, ErrPasswordMismatch) {
-					f.config.Password = ""
 				}
 			}
 			collector.OnFileDone(f, err)

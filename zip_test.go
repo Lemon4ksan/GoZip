@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lemon4ksan/gozip"
 )
@@ -99,7 +100,7 @@ func TestRoundTrip_AES256(t *testing.T) {
 	readArchive := gozip.NewZip()
 	readArchive.SetConfig(gozip.ZipConfig{Password: password})
 
-	if err := readArchive.Load(bytes.NewReader(buf.Bytes()), int64(buf.Len())); err != nil {
+	if _, err := readArchive.Load(bytes.NewReader(buf.Bytes()), int64(buf.Len())); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 
@@ -169,6 +170,108 @@ func verifyZipContent(t *testing.T, data []byte, expectedFiles map[string]string
 			t.Errorf("Content mismatch for %s", f.Name)
 		}
 	}
+}
+
+// --- Race condition tests ---
+
+func TestParallelWriteRace(t *testing.T) {
+	archive := gozip.NewZip()
+
+	content := "Some repeatable content for compression testing"
+
+	for i := range 5 {
+		name := fmt.Sprintf("file_%d.txt", i)
+
+		f, err := archive.AddLazy(name, func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(content)), nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.SetUncompressedSize(int64(len(content)))
+	}
+
+	const (
+		writersCount = 20
+		repeatCount  = 50
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(writersCount + 1)
+
+	go func() {
+		defer wg.Done()
+		for i := range repeatCount {
+			for j := range 5 {
+				name := fmt.Sprintf("file_%d.txt", j)
+				if f, ok := archive.File(name); ok {
+					f.SetPassword(fmt.Sprintf("pass_%d", i)).
+						SetComment(fmt.Sprintf("comment_%d", i))
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	for i := range writersCount {
+		go func(id int) {
+			defer wg.Done()
+
+			_, err := archive.WriteTo(io.Discard,
+				gozip.WithWorkers(runtime.NumCPU()),
+				gozip.WithProgress(func(s gozip.ProgressStats) {
+					_ = s.TotalRead
+					_ = s.CurrentFile
+				}))
+
+			if err != nil {
+				t.Errorf("Writer %d failed: %v", id, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+func TestParallelExtractRace(t *testing.T) {
+	archive := gozip.NewZip()
+	content := "content"
+
+	f, err := archive.AddLazy("test.txt", func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(content)), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.SetPassword("secret").SetUncompressedSize(int64(len(content)))
+
+	const count = 10
+	var wg sync.WaitGroup
+	wg.Add(count)
+
+	for range count {
+		go func() {
+			defer wg.Done()
+
+			fileRef, ok := archive.File("test.txt")
+			if !ok {
+				t.Error("File not found")
+				return
+			}
+
+			rc, err := fileRef.Open()
+			if err != nil {
+				t.Errorf("Open failed: %v", err)
+				return
+			}
+			defer rc.Close()
+
+			if _, err := io.Copy(io.Discard, rc); err != nil {
+				t.Errorf("Copy failed: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // --- Benchmarks ---
@@ -368,7 +471,7 @@ func BenchmarkLoad_GoZip(b *testing.B) {
 			b.Fatal(err)
 		}
 		// GoZip Load reads and parses Central Directory completely
-		if err := archive.Load(f, testZipSize); err != nil {
+		if _, err := archive.Load(f, testZipSize); err != nil {
 			b.Fatal(err)
 		}
 		f.Close()

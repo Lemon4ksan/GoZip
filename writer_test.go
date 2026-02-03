@@ -54,7 +54,7 @@ func TestZipWriter_WriteFileHeader(t *testing.T) {
 			mw := NewMemoryWriteSeeker()
 			zw := newZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw)
 
-			err := zw.writeFileHeader(tt.file)
+			err := zw.writeFileHeader(tt.file.Snapshot())
 
 			if (err != nil) != tt.wantErr {
 				t.Errorf("WriteFileHeader() error = %v, wantErr %v", err, tt.wantErr)
@@ -211,7 +211,7 @@ func TestZipWriter_UpdateLocalHeader(t *testing.T) {
 	zw := newZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw)
 
 	// 1. Write initial header
-	err := zw.writeFileHeader(file)
+	err := zw.writeFileHeader(file.Snapshot())
 	if err != nil {
 		t.Fatalf("WriteFileHeader() error = %v", err)
 	}
@@ -220,7 +220,7 @@ func TestZipWriter_UpdateLocalHeader(t *testing.T) {
 	mw.Write(make([]byte, 100))
 
 	// 3. Update header
-	err = zw.updateLocalHeader(file)
+	err = zw.updateLocalHeader(file.Snapshot())
 	if err != nil {
 		t.Errorf("UpdateLocalHeader() error = %v", err)
 	}
