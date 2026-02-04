@@ -42,7 +42,7 @@
 // Plain wrapped errors are used for global archive issues.
 // Example:
 //
-//	err := archive.AddFile("data/report.pdf")
+//	_, err := archive.AddFile("data/report.pdf")
 //	if err != nil {
 //	    var fileErr *gozip.FileError
 //	    if errors.As(err, &fileErr) {
@@ -73,9 +73,8 @@
 //	archive.Remove("logs/obsolete.log")
 //
 //	// 2. Modify a file
-//	file, _ := archive.File("data/config.json")
-//	archive.Remove(file.Name())
-//	archive.AddLazy(file.Name(), func() (io.ReadCloser, error) {
+//	files, _ := archive.Remove("data/config.json")
+//	archive.AddLazy(files[0].Name(), func() (io.ReadCloser, error) {
 //		pr, pw := io.Pipe()
 //		go func() {
 //			defer pw.Close()
@@ -258,12 +257,6 @@ type decompressorsMap map[CompressionMethod]Decompressor
 
 // Zip represents an in-memory ZIP archive manager.
 // It is concurrency-safe and supports streaming, random access, and parallel operations.
-//
-// Thread Safety:
-//   - Methods like AddFile, Remove, Exists, File are safe to call concurrently.
-//   - However, modifying the archive (Add/Remove) while simultaneously writing it
-//     (WriteTo) is NOT supported and may lead to unpredictable results.
-//     Finish all modifications before calling WriteTo.
 type Zip struct {
 	mu            sync.RWMutex     // Guards files, fileCache, and config
 	config        ZipConfig        // Global settings
@@ -543,41 +536,43 @@ func (z *Zip) Mkdir(name string, options ...AddOption) (*File, error) {
 //     matched the provided name.
 //
 // Complexity: O(N) where N is the total number of files in the archive.
-func (z *Zip) Remove(name string) error {
+func (z *Zip) Remove(name string) ([]*File, error) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 
 	if name == "" || name == "." {
 		if len(z.files) == 0 {
-			return nil
+			return nil, nil
 		}
+		files := z.Files()
 		z.files = z.files[:0]
 		clear(z.lookup)
-		return nil
+		return files, nil
 	}
 
 	cleanName := z.normalizePath(name)
 	dirPrefix := cleanName + "/"
 
-	var n, deletedCount int
-	for _, f := range z.files {
-		fName := f.entryName()
+	var deleted []*File
+	var n int
+	for _, file := range z.files {
+		fName := file.entryName()
 
 		isExactMatch := fName == cleanName || fName == dirPrefix
 		isChild := strings.HasPrefix(fName, dirPrefix)
 
 		if isExactMatch || isChild {
+			deleted = append(deleted, file)
 			delete(z.lookup, fName)
-			deletedCount++
 			continue
 		}
 
-		z.files[n] = f
+		z.files[n] = file
 		n++
 	}
 
-	if deletedCount == 0 {
-		return wrapErr("remove", nil, fmt.Errorf("%w: '%s'", ErrFileNotFound, name))
+	if len(deleted) == 0 {
+		return nil, wrapErr("remove", nil, fmt.Errorf("%w: '%s'", ErrFileNotFound, name))
 	}
 
 	for i := n; i < len(z.files); i++ {
@@ -586,7 +581,7 @@ func (z *Zip) Remove(name string) error {
 
 	z.files = z.files[:n]
 
-	return nil
+	return deleted, nil
 }
 
 // Rename changes the name of an entry while preserving its current directory location.
@@ -828,13 +823,13 @@ func (z *Zip) Find(pattern string) ([]*File, error) {
 //   - For memory-constrained environments, reduce maxWorkers or MemoryThreshold.
 //
 // Returns the total number of bytes written.
-func (z *Zip) WriteTo(dest io.Writer, opts ...Option) (int64, error) {
+func (z *Zip) WriteTo(dest io.Writer, opts ...ZipOption) (int64, error) {
 	return z.WriteToWithContext(context.Background(), dest, opts...)
 }
 
 // WriteToWithContext writes the archive with context support.
 // Cancelling the context stops processing the remaining files and results in a valid archive.
-func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, opts ...Option) (int64, error) {
+func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, opts ...ZipOption) (int64, error) {
 	cfg := z.applyOptions(opts)
 	files := z.applyFilters(z.Files(), cfg.filters)
 	files = SortFilesOptimized(files, z.config.FileSortStrategy)
@@ -980,20 +975,17 @@ func (z *Zip) LoadFromFileWithContext(ctx context.Context, f *os.File) ([]*File,
 //   - Recommended for SSDs or systems with high I/O throughput.
 //   - faster than [Zip.ExtractTo] for archives with many encrypted or compressed files
 //     due to parallel CPU decryption/decompression.
-func (z *Zip) ExtractTo(path string, opts ...Option) error {
+func (z *Zip) ExtractTo(path string, opts ...ZipOption) error {
 	return z.ExtractToWithContext(context.Background(), path, opts...)
 }
 
 // ExtractToWithContext extracts files with context support.
 // Context cancellation stops the extraction process.
-func (z *Zip) ExtractToWithContext(ctx context.Context, path string, opts ...Option) error {
+func (z *Zip) ExtractToWithContext(ctx context.Context, path string, opts ...ZipOption) error {
 	path = filepath.Clean(path)
 	cfg := z.applyOptions(opts)
 	files := z.applyFilters(z.Files(), cfg.filters)
 	sortAlphabetical(files)
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 
 	collector := newStatsCollector(cfg, files, nil)
 
@@ -1509,7 +1501,7 @@ func (z *Zip) extractFile(ctx context.Context, f *File, path string, onRead, onW
 	return nil
 }
 
-func (z *Zip) applyOptions(opts []Option) processConfig {
+func (z *Zip) applyOptions(opts []ZipOption) processConfig {
 	cfg := processConfig{}
 	if cfg.onFileDone != nil {
 		cfg.onFileDone = z.config.OnFileDone

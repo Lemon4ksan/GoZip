@@ -2,7 +2,6 @@ package gozip
 
 import (
 	"io"
-	"io/fs"
 	"path"
 	"strings"
 	"sync/atomic"
@@ -71,14 +70,6 @@ func WithPath(p string) AddOption {
 	}
 }
 
-// WithMode sets the Unix-style permission bits.
-// This affects the external attributes field in the ZIP header.
-func WithMode(mode fs.FileMode) AddOption {
-	return func(f *File) {
-		f.mode = mode
-	}
-}
-
 type processConfig struct {
 	filters    []Filter
 	workers    int
@@ -86,10 +77,10 @@ type processConfig struct {
 	onFileDone func(*File, error)
 }
 
-type Option func(*processConfig)
+type ZipOption func(*processConfig)
 
 // WithWorkers sets the given amount of workers for the operation.
-func WithWorkers(n int) Option {
+func WithWorkers(n int) ZipOption {
 	return func(pc *processConfig) {
 		if n <= 0 {
 			pc.workers = 1
@@ -100,14 +91,14 @@ func WithWorkers(n int) Option {
 }
 
 // WithOnFileDone overrides global [ZipConfig.OnFileDone]
-func WithOnFileDone(fn func(*File, error)) Option {
+func WithOnFileDone(fn func(*File, error)) ZipOption {
 	return func(pc *processConfig) {
 		pc.onFileDone = fn
 	}
 }
 
 // WithFilter allows using any custom [Filter] as an option.
-func WithFilter(f Filter) Option {
+func WithFilter(f Filter) ZipOption {
 	return func(c *processConfig) {
 		if f != nil {
 			c.filters = append(c.filters, f)
@@ -124,7 +115,7 @@ func WithFiles(files []*File) Filter {
 }
 
 // FromDir restricts operation to files nested under the specified path.
-func FromDir(dirPath string) Option {
+func FromDir(dirPath string) ZipOption {
 	return func(pc *processConfig) {
 		pc.filters = append(pc.filters, func(files []*File) []*File {
 			if dirPath == "" || dirPath == "." {
@@ -156,7 +147,7 @@ func FromDir(dirPath string) Option {
 }
 
 // WithoutDir excludes a directory and its contents from operation.
-func WithoutDir(dirPath string) Option {
+func WithoutDir(dirPath string) ZipOption {
 	return func(pc *processConfig) {
 		pc.filters = append(pc.filters, func(files []*File) []*File {
 			if dirPath == "" || dirPath == "." {
@@ -207,7 +198,7 @@ var DefaultStoreExtensions = map[string]struct{}{
 // WithSmartStore disables compression for files whose extensions are in the list.
 // Passed extensions are merged with [DefaultStoreExtensions].
 // This filter changes the state of [File] objects in the archive.
-func WithSmartStore(exts ...string) Option {
+func WithSmartStore(exts ...string) ZipOption {
 	extMap := make(map[string]struct{}, len(DefaultStoreExtensions)+len(exts))
 	for k := range DefaultStoreExtensions {
 		extMap[k] = struct{}{}
@@ -236,7 +227,7 @@ type Predicate func(*File) bool
 
 // Where returns a filtering option based on an arbitrary condition.
 // This is the most flexible way to select files.
-func Where(cond Predicate) Option {
+func Where(cond Predicate) ZipOption {
 	return WithFilter(func(files []*File) []*File {
 		n := 0
 		for _, f := range files {
@@ -267,7 +258,7 @@ type ProgressStats struct {
 }
 
 // WithProgress adds a callback to monitor bytes in real time.
-func WithProgress(cb func(ProgressStats)) Option {
+func WithProgress(cb func(ProgressStats)) ZipOption {
 	return func(c *processConfig) {
 		c.onProgress = cb
 	}

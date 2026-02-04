@@ -884,21 +884,3 @@ func (zh *zipHeaders) buildExtraFieldBytes() []byte {
 	}
 	return buf
 }
-
-// getSortedExtraField returns a sorted slice of extra fields for deterministic writes.
-func getSortedExtraField(extraField map[uint16][]byte) [][]byte {
-	if len(extraField) == 0 {
-		return nil
-	}
-	keys := make([]uint16, 0, len(extraField))
-	for key := range extraField {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-
-	fields := make([][]byte, len(extraField))
-	for i, key := range keys {
-		fields[i] = extraField[key]
-	}
-	return fields
-}
