@@ -554,9 +554,6 @@ func StreamWithDecoder(d TextDecoder) StreamOption {
 
 // NewStreamReader returns a new StreamReader reading from source.
 func NewStreamReader(src io.Reader, options ...StreamOption) *StreamReader {
-	globalMu.RLock()
-	defer globalMu.RUnlock()
-
 	r := &StreamReader{
 		readerBase: newReaderBase(nil, ZipConfig{}),
 		src:        src,
@@ -564,9 +561,6 @@ func NewStreamReader(src io.Reader, options ...StreamOption) *StreamReader {
 	}
 	for _, opt := range options {
 		opt(r)
-	}
-	for k, v := range globalDecompressors {
-		r.decompressors[k] = v
 	}
 	return r
 }
@@ -705,7 +699,7 @@ func (sr *StreamReader) Open() (io.ReadCloser, error) {
 
 // OpenRaw returns an [io.Reader] for reading the raw content
 // (compressed and/or encrypted) directly from the currently opened file.
-// If the file is encrypted (AES), the reader includes Salt, PVV, and MAC bytes.
+// If the file is encrypted ([AES256]), the reader includes Salt, PVV, and MAC bytes.
 func (sr *StreamReader) OpenRaw() (io.Reader, error) {
 	if sr.curFile == nil {
 		return nil, errors.New("no current file")

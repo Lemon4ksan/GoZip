@@ -128,27 +128,6 @@ import (
 	"time"
 )
 
-// Global codecs registry
-var (
-	globalFactories     = make(map[CompressionMethod]CompressorFactory)
-	globalDecompressors = make(map[CompressionMethod]Decompressor)
-	globalMu            sync.RWMutex
-)
-
-// RegisterCompressor registers a compressor at the global level.
-func RegisterCompressor(method CompressionMethod, factory CompressorFactory) {
-	globalMu.Lock()
-	defer globalMu.Unlock()
-	globalFactories[method] = factory
-}
-
-// RegisterDecompressor registers a decompressor at the global level.
-func RegisterDecompressor(method CompressionMethod, d Decompressor) {
-	globalMu.Lock()
-	defer globalMu.Unlock()
-	globalDecompressors[method] = d
-}
-
 // SizeUnknown is a sentinel value used when the data size
 // cannot be determined before writing (e.g., streaming from [io.Reader]).
 const SizeUnknown int64 = -1
@@ -270,10 +249,7 @@ type Zip struct {
 // NewZip creates a ready-to-use empty ZIP archive.
 // Default support includes [Store] (No Compression) and [Deflate].
 func NewZip() *Zip {
-	globalMu.RLock()
-	defer globalMu.RUnlock()
-
-	z := &Zip{
+	return &Zip{
 		files:         make([]*File, 0),
 		lookup:        make(map[string]*File),
 		factories:     make(factoriesMap),
@@ -285,13 +261,6 @@ func NewZip() *Zip {
 			},
 		},
 	}
-	for k, v := range globalFactories {
-		z.factories[k] = v
-	}
-	for k, v := range globalDecompressors {
-		z.decompressors[k] = v
-	}
-	return z
 }
 
 // Config returns current global zip configuration.
@@ -958,6 +927,39 @@ func (z *Zip) LoadFromFileWithContext(ctx context.Context, f *os.File) ([]*File,
 	return z.LoadWithContext(ctx, f, stat.Size())
 }
 
+// Verify checks the integrity of the archive files.
+// It decompresses every file and verifies checksums/MACs without writing to disk.
+func (z *Zip) Verify(opts ...ZipOption) error {
+	return z.VerifyWithContext(context.Background(), opts...)
+}
+
+// VerifyWithContext checks integrity with context cancellation.
+func (z *Zip) VerifyWithContext(ctx context.Context, opts ...ZipOption) error {
+	cfg := z.applyOptions(opts)
+	files := z.applyFilters(z.Files(), cfg.filters)
+
+	if len(files) == 0 {
+		return nil
+	}
+
+	collector := newStatsCollector(cfg, files, nil)
+
+	var errs []error
+	if workers := z.getWorkers(cfg, files); workers > 0 {
+		errs = z.execParallelVerify(ctx, files, workers, collector)
+	} else {
+		errs = z.execSequentialVerify(ctx, files, collector)
+	}
+
+	collector.Finish()
+
+	if err := ctx.Err(); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
+}
+
 // ExtractTo unpacks the archive to the specified destination directory using "Best Effort" strategy.
 //
 // Security (Zip Slip):
@@ -1030,6 +1032,64 @@ func (z *Zip) execParallelWrite(ctx context.Context, files []*File, writer *zipW
 	pzw := newParallelZipWriter(writer, workers)
 	pzw.onFileDone = onFileDone
 	return pzw.WriteFiles(ctx, files)
+}
+
+func (z *Zip) execSequentialVerify(ctx context.Context, files []*File, collector *statsCollector) []error {
+	var errs []error
+	for _, f := range files {
+		if ctx.Err() != nil {
+			break
+		}
+		err := z.verifySingleFile(f, collector.OnRead)
+		if err != nil {
+			errs = append(errs, wrapErr("verify", f, err))
+		}
+		collector.OnFileDone(f, err)
+	}
+	return errs
+}
+
+func (z *Zip) execParallelVerify(ctx context.Context, files []*File, workers int, collector *statsCollector) []error {
+	sem := make(chan struct{}, workers)
+	errChan := make(chan error, len(files))
+	var wg sync.WaitGroup
+
+	for _, f := range files {
+		if ctx.Err() != nil {
+			errChan <- ctx.Err()
+			break
+		}
+
+		sem <- struct{}{}
+		wg.Add(1)
+
+		go func(file *File) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+
+			if ctx.Err() != nil {
+				return
+			}
+
+			err := z.verifySingleFile(file, collector.OnRead)
+			if err != nil {
+				errChan <- wrapErr("verify", f, err)
+			}
+			collector.OnFileDone(file, err)
+		}(f)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	var errs []error
+	for err := range errChan {
+		errs = append(errs, err)
+	}
+
+	return errs
 }
 
 func (z *Zip) execSequentialExtract(
@@ -1439,7 +1499,12 @@ func (z *Zip) verifySingleFile(f *File, onRead signalFunc) error {
 		return err
 	}
 
-	return rc.Close()
+	err = rc.Close()
+	if errors.Is(err, ErrChecksum) && f.srcConfig.EncryptionMethod == AES256 {
+		// AES256 doesn't store file CRC, because it uses the MAC for integrity
+		return nil
+	}
+	return err
 }
 
 // extractFile handles low-level extraction logic.
