@@ -39,7 +39,7 @@ func newZipWriter(config ZipConfig, factories factoriesMap, dest io.Writer) *zip
 		dest:        dest,
 		config:      config,
 		factories:   factories,
-		compressors: make(map[compressorKey]Compressor),
+		compressors: make(compressorsMap),
 		centralDir:  newSpillBuffer(),
 	}
 }
@@ -546,7 +546,7 @@ func (zw *zipWriter) resolveCompressor(method CompressionMethod, level int) (Com
 		// Fallback to built-in methods
 		switch method {
 		case Store:
-			comp = new(StoredCompressor)
+			comp = new(storeCompressor)
 		case Deflate:
 			comp = NewDeflateCompressor(level)
 		default:

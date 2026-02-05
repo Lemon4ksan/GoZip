@@ -34,22 +34,6 @@ const (
 	DeflateStore     = flate.NoCompression // 0
 )
 
-// StoredCompressor implements the Store method (no compression).
-type StoredCompressor struct{}
-
-func (sc *StoredCompressor) Compress(src io.Reader, dest io.Writer) (int64, error) {
-	// io.Copy uses io.WriterTo if available, making this efficient
-	return io.Copy(dest, src)
-}
-
-// StoredDecompressor implements the Store method (no compression).
-type StoredDecompressor struct{}
-
-func (sd *StoredDecompressor) Decompress(src io.Reader) (io.ReadCloser, error) {
-	// We don't own src and shouldn't give the caller the ability to close it
-	return io.NopCloser(src), nil
-}
-
 // DeflateCompressor implements DEFLATE compression with memory pooling.
 type DeflateCompressor struct {
 	writers sync.Pool
@@ -57,7 +41,7 @@ type DeflateCompressor struct {
 }
 
 // NewDeflateCompressor creates a reusable compressor for a specific level.
-func NewDeflateCompressor(level int) *DeflateCompressor {
+func NewDeflateCompressor(level int) Compressor {
 	if level < flate.HuffmanOnly || level > flate.BestCompression {
 		level = flate.DefaultCompression
 	}
@@ -113,4 +97,24 @@ func (dd *DeflateDecompressor) Decompress(src io.Reader) (io.ReadCloser, error) 
 	// flate.NewReader returns an io.ReadCloser.
 	// The Close() method of the returned reader does not close the underlying src.
 	return flate.NewReader(src), nil
+}
+
+// storeCompressor implements the Store method (no compression).
+type storeCompressor struct{}
+
+func (sc *storeCompressor) Compress(src io.Reader, dest io.Writer) (int64, error) {
+	// io.Copy uses io.WriterTo if available, making this efficient
+	return io.Copy(dest, src)
+}
+
+func newStoreCompressor(_ int) Compressor {
+	return &storeCompressor{}
+}
+
+// storeDecompressor implements the Store method (no compression).
+type storeDecompressor struct{}
+
+func (sd *storeDecompressor) Decompress(src io.Reader) (io.ReadCloser, error) {
+	// We don't own src and shouldn't give the caller the ability to close it
+	return io.NopCloser(src), nil
 }

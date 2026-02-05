@@ -110,8 +110,10 @@ func WithFilter(f Filter) ZipOption {
 type Filter func(files []*File) []*File
 
 // WithFiles filters the operation to only the specific files provided.
-func WithFiles(files []*File) Filter {
-	return func(_ []*File) []*File { return files }
+func WithFiles(files []*File) ZipOption {
+	return func(pc *processConfig) {
+		pc.filters = append(pc.filters, func(_ []*File) []*File { return files })
+	}
 }
 
 // FromDir restricts operation to files nested under the specified path.
@@ -258,6 +260,7 @@ type ProgressStats struct {
 }
 
 // WithProgress adds a callback to monitor bytes in real time.
+// If operation uses workers, this progress is called concurrently.
 func WithProgress(cb func(ProgressStats)) ZipOption {
 	return func(c *processConfig) {
 		c.onProgress = cb

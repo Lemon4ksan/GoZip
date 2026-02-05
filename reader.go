@@ -41,7 +41,7 @@ func newReaderBase(dcm decompressorsMap, cfg ZipConfig) readerBase {
 		dcm = make(decompressorsMap)
 	}
 	if _, ok := dcm[Store]; !ok {
-		dcm[Store] = new(StoredDecompressor)
+		dcm[Store] = new(storeDecompressor)
 	}
 	if _, ok := dcm[Deflate]; !ok {
 		dcm[Deflate] = new(DeflateDecompressor)
