@@ -491,6 +491,9 @@ func BenchmarkReadSeq_GoZip(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		for _, file := range files {
+			if file.IsDir() {
+				continue
+			}
 			rc, _ := file.Open()
 			io.Copy(io.Discard, rc)
 			rc.Close()
@@ -518,10 +521,13 @@ func BenchmarkReadPar_GoZip(b *testing.B) {
 		close(ch)
 
 		wg.Add(workers)
-		for j := 0; j < workers; j++ {
+		for range workers {
 			go func() {
 				defer wg.Done()
 				for file := range ch {
+					if file.IsDir() {
+						continue
+					}
 					rc, _ := file.Open()
 					io.Copy(io.Discard, rc)
 					rc.Close()

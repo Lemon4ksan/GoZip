@@ -667,8 +667,10 @@ func (z *Zip) SafePath(destDir, fileName string) (string, error) {
 	cleanedName := path.Clean("/" + fileName)
 	cleanedName = strings.TrimPrefix(cleanedName, "/")
 
-	if strings.ContainsAny(cleanedName, "\x00\r\n\t") {
-		return "", fmt.Errorf("%w: filename contains control characters", ErrInsecurePath)
+	for _, r := range fileName {
+		if r < 0x20 || r == 0x7F {
+			return "", fmt.Errorf("%w: filename contains control characters", ErrInsecurePath)
+		}
 	}
 
 	destDir = filepath.Clean(destDir)
@@ -1025,9 +1027,9 @@ func (z *Zip) ExtractToWithContext(ctx context.Context, path string, opts ...Zip
 	var errs []error
 	var dirsToRestore []*File
 	if workers := z.getWorkers(cfg, files); workers > 1 {
-		dirsToRestore, errs = z.execParallelExtract(ctx, files, path, workers, collector)
+		dirsToRestore, errs = z.execParallelExtract(ctx, files, path, workers, collector, cfg)
 	} else {
-		dirsToRestore, errs = z.execSequentialExtract(ctx, files, path, collector)
+		dirsToRestore, errs = z.execSequentialExtract(ctx, files, path, collector, cfg)
 	}
 
 	for i := len(dirsToRestore) - 1; i >= 0; i-- {
@@ -1124,14 +1126,29 @@ func (z *Zip) execParallelVerify(ctx context.Context, files []*File, workers int
 }
 
 func (z *Zip) execSequentialExtract(
-	ctx context.Context, files []*File, destDir string, collector *statsCollector,
+	ctx context.Context, files []*File, destDir string, collector *statsCollector, cfg processConfig,
 ) ([]*File, []error) {
 	var errs []error
+	var globalWritten int64
 	dirsToRestore := make([]*File, 0, len(files)/2)
 
 	for _, f := range files {
 		if ctx.Err() != nil {
 			break
+		}
+
+		if f.config.EncryptionMethod < cfg.security.MinEncryption {
+			err := fmt.Errorf("%w: encryption method too weak (required %v, got %v)",
+				ErrInsecurePath, cfg.security.MinEncryption, f.config.EncryptionMethod)
+			errs = append(errs, wrapErr("extract", f, err))
+			collector.OnFileDone(f, err)
+			continue
+		}
+
+		limits := cfg.security.ResourceLimits
+		if limits.MaxFileSize > 0 && f.UncompressedSize() > limits.MaxFileSize {
+			errs = append(errs, wrapErr("extract", f, ErrResourceLimit))
+			continue
 		}
 
 		fpath, err := z.SafePath(destDir, f.name)
@@ -1158,7 +1175,7 @@ func (z *Zip) execSequentialExtract(
 			continue
 		}
 
-		err = z.extractFile(ctx, f, fpath, collector.OnRead, collector.OnWritten)
+		err = z.extractFile(ctx, f, destDir, f.name, collector.OnRead, collector.OnWritten, &globalWritten, cfg)
 		if err != nil {
 			if ctx.Err() != nil {
 				break
@@ -1172,15 +1189,30 @@ func (z *Zip) execSequentialExtract(
 }
 
 func (z *Zip) execParallelExtract(
-	ctx context.Context, files []*File, destDir string, workers int, collector *statsCollector,
+	ctx context.Context, files []*File, destDir string, workers int, collector *statsCollector, cfg processConfig,
 ) ([]*File, []error) {
+	var globalWritten int64
 	filesToExtract := make([]*File, 0, len(files))
 	dirsToRestore := make([]*File, 0, len(files)/2)
 
 	var errs []error
 	for _, f := range files {
+		if f.config.EncryptionMethod < cfg.security.MinEncryption {
+			err := fmt.Errorf("%w: encryption method too weak (required %v, got %v)",
+				ErrInsecurePath, cfg.security.MinEncryption, f.config.EncryptionMethod)
+			errs = append(errs, wrapErr("extract", f, err))
+			collector.OnFileDone(f, err)
+			continue
+		}
+
 		fpath, err := z.SafePath(destDir, f.name)
 		if err != nil {
+			errs = append(errs, wrapErr("extract", f, err))
+			collector.OnFileDone(f, err)
+			continue
+		}
+
+		if err := checkSymlinkTraversal(fpath, destDir); err != nil {
 			errs = append(errs, wrapErr("extract", f, err))
 			collector.OnFileDone(f, err)
 			continue
@@ -1219,7 +1251,7 @@ func (z *Zip) execParallelExtract(
 		go func(f *File) {
 			defer func() { <-sem; wg.Done() }()
 
-			err := z.extractFile(ctx, f, filepath.Join(destDir, f.name), collector.OnRead, collector.OnWritten)
+			err := z.extractFile(ctx, f, destDir, f.name, collector.OnRead, collector.OnWritten, &globalWritten, cfg)
 			if err != nil {
 				if ctx.Err() == nil {
 					errChan <- wrapErr("extract", f, err)
@@ -1544,13 +1576,23 @@ func (z *Zip) verifySingleFile(f *File, onRead signalFunc) error {
 
 // extractFile handles low-level extraction logic.
 // It uses the shared buffer pool and attempts to restore file metadata (times/perms).
-func (z *Zip) extractFile(ctx context.Context, f *File, path string, onRead, onWrite signalFunc) error {
+func (z *Zip) extractFile(
+	ctx context.Context, f *File, destDir, path string, onRead, onWrite signalFunc, globalWritten *int64, cfg processConfig,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	if strings.ContainsAny(path, "\x00\r\n\t") {
-		return fmt.Errorf("%w: filename contains control characters", ErrFileEntry)
+	if !cfg.security.AllowSymlinks && f.Mode()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("%w: symlinks are disabled", ErrInsecurePath)
+	}
+
+	fpath, _ := z.SafePath(destDir, path)
+
+	if cfg.security.AllowSymlinks {
+		if err := checkSymlinkTraversal(fpath, destDir); err != nil {
+			return err
+		}
 	}
 
 	src, err := f.Open()
@@ -1559,20 +1601,52 @@ func (z *Zip) extractFile(ctx context.Context, f *File, path string, onRead, onW
 	}
 	defer src.Close()
 
-	dest, err := os.Create(path)
+	dest, err := os.Create(fpath)
 	if err != nil {
 		return err
 	}
 	defer dest.Close()
 
 	var r io.Reader = src
+
+	if f.UncompressedSize() > 0 {
+		r = io.LimitReader(src, f.UncompressedSize())
+	}
+
+	limits := cfg.security.ResourceLimits
+	if limits.MaxFileSize > 0 && f.UncompressedSize() > limits.MaxFileSize {
+		return fmt.Errorf("%w: file header claims %d bytes, limit is %d", ErrResourceLimit, f.UncompressedSize(), limits.MaxFileSize)
+	}
+
+	var wrappedR io.Reader = r
+
 	if onRead != nil {
-		r = newProgressReader(src, f, onRead)
+		wrappedR = newProgressReader(r, f, onRead)
 	}
 
 	var w io.Writer = dest
+
+	hasLimits := limits.MaxTotalSize > 0 || limits.MaxFileSize > 0 || limits.MaxRatio > 0
+	if hasLimits {
+		cSize := f.CompressedSize()
+		if cSize == -1 {
+			cSize = 0
+		}
+
+		w = &secureWriter{
+			w:              dest,
+			totalWritten:   globalWritten,
+			maxFileSize:    limits.MaxFileSize,
+			maxTotalSize:   limits.MaxTotalSize,
+			maxRatio:       limits.MaxRatio,
+			compressedSize: cSize,
+		}
+	}
+
+	var wrappedW io.Writer = w
+
 	if onWrite != nil {
-		w = newProgressWriter(dest, f, onWrite)
+		wrappedW = newProgressWriter(w, f, onWrite)
 	}
 
 	if f.uncompressedSize > 0 {
@@ -1581,7 +1655,7 @@ func (z *Zip) extractFile(ctx context.Context, f *File, path string, onRead, onW
 		}
 
 		bufPtr := z.bufferPool.Get().(*[]byte)
-		_, err = io.CopyBuffer(w, &contextReader{ctx, r}, *bufPtr)
+		_, err = io.CopyBuffer(wrappedW, &contextReader{ctx, wrappedR}, *bufPtr)
 		z.bufferPool.Put(bufPtr)
 
 		if err != nil {
@@ -1598,6 +1672,31 @@ func (z *Zip) extractFile(ctx context.Context, f *File, path string, onRead, onW
 	_ = os.Chmod(path, perm)
 	_ = os.Chtimes(path, time.Now(), f.modTime)
 
+	return nil
+}
+
+// checkSymlinkTraversal verifies that the destination path does not write *through* a symlink.
+// This is expensive (requires Lstat), so it's part of the security check.
+func checkSymlinkTraversal(destPath, rootDir string) error {
+	current := destPath
+	rootDir = filepath.Clean(rootDir)
+
+	for current != rootDir && current != "." && current != "/" {
+		info, err := os.Lstat(current)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("%w: path component '%s' is a symlink", ErrInsecurePath, current)
+			}
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
 	return nil
 }
 

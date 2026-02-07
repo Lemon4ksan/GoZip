@@ -67,6 +67,9 @@ var (
 
 	// ErrExtraFieldTooLong is returned when the total size of extra fields exceeds 65535 bytes.
 	ErrExtraFieldTooLong = errors.New("extra field too long")
+
+	// ErrResourceLimit is returned when extraction uses too much resources.
+	ErrResourceLimit = errors.New("resource limit exceeded")
 )
 
 // wrapErr is an internal helper for creating contextual errors.

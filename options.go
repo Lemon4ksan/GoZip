@@ -1,6 +1,7 @@
 package gozip
 
 import (
+	"fmt"
 	"io"
 	"path"
 	"strings"
@@ -131,6 +132,7 @@ type processConfig struct {
 	workers    int
 	onProgress func(stats ProgressStats)
 	onFileDone func(*File, error)
+	security   SecuritySettings
 }
 
 // ZipOption is a function option for configuring [Zip] operations.
@@ -328,6 +330,44 @@ func WithSmartStore(exts ...string) ZipOption {
 	}
 }
 
+// SecuritySettings define extraction safety configuration.
+type SecuritySettings struct {
+	// AllowSymlinks enables extraction of symbolic links.
+	// WARNING: disabling this is recommended for untrusted archives.
+	// Default: false.
+	AllowSymlinks bool
+
+	// MinEncryption allows enforcing a minimum encryption standard.
+	// e.g. Require AES256 to prevent downgrade attacks.
+	MinEncryption EncryptionMethod
+
+	// ResourceLimits defines constraints for extraction.
+	ResourceLimits ResourceLimits
+}
+
+// ResourceLimits defines constraints for extraction.
+type ResourceLimits struct {
+	// MaxTotalSize is the maximum allowed bytes to write to disk for the whole operation.
+	// Default: 0 (unlimited).
+	MaxTotalSize int64
+
+	// MaxFileSize is the maximum allowed size for a single file.
+	// Default: 0 (unlimited).
+	MaxFileSize int64
+
+	// MaxCompressionRatio is the maximum allowed ratio between uncompressed and compressed size.
+	// E.g., 100 means uncompressed data cannot be more than 100x larger than compressed.
+	// Default: 0 (disabled). Recommended: 100-200.
+	MaxRatio float64
+}
+
+// WithSecurity applies security settings for extraction.
+func WithSecurity(settings SecuritySettings) ZipOption {
+	return func(pc *processConfig) {
+		pc.security = settings
+	}
+}
+
 // ProgressStats contains detailed information about the current progress of the operation.
 type ProgressStats struct {
 	CurrentFile    *File // Currently processed file
@@ -502,4 +542,61 @@ type progressWriteSeeker struct {
 
 func (pws *progressWriteSeeker) Seek(offset int64, whence int) (int64, error) {
 	return pws.seeker.Seek(offset, whence)
+}
+
+// Default limits to prevent denial of service
+const (
+	defaultGraceSpace  = 10 * 1024 * 1024 // 10 MB grace period
+	defaultRatioBuffer = 4096             // Buffer to smooth out ratio calc for small files
+)
+
+type secureWriter struct {
+	w io.Writer
+
+	// Counters
+	written      int64  // Bytes written for current file
+	totalWritten *int64 // Pointer to global atomic counter
+
+	maxFileSize  int64
+	maxTotalSize int64
+	maxRatio     float64
+
+	// Ratio calculation data
+	compressedSize int64 // From file header
+}
+
+func (sw *secureWriter) Write(p []byte) (n int, err error) {
+	n = len(p)
+	writeLen := int64(n)
+
+	if sw.maxTotalSize > 0 {
+		newTotal := atomic.AddInt64(sw.totalWritten, writeLen)
+		if newTotal > sw.maxTotalSize {
+			atomic.AddInt64(sw.totalWritten, -writeLen)
+			return 0, fmt.Errorf("%w: global limit %d bytes exceeded", ErrResourceLimit, sw.maxTotalSize)
+		}
+	}
+
+	if sw.maxFileSize > 0 {
+		if sw.written+writeLen > sw.maxFileSize {
+			return 0, fmt.Errorf("%w: file limit %d bytes exceeded", ErrResourceLimit, sw.maxFileSize)
+		}
+	}
+
+	if sw.maxRatio > 0 && (sw.written+writeLen) > defaultGraceSpace {
+
+		// Formula: Written / (Compressed + Buffer)
+		// Buffer prevents division by zero and false positives on tiny files
+		denominator := float64(sw.compressedSize + defaultRatioBuffer)
+		currentRatio := float64(sw.written+writeLen) / denominator
+
+		if currentRatio > sw.maxRatio {
+			return 0, fmt.Errorf("%w: compression ratio %.2fx exceeds limit %.2fx",
+				ErrResourceLimit, currentRatio, sw.maxRatio)
+		}
+	}
+
+	n, err = sw.w.Write(p)
+	sw.written += int64(n)
+	return n, err
 }

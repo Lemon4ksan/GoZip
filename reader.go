@@ -393,6 +393,10 @@ func (zr *zipReader) newFileFromCentralDir(entry internal.CentralDirectory) *Fil
 
 	f.srcConfig = f.config
 
+	if f.isDir {
+		return f
+	}
+
 	f.openFunc = func() (io.ReadCloser, error) {
 		return zr.openFile(f)
 	}
