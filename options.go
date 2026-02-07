@@ -7,6 +7,37 @@ import (
 	"sync/atomic"
 )
 
+// ArchiveOption is a function option for configuring archive creation
+type ArchiveOption func(*Zip)
+
+// WithCompressor registers a custom compression algorithm for this archive instance.
+func WithCompressor(method CompressionMethod, factory CompressorFactory) ArchiveOption {
+	return func(z *Zip) {
+		z.RegisterCompressor(method, factory)
+	}
+}
+
+// WithDecompressor registers a custom decompression algorithm.
+func WithDecompressor(method CompressionMethod, d Decompressor) ArchiveOption {
+	return func(z *Zip) {
+		z.RegisterDecompressor(method, d)
+	}
+}
+
+// WithArchivePasswords sets global password for the archive.
+func WithZipPassword(pwd string) ArchiveOption {
+	return func(z *Zip) {
+		z.config.Password = pwd
+	}
+}
+
+// WithZipConfig applies the complete [ZipConfig] to the archive.
+func WithZipConfig(cfg ZipConfig) ArchiveOption {
+	return func(z *Zip) {
+		z.config = cfg
+	}
+}
+
 // AddOption is a functional option for configuring file entries during addition.
 type AddOption func(f *File)
 
@@ -72,6 +103,7 @@ func WithPath(p string) AddOption {
 
 type processConfig struct {
 	filters    []Filter
+	password   string
 	workers    int
 	onProgress func(stats ProgressStats)
 	onFileDone func(*File, error)
@@ -87,6 +119,13 @@ func WithWorkers(n int) ZipOption {
 		} else {
 			pc.workers = n
 		}
+	}
+}
+
+// WithOpPassword overwrites password for each file in the operation.
+func WithOpPassword(pwd string) ZipOption {
+	return func(pc *processConfig) {
+		pc.password = pwd
 	}
 }
 
@@ -106,78 +145,118 @@ func WithFilter(f Filter) ZipOption {
 	}
 }
 
+// WithOnly filters the operation to only the specific files provided.
+func WithOnly(files []*File) ZipOption {
+	return func(pc *processConfig) {
+		pc.filters = append(pc.filters, FilterOnly(files))
+	}
+}
+
+// WithFromDir restricts operation to files nested under the specified path.
+func WithFromDir(dirPath string) ZipOption {
+	return func(pc *processConfig) {
+		pc.filters = append(pc.filters, FilterFromDir(dirPath))
+	}
+}
+
+// WithExcludeDir excludes a directory and its contents from operation.
+func WithExcludeDir(dirPath string) ZipOption {
+	return func(pc *processConfig) {
+		pc.filters = append(pc.filters, FilterExcludeDir(dirPath))
+	}
+}
+
+// Predicate defines the condition for selecting a file.
+type Predicate func(*File) bool
+
+// WithWhere restricts operation to
+func WithWhere(cond Predicate) ZipOption {
+	return WithFilter(FilterWhere(cond))
+}
+
 // Filter filters out the files.
 type Filter func(files []*File) []*File
 
-// WithFiles filters the operation to only the specific files provided.
-func WithFiles(files []*File) ZipOption {
-	return func(pc *processConfig) {
-		pc.filters = append(pc.filters, func(_ []*File) []*File { return files })
-	}
+// WithFiles returns files provided.
+func FilterOnly(files []*File) Filter {
+	return func(_ []*File) []*File { return files }
 }
 
-// FromDir restricts operation to files nested under the specified path.
-func FromDir(dirPath string) ZipOption {
-	return func(pc *processConfig) {
-		pc.filters = append(pc.filters, func(files []*File) []*File {
-			if dirPath == "" || dirPath == "." {
-				return files
-			}
+// FilterFromDir returns only files nested under the specified path.
+func FilterFromDir(dirPath string) Filter {
+	return func(files []*File) []*File {
+		if dirPath == "" || dirPath == "." {
+			return files
+		}
 
-			prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
-			if !strings.HasSuffix(prefix, "/") {
-				prefix += "/"
-			}
-			dirEntryName := strings.TrimSuffix(prefix, "/")
+		prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
+		if !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+		dirEntryName := strings.TrimSuffix(prefix, "/")
 
-			n := 0
-			for _, f := range files {
-				fName := f.entryName()
-				if strings.HasPrefix(fName, prefix) || fName == dirEntryName {
-					files[n] = f
-					n++
-				}
-			}
-
-			for i := n; i < len(files); i++ {
-				files[i] = nil
-			}
-
-			return files[:n]
-		})
-	}
-}
-
-// WithoutDir excludes a directory and its contents from operation.
-func WithoutDir(dirPath string) ZipOption {
-	return func(pc *processConfig) {
-		pc.filters = append(pc.filters, func(files []*File) []*File {
-			if dirPath == "" || dirPath == "." {
-				return nil
-			}
-
-			prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
-			if !strings.HasSuffix(prefix, "/") {
-				prefix += "/"
-			}
-			dirEntryName := strings.TrimSuffix(prefix, "/")
-
-			n := 0
-			for _, f := range files {
-				fName := f.entryName()
-				if strings.HasPrefix(fName, prefix) || fName == dirEntryName {
-					continue
-				}
+		n := 0
+		for _, f := range files {
+			fName := f.entryName()
+			if strings.HasPrefix(fName, prefix) || fName == dirEntryName {
 				files[n] = f
 				n++
 			}
+		}
 
-			for i := n; i < len(files); i++ {
-				files[i] = nil
+		for i := n; i < len(files); i++ {
+			files[i] = nil
+		}
+
+		return files[:n]
+	}
+}
+
+// FilterExcludeDir returns files without a provided directory and its contents.
+func FilterExcludeDir(dirPath string) Filter {
+	return func(files []*File) []*File {
+		if dirPath == "" || dirPath == "." {
+			return nil
+		}
+
+		prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
+		if !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+		dirEntryName := strings.TrimSuffix(prefix, "/")
+
+		n := 0
+		for _, f := range files {
+			fName := f.entryName()
+			if strings.HasPrefix(fName, prefix) || fName == dirEntryName {
+				continue
 			}
+			files[n] = f
+			n++
+		}
 
-			return files[:n]
-		})
+		for i := n; i < len(files); i++ {
+			files[i] = nil
+		}
+
+		return files[:n]
+	}
+}
+
+// FilterWhere returns files that match the specified condition.
+func FilterWhere(cond Predicate) Filter {
+	return func(files []*File) []*File {
+		n := 0
+		for _, f := range files {
+			if cond(f) {
+				files[n] = f
+				n++
+			}
+		}
+		for i := range len(files) {
+			files[i] = nil
+		}
+		return files[:n]
 	}
 }
 
@@ -224,39 +303,18 @@ func WithSmartStore(exts ...string) ZipOption {
 	}
 }
 
-// Predicate defines the condition for selecting a file.
-type Predicate func(*File) bool
-
-// Where returns a filtering option based on an arbitrary condition.
-// This is the most flexible way to select files.
-func Where(cond Predicate) ZipOption {
-	return WithFilter(func(files []*File) []*File {
-		n := 0
-		for _, f := range files {
-			if cond(f) {
-				files[n] = f
-				n++
-			}
-		}
-		for i := range len(files) {
-			files[i] = nil
-		}
-		return files[:n]
-	})
-}
-
 // ProgressStats contains detailed information about the current progress of the operation.
 type ProgressStats struct {
-	CurrentFile       *File
-	CurrentRead       int64 // Uncompressed bytes read from current file
-	CurrentCompressed int64 // Compressed/Encrypted bytes produced for current file
-	ExpectedRead      int64 // Sum of uncompressed file sizes
-	TotalRead         int64 // Total uncompressed bytes read so far
-	TotalCompressed   int64 // Total compressed bytes produced so far
-	TotalWritten      int64 // Total bytes written to dest (headers + data + CD)
-	TotalFiles        int64
-	ProcessedFiles    int64
-	Errors            int64
+	CurrentFile    *File // Currently processed file
+	CurrentRead    int64 // Uncompressed bytes read from current file
+	CurrentWritten int64 // Bytes produced for current file
+	ExpectedRead   int64 // Sum of uncompressed file sizes
+	TotalRead      int64 // Total uncompressed bytes read so far
+	TotalWritten   int64 // Total compressed bytes produced so far
+	ArchiveWritten int64 // Total bytes written to dest (headers + data + CD)
+	TotalFiles     int64 // Total amount of files to process
+	ProcessedFiles int64 // The total number of files processed, including errors.
+	Errors         int64 // Failed files count
 }
 
 // WithProgress adds a callback to monitor bytes in real time.
@@ -302,18 +360,18 @@ func (c *statsCollector) OnRead(f *File, n int, fileRead int64) {
 	atomic.StoreInt64(&c.stats.CurrentRead, fileRead)
 	atomic.AddInt64(&c.stats.TotalRead, int64(n))
 	if c.destCounter != nil {
-		atomic.StoreInt64(&c.stats.TotalWritten, c.destCounter.Count())
+		atomic.StoreInt64(&c.stats.ArchiveWritten, c.destCounter.Count())
 	}
 	c.notify(f)
 }
 
-// OnCompressed handles updates when bytes are compressed.
-func (c *statsCollector) OnCompressed(_ *File, n int, compressed int64) {
+// OnWritten handles updates when bytes are written.
+func (c *statsCollector) OnWritten(_ *File, n int, written int64) {
 	if c.stats == nil {
 		return
 	}
-	atomic.AddInt64(&c.stats.TotalCompressed, int64(n))
-	atomic.StoreInt64(&c.stats.CurrentCompressed, compressed)
+	atomic.AddInt64(&c.stats.TotalWritten, int64(n))
+	atomic.StoreInt64(&c.stats.CurrentWritten, written)
 }
 
 // OnFileDone handles completion of a single file processing.
@@ -349,16 +407,16 @@ func (c *statsCollector) notify(f *File) {
 
 func (c *statsCollector) snapshotStats(current *File) ProgressStats {
 	return ProgressStats{
-		CurrentFile:       current,
-		CurrentRead:       atomic.LoadInt64(&c.stats.CurrentRead),
-		CurrentCompressed: atomic.LoadInt64(&c.stats.CurrentCompressed),
-		TotalRead:         atomic.LoadInt64(&c.stats.TotalRead),
-		TotalCompressed:   atomic.LoadInt64(&c.stats.TotalCompressed),
-		ProcessedFiles:    atomic.LoadInt64(&c.stats.ProcessedFiles),
-		Errors:            atomic.LoadInt64(&c.stats.Errors),
-		ExpectedRead:      c.stats.ExpectedRead, // const
-		TotalFiles:        c.stats.TotalFiles,   // const
-		TotalWritten:      atomic.LoadInt64(&c.stats.TotalWritten),
+		CurrentFile:    current,
+		CurrentRead:    atomic.LoadInt64(&c.stats.CurrentRead),
+		CurrentWritten: atomic.LoadInt64(&c.stats.CurrentWritten),
+		TotalRead:      atomic.LoadInt64(&c.stats.TotalRead),
+		TotalWritten:   atomic.LoadInt64(&c.stats.TotalWritten),
+		ProcessedFiles: atomic.LoadInt64(&c.stats.ProcessedFiles),
+		Errors:         atomic.LoadInt64(&c.stats.Errors),
+		ExpectedRead:   c.stats.ExpectedRead, // const
+		TotalFiles:     c.stats.TotalFiles,   // const
+		ArchiveWritten: atomic.LoadInt64(&c.stats.ArchiveWritten),
 	}
 }
 

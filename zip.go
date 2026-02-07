@@ -7,33 +7,71 @@
 //
 // It is designed as a robust alternative to the standard library's archive/zip,
 // specifically built for high-load applications, security-conscious environments,
-// and scenarios requiring legacy compatibility.
+// and developer experience.
 //
 // # Key Features
 //
-// 1. Concurrency: Unlike the standard library, gozip supports parallel compression and
-// parallel extraction, offering significant speedups by utilizing all available CPU cores.
+// 1. Architecture: The library uses the [Archiver] to encapsulate configuration
+// (passwords, codecs). No global state or side effects.
 //
-// 2. Security: Native support for WinZip AES-256 encryption (reading and writing)
-// and built-in "Zip Slip" protection during extraction to prevent directory
-// traversal attacks.
+// 2. Usability: Includes high-level helpers ([ArchiveDir], [Unzip], [Diff]) for
+// common tasks, reducing boilerplate code to the minimum.
 //
-// 3. Context Awareness: All long-running operations support context.Context for
-// cancellation and timeout management, making it ideal for HTTP handlers and
-// background jobs.
+// 3. Concurrency: Supports parallel compression and extraction, utilizing all
+// available CPU cores for maximum throughput using [WithWorkers].
 //
-// 4. Compatibility: Handles Zip64 (files > 4GB), NTFS timestamps, Unix permissions,
+// 4. Security: Native support for WinZip AES-256 encryption and built-in "Zip Slip"
+// protection during extraction to prevent directory traversal attacks.
+//
+// 5. Abstraction: Uses [Source] and [Sink] interfaces to transparently handle
+// files on disk, in-memory buffers, or network streams.
+//
+// 6. Context Awareness: All long-running operations support [context.Context] for
+// cancellation and timeout management.
+//
+// 7. Compatibility: Handles Zip64 (files > 4GB), NTFS timestamps, Unix permissions,
 // and legacy DOS encodings (CP437, CP866) automatically.
 //
-// 5. File System Interface: The archive can be accessed as a read-only filesystem
-// using the [fs.FS] interface. This allows seamless integration with Go's standard
-// filesystem APIs, such as [io/fs] and [path/filepath].
-// Example:
+// # Quick Start
 //
-//	archive := gozip.NewZip()
-//	// ... add files to the archive ...
-//	fsys := archive.FS()
-//	data, _ := fs.ReadFile(fsys, "file.txt")
+// The simplest way to use the library is via global helper functions that use
+// default settings (Deflate compression):
+//
+//	// Archive a directory
+//	err := gozip.ArchiveDir("data/", gozip.ToFilePath("backup.zip"))
+//
+//	// Extract an archive
+//	err := gozip.Unzip(gozip.FromFilePath("backup.zip"), "restored/")
+//
+//	// Read a single file contents without extraction
+//	data, err := gozip.ReadFile(gozip.FromFilePath("config.zip"), "settings.json")
+//
+// # Advanced Usage (The Archiver)
+//
+// For custom configuration (passwords, specific compression algorithms), create
+// an [Archiver] instance. This allows you to isolate settings per operation.
+//
+//	// Configure an environment
+//	archiver := gozip.NewArchiver(
+//	    gozip.WithArchivePassword("secure-password"),
+//	    // gozip.WithCompressor(gozip.Zstd, zstd.NewFactory()), // If using custom codecs
+//	)
+//
+//	// Use the configured instance
+//	err := archiver.Unzip(gozip.FromFilePath("encrypted.zip"), "output/")
+//
+// # Source & Sink
+//
+// The library abstracts IO operations. You can work with physical files,
+// byte slices, or streams seamlessly:
+//
+//	// Unzip from memory (e.g., uploaded file)
+//	src := gozip.FromReader(bytes.NewReader(data), int64(len(data)))
+//	gozip.Unzip(src, "uploads/")
+//
+//	// Archive directly to an HTTP response
+//	dest := gozip.ToWriter(httpResponseWriter)
+//	gozip.ArchiveDir("report/", dest)
 //
 // # Error handling
 //
@@ -52,7 +90,7 @@
 //	    }
 //	}
 //
-// # Basic Usage
+// # Manual Control (Low-Level)
 //
 // Creating an archive:
 //
@@ -98,19 +136,6 @@
 //
 //	// Close source after the work is done
 //	src.Close()
-//
-// Streaming to HTTP response:
-//
-//	func handler(w http.ResponseWriter, r *http.Request) {
-//		w.Header().Set("Content-Type", "application/zip")
-//		w.Header().Set("Content-Disposition", `attachment; filename="download.zip"`)
-//
-//		archive := gozip.NewZip()
-//		archive.AddFile("report.pdf")
-//
-//		// Stream directly to the client
-//		archive.WriteTo(w)
-//	}
 package gozip
 
 import (
@@ -120,6 +145,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"mime"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -236,6 +263,7 @@ type decompressorsMap map[CompressionMethod]Decompressor
 
 // Zip represents an in-memory ZIP archive manager.
 // It is concurrency-safe and supports streaming, random access, and parallel operations.
+// By default it supports [Store] (no compression) and [Deflate] compression methods.
 type Zip struct {
 	mu            sync.RWMutex     // Guards files, fileCache, and config
 	config        ZipConfig        // Global settings
@@ -248,8 +276,8 @@ type Zip struct {
 
 // NewZip creates a ready-to-use empty ZIP archive.
 // Default support includes [Store] (No Compression) and [Deflate].
-func NewZip() *Zip {
-	return &Zip{
+func NewZip(opts ...ArchiveOption) *Zip {
+	z := &Zip{
 		files:         make([]*File, 0),
 		lookup:        make(map[string]*File),
 		factories:     make(factoriesMap),
@@ -261,6 +289,13 @@ func NewZip() *Zip {
 			},
 		},
 	}
+	z.registerDefaults()
+
+	for _, opt := range opts {
+		opt(z)
+	}
+
+	return z
 }
 
 // Config returns current global zip configuration.
@@ -270,27 +305,30 @@ func (z *Zip) Config() ZipConfig {
 
 // SetConfig updates the global configuration atomically.
 // For files loaded from an existing archive, only the password is applied.
-func (z *Zip) SetConfig(c ZipConfig) {
+func (z *Zip) SetConfig(c ZipConfig) *Zip {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.config = c
+	return z
 }
 
 // RegisterCompressor registers a factory function for a specific compression method.
 // The factory will be called when a file requires this method at a specific level.
 // See [NewDeflateCompressor] and [DeflateCompressor] for optimal implementation example.
-func (z *Zip) RegisterCompressor(method CompressionMethod, factory CompressorFactory) {
+func (z *Zip) RegisterCompressor(method CompressionMethod, factory CompressorFactory) *Zip {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.factories[method] = factory
+	return z
 }
 
 // RegisterDecompressor adds support for reading a custom compression method.
 // See [DeflateDecompressor] for implementation example.
-func (z *Zip) RegisterDecompressor(method CompressionMethod, d Decompressor) {
+func (z *Zip) RegisterDecompressor(method CompressionMethod, d Decompressor) *Zip {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.decompressors[method] = d
+	return z
 }
 
 // FS returns [fs.FS], a read-only virtual filesystem on top of the ZIP archive.
@@ -330,13 +368,13 @@ func (z *Zip) AddOSFile(f *os.File, options ...AddOption) (*File, error) {
 	return fileEntry, wrapErr("add", fileEntry, z.addEntry(fileEntry, options))
 }
 
-// AddDir recursively adds a directory and its contents to the archive.
+// AddDir recursively recursively adds contents of the directory to the archive.
 //
 // Behavior:
 //   - Files are added using "Best Effort" strategy: if a single file fails to read,
 //     AddDir continues processing others but returns a joined error at the end.
 //   - Symlinks inside the directory are stored as links, not followed.
-//   - Use [WithoutDir] or [FromDir] options during extraction, not here.
+//   - Use [WithExcludeDir] or [WithFromDir] options during extraction, not here.
 func (z *Zip) AddDir(path string, options ...AddOption) ([]*File, error) {
 	var errs []error
 	var files []*File
@@ -448,7 +486,7 @@ func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...Add
 //     change between adding them to the struct and writing the archive.
 //
 // Concurrency Warning:
-//   - If [Zip.WriteToParallel] is used, openFunc will be called concurrently.
+//   - If [WithWorkers] is used, openFunc may be called concurrently.
 //     Ensure the closure is thread-safe.
 //
 // Resource Management:
@@ -790,8 +828,9 @@ func (z *Zip) Find(pattern string) ([]*File, error) {
 //     helps finish long-running compression tasks early and can stabilize memory
 //     usage, though it may be slightly slower for small archives.
 //   - For memory-constrained environments, reduce maxWorkers or MemoryThreshold.
+//   - If the writer supports [io.Seeker], temporary files are used if size exceeds MemoryThreshold).
 //
-// Returns the total number of bytes written.
+// Returns the total number of bytes written or an error if the operation fails.
 func (z *Zip) WriteTo(dest io.Writer, opts ...ZipOption) (int64, error) {
 	return z.WriteToWithContext(context.Background(), dest, opts...)
 }
@@ -803,6 +842,12 @@ func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, opts ...Zi
 	files := z.applyFilters(z.Files(), cfg.filters)
 	files = SortFilesOptimized(files, z.config.FileSortStrategy)
 
+	if cfg.password != "" {
+		for _, f := range files {
+			f.SetPassword(cfg.password)
+		}
+	}
+
 	tracker := &atomicCounterWriter{w: dest}
 	var writerDest io.Writer = tracker
 	if seeker, ok := dest.(io.WriteSeeker); ok {
@@ -813,7 +858,7 @@ func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, opts ...Zi
 
 	writer := newZipWriter(z.config, z.factories, writerDest)
 	writer.onRead = collector.OnRead
-	writer.onCompressed = collector.OnCompressed
+	writer.onCompressed = collector.OnWritten
 
 	var errs []error
 	if workers := z.getWorkers(cfg, files); workers > 1 {
@@ -833,6 +878,54 @@ func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, opts ...Zi
 	}
 
 	return tracker.Count(), errors.Join(errs...)
+}
+
+// WriteHTTP writes the archive to the HTTP response writer with correct headers.
+//
+// Behavior:
+//   - Sets Content-Type to "application/zip".
+//   - Handles UTF-8 filenames properly (RFC 6266) so they show up correctly in all browsers.
+//   - Disables MIME sniffing and caching.
+//   - Returns an error if the write operation fails.
+//
+// Error Handling:
+//   - If an error occurs before writing data (e.g. empty archive), it does not write
+//     headers, allowing the caller to send an HTTP 500/400.
+//   - If an error occurs during writing, the download will be truncated/corrupted
+//     (which is the only way to signal failure to the client after headers are sent).
+//     In this case, the error is returned for server-side logging.
+func (z *Zip) WriteHTTP(w http.ResponseWriter, filename string, opts ...ZipOption) error {
+	return z.WriteHTTPWithContext(context.Background(), w, filename, opts...)
+}
+
+func (z *Zip) WriteHTTPWithContext(ctx context.Context, w http.ResponseWriter, filename string, opts ...ZipOption) error {
+	filename = filepath.Base(filename)
+	if filename == "" || filename == "." {
+		filename = "archive.zip"
+	}
+
+	header := w.Header()
+
+	header.Set("Content-Type", "application/zip")
+	header.Set("X-Content-Type-Options", "nosniff") // Prevent browser from guessing content type
+
+	// Prevent caching for generated content
+	header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	header.Set("Pragma", "no-cache")
+	header.Set("Expires", "0")
+
+	// mime.FormatMediaType automatically handles special characters and UTF-8
+	// creating: attachment; filename="name.zip"; filename*=UTF-8''name%20.zip
+	disposition := mime.FormatMediaType("attachment", map[string]string{
+		"filename": filename,
+	})
+	header.Set("Content-Disposition", disposition)
+
+	// Note: We use the ResponseWriter directly.
+	// If the client disconnects, w.Write() will return an error (Broken Pipe),
+	// which will stop the compression process.
+	_, err := z.WriteToWithContext(ctx, w, opts...)
+	return err
 }
 
 // Load parses an existing ZIP archive's central directory and merges
@@ -942,6 +1035,12 @@ func (z *Zip) VerifyWithContext(ctx context.Context, opts ...ZipOption) error {
 		return nil
 	}
 
+	if cfg.password != "" {
+		for _, f := range files {
+			f.SetPassword(cfg.password)
+		}
+	}
+
 	collector := newStatsCollector(cfg, files, nil)
 
 	var errs []error
@@ -990,6 +1089,12 @@ func (z *Zip) ExtractToWithContext(ctx context.Context, path string, opts ...Zip
 	sortAlphabetical(files)
 
 	collector := newStatsCollector(cfg, files, nil)
+
+	if cfg.password != "" {
+		for _, f := range files {
+			f.SetSourcePassword(cfg.password)
+		}
+	}
 
 	var errs []error
 	var dirsToRestore []*File
@@ -1103,10 +1208,6 @@ func (z *Zip) execSequentialExtract(
 			break
 		}
 
-		if f.config.Password == "" {
-			f.config.Password = z.config.Password
-		}
-
 		fpath, err := z.SafePath(destDir, f.name)
 		if err != nil {
 			errs = append(errs, wrapErr("extract", f, err))
@@ -1131,7 +1232,7 @@ func (z *Zip) execSequentialExtract(
 			continue
 		}
 
-		err = z.extractFile(ctx, f, fpath, collector.OnRead, collector.OnCompressed)
+		err = z.extractFile(ctx, f, fpath, collector.OnRead, collector.OnWritten)
 		if err != nil {
 			if ctx.Err() != nil {
 				break
@@ -1152,10 +1253,6 @@ func (z *Zip) execParallelExtract(
 
 	var errs []error
 	for _, f := range files {
-		if f.config.Password == "" {
-			f.config.Password = z.config.Password
-		}
-
 		fpath, err := z.SafePath(destDir, f.name)
 		if err != nil {
 			errs = append(errs, wrapErr("extract", f, err))
@@ -1196,7 +1293,7 @@ func (z *Zip) execParallelExtract(
 		go func(f *File) {
 			defer func() { <-sem; wg.Done() }()
 
-			err := z.extractFile(ctx, f, filepath.Join(destDir, f.name), collector.OnRead, collector.OnCompressed)
+			err := z.extractFile(ctx, f, filepath.Join(destDir, f.name), collector.OnRead, collector.OnWritten)
 			if err != nil {
 				if ctx.Err() == nil {
 					errChan <- wrapErr("extract", f, err)
@@ -1219,7 +1316,17 @@ Finish:
 
 // Internal helpers
 
+func (z *Zip) registerDefaults() {
+	z.RegisterCompressor(Store, newStoreCompressor)
+	z.RegisterDecompressor(Store, new(storeDecompressor))
+	z.RegisterCompressor(Deflate, NewDeflateCompressor)
+	z.RegisterDecompressor(Deflate, new(DeflateDecompressor))
+}
+
 // addEntry validates and adds a file to the archive.
+// It normalizes paths, checks for duplicates, and ensures parent directories exist.
+// If the file is a directory, it marks it as such and skips compression.
+// Returns an error if the file name is invalid or conflicts with an existing entry.
 func (z *Zip) addEntry(f *File, options []AddOption) error {
 	if !f.isDir {
 		f.config.CompressionMethod = z.config.CompressionMethod

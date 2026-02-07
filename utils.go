@@ -7,6 +7,8 @@ package gozip
 import (
 	"context"
 	"io"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -149,4 +151,94 @@ func hasMeta(path string) bool {
 		}
 	}
 	return false
+}
+
+// treeNode represents a node in the directory tree.
+type treeNode struct {
+	name     string
+	isDir    bool
+	children map[string]*treeNode
+}
+
+func newTreeNode(name string, isDir bool) *treeNode {
+	return &treeNode{
+		name:     name,
+		isDir:    isDir,
+		children: make(map[string]*treeNode),
+	}
+}
+
+// generateTree converts a list of zip Files into a visual tree string.
+func generateTree(files []*File) string {
+	if len(files) == 0 {
+		return ".\n└── (empty archive)"
+	}
+
+	// Build the tree structure from flat paths
+	root := newTreeNode(".", true)
+
+	for _, f := range files {
+		// Clean path and split into components
+		path := strings.Trim(f.Name(), "/")
+		parts := strings.Split(path, "/")
+
+		current := root
+		for i, part := range parts {
+			if part == "" {
+				continue
+			}
+
+			// Determine if this part is a directory
+			// It is a directory if it has children (i < len-1) OR if the file itself is a dir
+			isDir := i < len(parts)-1 || f.IsDir()
+
+			if _, exists := current.children[part]; !exists {
+				current.children[part] = newTreeNode(part, isDir)
+			}
+			current = current.children[part]
+		}
+	}
+
+	// Render the tree
+	var sb strings.Builder
+	sb.WriteString(".\n")
+	renderTreeNode(root, "", &sb)
+
+	return sb.String()
+}
+
+func renderTreeNode(node *treeNode, prefix string, sb *strings.Builder) {
+	// Sort children keys to ensure deterministic output
+	keys := make([]string, 0, len(node.children))
+	for k := range node.children {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for i, name := range keys {
+		child := node.children[name]
+		isLast := i == len(keys)-1
+
+		connector := "├── "
+		if isLast {
+			connector = "└── "
+		}
+
+		sb.WriteString(prefix)
+		sb.WriteString(connector)
+		sb.WriteString(name)
+		if child.isDir {
+			sb.WriteString("/")
+		}
+		sb.WriteString("\n")
+
+		childPrefix := prefix
+		if isLast {
+			childPrefix += "    "
+		} else {
+			childPrefix += "│   "
+		}
+
+		renderTreeNode(child, childPrefix, sb)
+	}
 }
