@@ -622,9 +622,9 @@ func (f *File) Snapshot() *FileSnapshot {
 			extraCopy[k] = vCopy
 		}
 	}
-	var metadata map[string]interface{}
+	var metadataCopy map[string]interface{}
 	if f.metadata != nil {
-		metadataCopy := make(map[string]interface{}, len(f.metadata))
+		metadataCopy = make(map[string]interface{}, len(f.metadata))
 		for k, v := range f.metadata {
 			metadataCopy[k] = v
 		}
@@ -646,7 +646,7 @@ func (f *File) Snapshot() *FileSnapshot {
 		CRC32:             atomic.LoadUint32(&f.crc32),
 		Flags:             f.flags,
 
-		Metadata:      metadata,
+		Metadata:      metadataCopy,
 		ExtraField:    extraCopy,
 		ExtraFieldRaw: f.extraFieldRaw, // Copy slice header is enough if content is immutable
 	}
