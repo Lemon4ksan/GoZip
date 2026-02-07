@@ -448,7 +448,7 @@ func (zw *zipWriter) createEncryptor(dest io.Writer, cfg FileConfig, crc32Val ui
 
 // writeFileHeader writes the Local File Header.
 func (zw *zipWriter) writeFileHeader(f *FileSnapshot) error {
-	if f.IsDir && zw.config.UseImplicitDirs {
+	if f.IsImplicit && !zw.config.IncludeImplicitDirs {
 		return nil
 	}
 
@@ -466,7 +466,7 @@ func (zw *zipWriter) writeFileHeader(f *FileSnapshot) error {
 
 // addCentralDirEntry adds a Central Directory record.
 func (zw *zipWriter) addCentralDirEntry(f *FileSnapshot) error {
-	if f.IsDir && zw.config.UseImplicitDirs {
+	if f.IsImplicit && !zw.config.IncludeImplicitDirs {
 		return nil
 	}
 

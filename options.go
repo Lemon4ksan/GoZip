@@ -10,6 +10,13 @@ import (
 // ArchiveOption is a function option for configuring archive creation
 type ArchiveOption func(*Zip)
 
+// WithZipConfig applies the complete [ZipConfig] to the archive.
+func WithZipConfig(cfg ZipConfig) ArchiveOption {
+	return func(z *Zip) {
+		z.config = cfg
+	}
+}
+
 // WithCompressor registers a custom compression algorithm for this archive instance.
 func WithCompressor(method CompressionMethod, factory CompressorFactory) ArchiveOption {
 	return func(z *Zip) {
@@ -24,17 +31,34 @@ func WithDecompressor(method CompressionMethod, d Decompressor) ArchiveOption {
 	}
 }
 
+// WithCompression sets the compression method and level for a regular file.
+func WithZipCompression(c CompressionMethod, lvl int) ArchiveOption {
+	return func(z *Zip) {
+		z.config.CompressionMethod = c
+		z.config.CompressionLevel = lvl
+	}
+}
+
+// WithPassword sets the encryption password for the archive.
+func WithZipEncryption(e EncryptionMethod, pwd string) ArchiveOption {
+	return func(z *Zip) {
+		z.config.EncryptionMethod = e
+		z.config.Password = pwd
+	}
+}
+
 // WithArchivePasswords sets global password for the archive.
+// If no encryption method is specified, it defaults to [AES256].
 func WithZipPassword(pwd string) ArchiveOption {
 	return func(z *Zip) {
 		z.config.Password = pwd
 	}
 }
 
-// WithZipConfig applies the complete [ZipConfig] to the archive.
-func WithZipConfig(cfg ZipConfig) ArchiveOption {
+// WithImplicitDirs enables writing implicit dirs to the resulting archive.
+func WithImplicitDirs() ArchiveOption {
 	return func(z *Zip) {
-		z.config = cfg
+		z.config.IncludeImplicitDirs = true
 	}
 }
 
@@ -109,6 +133,7 @@ type processConfig struct {
 	onFileDone func(*File, error)
 }
 
+// ZipOption is a function option for configuring [Zip] operations.
 type ZipOption func(*processConfig)
 
 // WithWorkers sets the given amount of workers for the operation.

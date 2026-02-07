@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"slices"
 	"strings"
 	"sync"
@@ -65,11 +66,12 @@ type File struct {
 	mu sync.RWMutex // Protects name, config, extraField, metadata
 
 	// Static
-	isDir      bool                              // True if this entry represents a directory
-	isImplicit bool                              // True if dir was created automatically.
-	openFunc   func() (io.ReadCloser, error)     // Factory function for reading decompressed content
-	srcFunc    func() (*io.SectionReader, error) // Factory function for reading compressed content
-	srcConfig  FileConfig
+	isDir      bool           // True if this entry represents a directory
+	isImplicit bool           // True if dir was created automatically.
+	srcConfig  FileConfig     // Config for file loaded from another archive
+	hostSystem sys.HostSystem // Operating system that created the file (for attribute mapping)
+
+	srcFunc func() (*io.SectionReader, error) // Factory function for reading compressed content
 
 	// Atomic
 	uncompressedSize  int64  // Size of original content before compression in bytes
@@ -79,10 +81,11 @@ type File struct {
 	flags             uint16 // Internal flags state
 
 	// Require mu
-	name       string         // File path within the archive (using forward slashes)
-	mode       fs.FileMode    // Unix-style file permissions and type bits
-	modTime    time.Time      // File modification time (best available precision)
-	hostSystem sys.HostSystem // Operating system that created the file (for attribute mapping)
+	name    string      // File path within the archive (using forward slashes)
+	mode    fs.FileMode // Unix-style file permissions and type bits
+	modTime time.Time   // File modification time (best available precision)
+
+	openFunc func() (io.ReadCloser, error) // Factory function for reading decompressed content
 
 	// Per-file configuration overriding archive defaults
 	config        FileConfig
@@ -92,6 +95,84 @@ type File struct {
 
 	extraParseOnce sync.Once // Sync for map initialization
 	hasZip64Extra  bool      // True if 0x0001 tag is present in local header or cd
+}
+
+// NewFile creates a detached File entry with manual metadata.
+// Note: The file is not attached to any archive until you call [Zip.Add].
+// You must set a data source via [File.SetOpenFunc] before writing, unless it's a directory.
+func NewFile(name string, isDir bool) (*File, error) {
+	if name == "" {
+		return nil, fmt.Errorf("%w: filename cannot be empty", ErrFileEntry)
+	}
+
+	cleanName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(name, "\\", "/")), "/")
+	if cleanName == "" || cleanName == "." {
+		return nil, fmt.Errorf("%w: invalid filename", ErrFileEntry)
+	}
+
+	f := &File{
+		name:       cleanName,
+		isDir:      isDir,
+		modTime:    time.Now(),
+		mode:       0644,
+		hostSystem: sys.DefaultHostSystem,
+		metadata:   make(map[string]interface{}),
+		extraField: make(map[uint16][]byte),
+	}
+	if isDir {
+		f.mode = 0755 | fs.ModeDir
+	} else {
+		f.openFunc = func() (io.ReadCloser, error) {
+			return io.NopCloser(nil), nil
+		}
+	}
+
+	return f, nil
+}
+
+// newFileFromPath creates a File object by opening the file at the given path.
+func newFileFromPath(path string) (*File, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	isSymlink := info.Mode()&fs.ModeSymlink != 0
+	var size int64
+	var linkTarget string
+
+	if isSymlink {
+		linkTarget, err = os.Readlink(path)
+		if err != nil {
+			return nil, err
+		}
+		size = int64(len(linkTarget))
+	} else if !info.IsDir() {
+		size = info.Size()
+	}
+
+	f := &File{
+		name:             info.Name(),
+		uncompressedSize: size,
+		modTime:          info.ModTime(),
+		isDir:            info.IsDir(),
+		mode:             info.Mode(),
+		metadata:         sys.GetFileMetadata(info),
+		hostSystem:       sys.DefaultHostSystem,
+		extraField:       make(map[uint16][]byte),
+	}
+
+	if isSymlink {
+		f.openFunc = func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(linkTarget)), nil
+		}
+	} else if !f.isDir {
+		f.openFunc = func() (io.ReadCloser, error) {
+			return os.Open(path)
+		}
+	}
+
+	return f, nil
 }
 
 // newFileFromOS creates a File object from an already opened os.File handle.
@@ -124,51 +205,6 @@ func newFileFromOS(f *os.File) (*File, error) {
 			return io.NopCloser(io.NewSectionReader(f, 0, stat.Size())), nil
 		},
 	}, nil
-}
-
-// newFileFromPath creates a File object by opening the file at the given path.
-func newFileFromPath(filePath string) (*File, error) {
-	info, err := os.Lstat(filePath)
-	if err != nil {
-		return nil, err
-	}
-
-	isSymlink := info.Mode()&fs.ModeSymlink != 0
-	var size int64
-	var linkTarget string
-
-	if isSymlink {
-		linkTarget, err = os.Readlink(filePath)
-		if err != nil {
-			return nil, err
-		}
-		size = int64(len(linkTarget))
-	} else if !info.IsDir() {
-		size = info.Size()
-	}
-
-	f := &File{
-		name:             info.Name(),
-		uncompressedSize: size,
-		modTime:          info.ModTime(),
-		isDir:            info.IsDir(),
-		mode:             info.Mode(),
-		metadata:         sys.GetFileMetadata(info),
-		hostSystem:       sys.DefaultHostSystem,
-		extraField:       make(map[uint16][]byte),
-	}
-
-	if isSymlink {
-		f.openFunc = func() (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader(linkTarget)), nil
-		}
-	} else if !f.isDir {
-		f.openFunc = func() (io.ReadCloser, error) {
-			return os.Open(filePath)
-		}
-	}
-
-	return f, nil
 }
 
 // newFileFromReader creates a File object from an arbitrary io.Reader source.
@@ -249,8 +285,8 @@ func (f *File) IsDir() bool { return f.isDir }
 // IsImplicit returns true if the entry was created automatically and is not associated with a real directory.
 func (f *File) IsImplicit() bool { return f.isImplicit }
 
-// Mode returns underlying file attributes.
-func (f *File) Mode() fs.FileMode { return f.mode }
+// HostSystem returns the system file was created in.
+func (f *File) HostSystem() sys.HostSystem { return f.hostSystem }
 
 // UncompressedSize returns the size of the original file content before compression.
 func (f *File) UncompressedSize() int64 {
@@ -268,7 +304,16 @@ func (f *File) LocalHeaderOffset() int64 {
 }
 
 // CRC32 returns the CRC-32 checksum of the uncompressed file data.
-func (f *File) CRC32() uint32 { return f.crc32 }
+func (f *File) CRC32() uint32 {
+	return atomic.LoadUint32(&f.crc32)
+}
+
+// Mode returns underlying file attributes.
+func (f *File) Mode() fs.FileMode {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.mode
+}
 
 // Config returns archive file entry configuration.
 func (f *File) Config() FileConfig {
@@ -277,14 +322,18 @@ func (f *File) Config() FileConfig {
 	return f.config
 }
 
-// HostSystem returns the system file was created in.
-func (f *File) HostSystem() sys.HostSystem { return f.hostSystem }
-
 // ModTime returns the file's last modification timestamp.
-func (f *File) ModTime() time.Time { return f.modTime }
+func (f *File) ModTime() time.Time {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.modTime
+}
 
 // FsTime returns the file timestamps (Modification, Access, Creation) if available.
 func (f *File) FsTime() (mtime, atime, ctime time.Time) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
 	if val, ok := f.metadata["LastWriteTime"]; ok {
 		if t, ok := val.(uint64); ok {
 			mtime = winFiletimeToTime(t)
@@ -309,19 +358,16 @@ func (f *File) IsEncrypted() bool {
 }
 
 // Open returns an io.ReadCloser for reading the uncompressed content of the file.
+// If the file comes from an existing archive, the source config is used.
 //
-// Behavior:
-//   - If the file comes from an existing archive, the original compression
-//     and encryption methods are preserved automatically.
-//   - The file's Config is used ONLY to retrieve the decryption password.
-//
-// Errors:
-//   - Returns [ErrPasswordMismatch] immediately if the provided password is incorrect
-//     (for AES/ZipCrypto).
-//   - The returned ReadCloser may return [ErrChecksum] during reading (typically at EOF)
-//     or upon Close() if the data integrity check fails.
-//   - Returns an error if the file is a directory or has no data source.
+// Returns an error if the file is a directory or has no data source.
+// [ErrPasswordMismatch] is returned immediately if the provided password is incorrect.
+// The returned ReadCloser may return [ErrChecksum] during reading
+// (typically at EOF) or upon Close() if the data integrity check fails.
 func (f *File) Open() (io.ReadCloser, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
 	if f.openFunc == nil {
 		return nil, errors.New("Open: data not available")
 	}
@@ -331,12 +377,7 @@ func (f *File) Open() (io.ReadCloser, error) {
 // OpenRaw returns an [io.SectionReader] for reading the raw file content
 // (compressed and/or encrypted) directly from the archive source.
 // If the file is encrypted (AES), the reader includes Salt, PVV, and MAC bytes.
-// Returns error if the file was created in memory (e.g. AddReader)
-// and has not been written to disk yet.
-//
-// Use Cases:
-//   - Efficiently copying files between archives without re-compression (Zero-Copy).
-//   - Debugging compression headers or encryption metadata.
+// Returns error if the file source is not available.
 func (f *File) OpenRaw() (*io.SectionReader, error) {
 	if f.srcFunc == nil {
 		return nil, errors.New("OpenRaw: data not available (file not read from archive)")
@@ -582,6 +623,7 @@ type FileSnapshot struct {
 
 	Name       string
 	IsDir      bool
+	IsImplicit bool
 	Mode       fs.FileMode
 	ModTime    time.Time
 	HostSystem sys.HostSystem
@@ -634,6 +676,7 @@ func (f *File) Snapshot() *FileSnapshot {
 		file:       f,
 		Name:       f.name,
 		IsDir:      f.isDir,
+		IsImplicit: f.isImplicit,
 		Mode:       f.mode,
 		ModTime:    f.modTime,
 		HostSystem: f.hostSystem,

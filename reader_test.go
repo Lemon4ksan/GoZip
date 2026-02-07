@@ -410,9 +410,6 @@ func TestStreamReader_DataDescriptor(t *testing.T) {
 func TestStreamReader_RoundTrip(t *testing.T) {
 	buf := new(bytes.Buffer)
 	archive := NewZip()
-	archive.SetConfig(ZipConfig{
-		UseImplicitDirs: true,
-	})
 
 	testFiles := map[string]string{
 		"hello.txt":       "Hello World",

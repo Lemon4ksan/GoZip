@@ -29,7 +29,6 @@ func TestRoundTrip_Sequential(t *testing.T) {
 		CompressionMethod: gozip.Deflate,
 		CompressionLevel:  gozip.DeflateNormal,
 		Comment:           "Test Archive",
-		UseImplicitDirs:   true,
 	})
 
 	testFiles := map[string]string{

@@ -55,12 +55,13 @@ func ToFilePath(path string) Sink { return &fileManager{path: path} }
 func ToWriter(w io.Writer) Sink { return writerManager{w} }
 
 // Archiver provides a configurable environment for working with ZIP archives.
+// It is build on top of [Zip] and reduces boilerplate code for common operations.
 // By default, it supports the Store (no compression) and Deflate compression methods.
 type Archiver struct {
 	engineOptions []ArchiveOption
 }
 
-// NewArchiver creates a new Archiver instance with the specified options.
+// NewArchiver creates a new Archiver instance build on top of [Zip] with the specified options.
 func NewArchiver(opts ...ArchiveOption) *Archiver {
 	return &Archiver{engineOptions: opts}
 }
@@ -378,13 +379,9 @@ func (a *Archiver) TransformWithContext(ctx context.Context, src Source, dest Si
 		}
 
 		if newContent != nil {
-			// Add modified content (size unknown, will be buffered or streamed with descriptor)
 			output.AddReader(newContent, file.Name(), SizeUnknown)
 		} else {
-			// Add original file (Zero-copy optimization if possible)
-			// We need to re-add it to the new struct
-			output.files = append(output.files, file)
-			output.lookup[file.Name()] = file
+			output.Add(file)
 		}
 	}
 
