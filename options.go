@@ -126,6 +126,15 @@ func WithPath(p string) AddOption {
 	}
 }
 
+// WithMarkDirsImplicit marks added directories as implicit.
+func WithMarkDirsImplicit() AddOption {
+	return func(f *File) {
+		if f.isDir {
+			f.isImplicit = true
+		}
+	}
+}
+
 type processConfig struct {
 	filters    []Filter
 	password   string
