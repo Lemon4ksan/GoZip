@@ -849,7 +849,13 @@ func (a *Archiver) applyFilters(files []*File, filters []Filter) []*File {
 	return files
 }
 
-var DefaultArchiver = NewArchiver()
+var DefaultArchiver = NewArchiver(
+	WithZipConfig(ZipConfig{
+		CompressionMethod: Deflate,
+		CompressionLevel:  DeflateNormal,
+		FileSortStrategy:  SortZIP64Optimized,
+	}),
+)
 
 // ReadFile reads file content using the default archiver. See [Archiver.ReadFile].
 func ReadFile(zip Source, filename string) ([]byte, error) {
