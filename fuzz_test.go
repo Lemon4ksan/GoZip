@@ -1,4 +1,4 @@
-package gozip
+package gozip_test
 
 import (
 	"bytes"
@@ -6,8 +6,11 @@ import (
 	"path"
 	"strings"
 	"testing"
+
+	"github.com/lemon4ksan/gozip"
 )
 
+// Corpus data for FuzzLoad (valid minimal zip)
 var data = [...]byte{
 	0x50, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 0x77, 0x95, 0x39, 0x5C, 0xCD, 0x4E,
 	0xB0, 0xF8, 0x08, 0x01, 0x00, 0x00, 0xD1, 0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x74, 0x65,
@@ -41,13 +44,14 @@ func FuzzLoad(f *testing.F) {
 	f.Add(data[:])
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if len(data) > 10*1024*1024 {
+		if len(data) > 10*1024*1024 { // Sanity check for size
 			return
 		}
 
-		archive := NewZip()
+		archive := gozip.NewZip()
 		reader := bytes.NewReader(data)
 
+		// This uses memory structures, no disk I/O
 		_, err := archive.Load(reader, int64(len(data)))
 		if err != nil {
 			return
@@ -57,6 +61,7 @@ func FuzzLoad(f *testing.F) {
 			_ = file.Mode()
 			_ = file.ModTime()
 
+			// Open uses io.SectionReader on the memory buffer
 			rc, err := file.Open()
 			if err == nil {
 				buf := make([]byte, 100)
@@ -73,12 +78,16 @@ func FuzzWriteRead(f *testing.F) {
 	f.Add("weird\\backslashes\\file", []byte("windows path"))
 
 	f.Fuzz(func(t *testing.T, filename string, content []byte) {
+		if len(content) > 1024*1024 { // Sanity check for size
+			return
+		}
+
 		cleanName := strings.TrimPrefix(path.Clean(strings.ReplaceAll(filename, "\\", "/")), "/")
 		if cleanName == "" || cleanName == "." || cleanName == "/" {
 			return
 		}
 
-		archive := NewZip()
+		archive := gozip.NewZip()
 
 		_, err := archive.AddBytes(content, filename)
 		if err != nil {
@@ -91,7 +100,7 @@ func FuzzWriteRead(f *testing.F) {
 			t.Fatalf("failed to write valid archive: %v", err)
 		}
 
-		readArchive := NewZip()
+		readArchive := gozip.NewZip()
 		_, err = readArchive.Load(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 		if err != nil {
 			t.Fatalf("failed to load generated archive: %v", err)
@@ -129,7 +138,7 @@ func FuzzZipSlip(f *testing.F) {
 	f.Add("/absolute/path")
 
 	f.Fuzz(func(t *testing.T, pathName string) {
-		archive := NewZip()
+		archive := gozip.NewZip()
 		_, err := archive.AddBytes([]byte("data"), pathName)
 		if err != nil {
 			return
@@ -140,15 +149,15 @@ func FuzzZipSlip(f *testing.F) {
 			return
 		}
 
-		extractArch := NewZip()
+		extractArch := gozip.NewZip()
 		if _, err := extractArch.Load(bytes.NewReader(buf.Bytes()), int64(buf.Len())); err != nil {
 			return
 		}
 
-		err = extractArch.ExtractTo("output_dir")
+		err = extractArch.ExtractTo(t.TempDir())
 
 		if err != nil {
-			t.Logf("Got expected error for %s: %v", pathName, err)
+			t.Logf("Expected error for '%s': %v", pathName, err)
 		}
 	})
 }
