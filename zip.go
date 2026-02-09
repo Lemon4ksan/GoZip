@@ -418,31 +418,34 @@ func (z *Zip) AddDir(path string, opts ...AddOption) ([]*File, error) {
 func (z *Zip) AddFS(fileSystem fs.FS, opts ...AddOption) ([]*File, error) {
 	var errs []error
 	var files []*File
+	seen := make(map[string]bool)
 
 	walkErr := fs.WalkDir(fileSystem, ".", func(walkPath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			errs = append(errs, wrapErr("add", nil, fmt.Errorf("scan %s: %w", walkPath, err)))
 			return nil
 		}
-		if walkPath == "." {
+
+		cleanPath := path.Clean(walkPath)
+
+		if cleanPath == "." || seen[cleanPath] {
 			return nil
 		}
+		seen[cleanPath] = true
 
 		info, err := d.Info()
 		if err != nil {
+			errs = append(errs, wrapErr("add", nil, fmt.Errorf("stat %s: %w", walkPath, err)))
 			return nil
 		}
 
-		pathOpt := WithPath(path.Dir(walkPath))
-		fileOpts := append([]AddOption{pathOpt}, opts...)
-
-		f, err := newFileFromFS(fileSystem, walkPath, info)
+		f, err := newFileFromFS(fileSystem, cleanPath, info)
 		if err != nil {
-			return wrapErr("create", f, err)
+			errs = append(errs, wrapErr("create", f, err))
+			return nil
 		}
 
-		err = z.Add(f, fileOpts...)
-		if err != nil {
+		if err = z.Add(f); err != nil {
 			errs = append(errs, err)
 		} else {
 			files = append(files, f)
@@ -527,7 +530,8 @@ func (z *Zip) Remove(name string) ([]*File, error) {
 		if len(z.files) == 0 {
 			return nil, nil
 		}
-		files := z.Files()
+		files := make([]*File, len(z.files))
+		copy(files, z.files)
 		z.files = z.files[:0]
 		clear(z.lookup)
 		return files, nil
