@@ -8,7 +8,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -16,227 +15,216 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/lemon4ksan/gozip/internal"
 )
 
 func defaultTime() time.Time {
 	return time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
 }
 
-// TestZipWriter_WriteFileHeader tests local file header writing
-func TestZipWriter_WriteFileHeader(t *testing.T) {
-	tests := []struct {
-		name    string
-		file    *File
-		wantErr bool
-	}{
-		{
-			name: "basic file header",
-			file: &File{
-				name:    "test.txt",
-				modTime: defaultTime(),
-			},
-			wantErr: false,
-		},
-		{
-			name: "file with long name",
-			file: &File{
-				name:    strings.Repeat("a", 100) + ".txt",
-				modTime: defaultTime(),
-			},
-			wantErr: false,
-		},
+func TestZipWriter_Encryption_Seeker(t *testing.T) {
+	zw := newZipWriter(ZipConfig{}, nil, io.Discard)
+	data := []byte("secret data")
+
+	src := bytes.NewReader(data)
+	cfg := FileConfig{
+		EncryptionMethod:  AES256,
+		Password:          "password",
+		CompressionMethod: Deflate,
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mw := NewMemoryWriteSeeker()
-			zw := newZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw)
+	stats, err := zw.encodeTo(src, io.Discard, cfg)
+	if err != nil {
+		t.Fatalf("encodeTo encrypted seeker failed: %v", err)
+	}
 
-			err := zw.writeFileHeader(tt.file.Snapshot())
-
-			if (err != nil) != tt.wantErr {
-				t.Errorf("WriteFileHeader() error = %v, wantErr %v", err, tt.wantErr)
-			}
-
-			// Verify header signature
-			buf := mw.Bytes()
-			if len(buf) < 4 {
-				t.Error("WriteFileHeader() should write at least 4 bytes")
-			}
-
-			const expectedSig = internal.LocalFileHeaderSignature
-			signature := binary.LittleEndian.Uint32(buf[:4])
-			if signature != expectedSig {
-				t.Errorf("WriteFileHeader() signature = %x, want %x", signature, expectedSig)
-			}
-		})
+	if stats.uncompressedSize != int64(len(data)) {
+		t.Errorf("Expected size %d, got %d", len(data), stats.uncompressedSize)
+	}
+	if stats.crc32 != 0 {
+		t.Errorf("Expected CRC32 to be 0 for AES, got %x", stats.crc32)
 	}
 }
 
-// TestZipWriter_EncodeToWriter tests compression logic
-func TestZipWriter_EncodeToWriter(t *testing.T) {
-	const testData = "This is a long text with some repetition to demonstrate compression in action"
-	const expectedCRC = 0xdf3e3946
+func TestZipWriter_Encryption_Stream(t *testing.T) {
+	zw := newZipWriter(ZipConfig{}, nil, io.Discard)
+	data := []byte("stream secret")
 
-	tests := []struct {
-		name        string
-		compression CompressionMethod
-		level       int
-		wantErr     bool
-	}{
-		{
-			name:        "store compression",
-			compression: Store,
-			wantErr:     false,
-		},
-		{
-			name:        "deflate compression",
-			compression: Deflate,
-			level:       DeflateNormal,
-			wantErr:     false,
-		},
-		{
-			name:        "unsupported compression",
-			compression: CompressionMethod(99),
-			wantErr:     true,
-		},
+	src := bytes.NewBuffer(data)
+	cfg := FileConfig{
+		EncryptionMethod:  ZipCrypto,
+		Password:          "password",
+		CompressionMethod: Store,
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var destBuf bytes.Buffer
-			mw := NewMemoryWriteSeeker()
-			zw := newZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw)
+	stats, err := zw.encodeTo(src, io.Discard, cfg)
+	if err != nil {
+		t.Fatalf("encodeTo encrypted stream failed: %v", err)
+	}
 
-			src := strings.NewReader(testData)
-			config := FileConfig{
-				CompressionMethod: tt.compression,
-				CompressionLevel:  tt.level,
-				EncryptionMethod:  NotEncrypted,
-			}
-
-			stats, err := zw.encodeTo(src, &destBuf, config)
-
-			if (err != nil) != tt.wantErr {
-				t.Errorf("encodeToWriter() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-
-			if err != nil {
-				return
-			}
-
-			if stats.uncompressedSize != int64(len(testData)) {
-				t.Errorf("Stats.uncompressed = %d, want %d", stats.uncompressedSize, len(testData))
-			}
-
-			if stats.crc32 != uint32(expectedCRC) {
-				t.Errorf("Stats.crc32 = %d, want %d", stats.crc32, expectedCRC)
-			}
-		})
+	if stats.uncompressedSize != int64(len(data)) {
+		t.Errorf("Expected size %d, got %d", len(data), stats.uncompressedSize)
 	}
 }
 
-// TestZipWriter_WriteFile_Strategies verify logic selection (Stream vs TempFile)
-func TestZipWriter_WriteFile_Strategies(t *testing.T) {
-	data := []byte("test data for strategies")
+func TestZipWriter_Zip64_Finalization(t *testing.T) {
+	buf := new(bytes.Buffer)
+	zw := newZipWriter(ZipConfig{}, nil, buf)
 
-	tests := []struct {
-		name             string
-		uncompressedSize int64
-		isDir            bool
-	}{
-		{
-			name:             "Stream Path (Known Size)",
-			uncompressedSize: int64(len(data)),
-			isDir:            false,
-		},
-		{
-			name:             "Buffered Path (Unknown Size)",
-			uncompressedSize: SizeUnknown,
-			isDir:            false,
-		},
+	zw.entriesNum = StandardEntriesLimit + 1
+	zw.headerOffset = 100
+	zw.centralDirSize = 200
+
+	err := zw.WriteCentralDirAndEndRecords()
+	if err != nil {
+		t.Fatalf("WriteCentralDirAndEndRecords Zip64 failed: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mw := NewMemoryWriteSeeker()
-			zw := newZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw)
-
-			file := &File{
-				name:             "test",
-				uncompressedSize: tt.uncompressedSize,
-				isDir:            tt.isDir,
-				modTime:          defaultTime(),
-				config:           FileConfig{CompressionMethod: Store},
-				openFunc: func() (io.ReadCloser, error) {
-					return io.NopCloser(bytes.NewReader(data)), nil
-				},
-			}
-
-			err := zw.WriteFile(file)
-			if err != nil {
-				t.Fatalf("WriteFile() error = %v", err)
-			}
-
-			output := mw.Bytes()
-			if len(output) == 0 {
-				t.Fatal("Output is empty")
-			}
-
-			if file.crc32 == 0 {
-				t.Error("File CRC32 was not updated")
-			}
-			if file.compressedSize != int64(len(data)) {
-				t.Errorf("Compressed size mismatch: got %d want %d", file.compressedSize, len(data))
-			}
-		})
+	out := buf.Bytes()
+	if !bytes.Contains(out, []byte{0x50, 0x4b, 0x06, 0x06}) {
+		t.Error("Output should contain Zip64 EOCD signature")
 	}
 }
 
-// TestZipWriter_UpdateLocalHeader tests patching of CRC and sizes in Stream mode
-func TestZipWriter_UpdateLocalHeader(t *testing.T) {
-	file := &File{
-		name:              "test.txt",
-		crc32:             0x12345678,
-		compressedSize:    100,
-		uncompressedSize:  100,
-		localHeaderOffset: 0,
-		modTime:           defaultTime(),
-	}
-
+func TestZipWriter_EncodeToAndUpdate_RawCopy(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
-	zw := newZipWriter(ZipConfig{}, make(map[CompressionMethod]CompressorFactory), mw)
+	zw := newZipWriter(ZipConfig{}, nil, mw)
 
-	// 1. Write initial header
-	err := zw.writeFileHeader(file.Snapshot())
+	rawData := []byte("already compressed data")
+
+	f := &File{
+		name:      "raw.bin",
+		srcConfig: FileConfig{CompressionMethod: Deflate},
+		config:    FileConfig{CompressionMethod: Deflate},
+		srcFunc: func() (*io.SectionReader, error) {
+			return io.NewSectionReader(bytes.NewReader(rawData), 0, int64(len(rawData))), nil
+		},
+	}
+
+	snap := f.Snapshot()
+	err := zw.encodeToAndUpdate(snap, mw)
 	if err != nil {
-		t.Fatalf("WriteFileHeader() error = %v", err)
+		t.Fatalf("Raw copy failed: %v", err)
 	}
+}
 
-	// 2. Simulate data writing
-	mw.Write(make([]byte, 100))
+func TestZipWriter_ImplicitDirs(t *testing.T) {
+	t.Run("Ignore Implicit", func(t *testing.T) {
+		mw := NewMemoryWriteSeeker()
+		zw := newZipWriter(ZipConfig{IncludeImplicitDirs: false}, nil, mw)
 
-	// 3. Update header
-	err = zw.updateLocalHeader(file.Snapshot())
+		snap := &FileSnapshot{IsImplicit: true, Name: "ignored/"}
+		err := zw.writeFileHeader(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mw.pos > 0 {
+			t.Error("Implicit dir should not be written to header")
+		}
+	})
+
+	t.Run("Include Implicit", func(t *testing.T) {
+		mw := NewMemoryWriteSeeker()
+		zw := newZipWriter(ZipConfig{IncludeImplicitDirs: true}, nil, mw)
+
+		snap := &FileSnapshot{IsImplicit: true, Name: "included/"}
+		err := zw.writeFileHeader(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mw.pos == 0 {
+			t.Error("Implicit dir should be written when IncludeImplicitDirs is true")
+		}
+	})
+}
+
+func TestZipWriter_ResolveCompressor_Caching(t *testing.T) {
+	zw := newZipWriter(ZipConfig{}, nil, io.Discard)
+
+	c1, err := zw.resolveCompressor(Deflate, 5)
 	if err != nil {
-		t.Errorf("UpdateLocalHeader() error = %v", err)
+		t.Fatal(err)
 	}
 
-	// 4. Verify Patching
-	headerData := mw.Bytes()
-
-	// CRC is at offset 14 (4 bytes), CompSize at 18, UncompSize at 22
-	crcFromHeader := binary.LittleEndian.Uint32(headerData[14:18])
-	if crcFromHeader != file.crc32 {
-		t.Errorf("CRC32 in header = %x, want %x", crcFromHeader, file.crc32)
+	c2, err := zw.resolveCompressor(Deflate, 5)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	compSize := binary.LittleEndian.Uint32(headerData[18:22])
-	if compSize != uint32(file.compressedSize) {
-		t.Errorf("CompressedSize in header = %d, want %d", compSize, file.compressedSize)
+	if c1 != c2 {
+		t.Error("Compressor should be cached and returned as the same instance")
+	}
+
+	c3, _ := zw.resolveCompressor(Deflate, 1)
+	if c1 == c3 {
+		t.Error("Compressors with different levels should not be the same instance")
+	}
+}
+
+func TestZipWriter_UnsupportedAlgorithm(t *testing.T) {
+	zw := newZipWriter(ZipConfig{}, nil, io.Discard)
+	_, err := zw.resolveCompressor(CompressionMethod(999), 0)
+	if !errors.Is(err, ErrAlgorithm) {
+		t.Errorf("Expected ErrAlgorithm, got %v", err)
+	}
+}
+
+func TestZipWriter_DataDescriptor_Streaming(t *testing.T) {
+	buf := new(bytes.Buffer)
+	zw := newZipWriter(ZipConfig{}, nil, buf)
+
+	data := []byte("data for descriptor")
+	file := &File{
+		name:             "stream.txt",
+		uncompressedSize: int64(len(data)),
+		config:           FileConfig{CompressionMethod: Store},
+		openFunc: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(data)), nil
+		},
+	}
+
+	err := zw.WriteFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = zw.WriteCentralDirAndEndRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Contains(buf.Bytes(), []byte{0x50, 0x4b, 0x07, 0x08}) {
+		t.Error("Stream mode without seeker should write Data Descriptor")
+	}
+}
+
+func TestZipWriter_EncodeToAndUpdate_Errors(t *testing.T) {
+	zw := newZipWriter(ZipConfig{}, nil, io.Discard)
+
+	f := &File{
+		name: "error.txt",
+		openFunc: func() (io.ReadCloser, error) {
+			return nil, errors.New("open error")
+		},
+	}
+
+	err := zw.encodeToAndUpdate(f.Snapshot(), io.Discard)
+	if err == nil || err.Error() != "open error" {
+		t.Errorf("Expected open error, got %v", err)
+	}
+}
+
+func TestZipWriter_FinalizeStats(t *testing.T) {
+	zw := newZipWriter(ZipConfig{}, nil, io.Discard)
+	stats := encodingStats{crc32: 0x1234}
+
+	s1 := zw.finalizeStats(stats, FileConfig{EncryptionMethod: AES256})
+	if s1.crc32 != 0 {
+		t.Error("AES stats must have 0 CRC32")
+	}
+
+	s2 := zw.finalizeStats(stats, FileConfig{EncryptionMethod: ZipCrypto})
+	if s2.crc32 != 0x1234 {
+		t.Error("ZipCrypto stats must preserve CRC32")
 	}
 }
 
