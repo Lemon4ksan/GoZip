@@ -29,10 +29,17 @@ func (e *FileError) Unwrap() error {
 	return e.Err
 }
 
+// Global errors
 var (
 	// ErrFormat is returned when the input is not a valid ZIP archive.
-	ErrFormat = errors.New("not a valid zip file")
+	ErrFormat = errors.New("zip: not a valid zip file")
 
+	// ErrNotImplemented is returned if this code path is not implemented.
+	ErrNotImplemented = errors.New("zip: not implemented")
+)
+
+// File errors
+var (
 	// ErrFileEntry is returned when an invalid argument is passed to File creation.
 	ErrFileEntry = errors.New("not a valid file entry")
 

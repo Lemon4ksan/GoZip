@@ -3,17 +3,20 @@ package gozip
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 )
 
 // Source provides an interface for reading a ZIP archive.
 // Implementations must support multiple reads (for example, via io.ReaderAt).
 type Source interface {
-	Open() (io.ReaderAt, int64, error)
+	Open() (io.Reader, int64, error)
 	Close() error
 }
 
@@ -31,8 +34,11 @@ func FromFile(f *os.File) Source { return &fileManager{f: f} }
 // FromFilePath creates a Source from a file at the specified path.
 func FromFilePath(path string) Source { return &fileManager{path: path} }
 
-// FromReader creates a Source from an io.ReaderAt with a known size.
-func FromReader(r io.ReaderAt, size int64) Source { return readerManager{r, size} }
+// FromStream creates source from an [io.Reader] with a known size.
+func FromStream(r io.Reader, size int64) Source { return readerManager{r, size} }
+
+// FromReaderAt creates a Source from an [io.ReaderAt] with a known size.
+func FromReaderAt(r io.ReaderAt, size int64) Source { return readerAtManager{r, size} }
 
 // FromURL creates a Source for reading a ZIP archive over HTTP.
 // Requirements: the server must support the "Range" header (Accept-Ranges: bytes).
@@ -54,9 +60,76 @@ func ToFilePath(path string) Sink { return &fileManager{path: path} }
 // ToWriter creates a Sink for writing to an io.Writer.
 func ToWriter(w io.Writer) Sink { return writerManager{w} }
 
+// UseSource opens the source, handles the ReaderAt vs Reader distinction,
+// and ensures resources are closed properly after fn executes.
+//
+// It passes:
+//   - r: The underlying stream (always non-nil).
+//   - rAt: The Random Access interface (non-nil if supported, e.g. File or Memory).
+//   - size: The total size (or [SizeUnknown]).
+func UseSource(src Source, fn func(r io.Reader, rAt io.ReaderAt, size int64) error) (err error) {
+	r, size, err := src.Open()
+	if err != nil {
+		return
+	}
+	defer func() {
+		closeErr := src.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}()
+
+	var rAt io.ReaderAt
+	if ra, ok := r.(io.ReaderAt); ok {
+		rAt = ra
+	}
+
+	err = fn(r, rAt, size)
+	return
+}
+
+// UseSink creates the destination writer and ensures it is closed properly.
+func UseSink(sink Sink, fn func(w io.Writer) error) (err error) {
+	w, err := sink.Create()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		closeErr := sink.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}()
+
+	err = fn(w)
+	return
+}
+
+// SafePath returns a clean, absolute path for a zip entry within the destination directory.
+// It ensures that the resulting path is inside the destDir (prevents Zip Slip).
+func SafePath(destDir, fileName string) (string, error) {
+	cleanedName := strings.TrimPrefix(path.Clean("/"+fileName), "/")
+
+	for _, r := range fileName {
+		if r < 0x20 || r == 0x7F {
+			return "", fmt.Errorf("%w: filename contains control characters", ErrInsecurePath)
+		}
+	}
+
+	destDir = filepath.Clean(destDir)
+	fullPath := filepath.Join(destDir, filepath.FromSlash(cleanedName))
+
+	rel, err := filepath.Rel(destDir, fullPath)
+	if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return "", fmt.Errorf("%w: path escapes destination directory", ErrInsecurePath)
+	}
+
+	return fullPath, nil
+}
+
 // Archiver provides a configurable environment for working with ZIP archives.
 // It is build on top of [Zip] and reduces boilerplate code for common operations.
-// By default, it supports the Store (no compression) and Deflate compression methods.
+// By default, it supports the [Store] (no compression) and [Deflate] compression methods.
 type Archiver struct {
 	engineOptions []ArchiveOption
 }
@@ -72,49 +145,58 @@ func (a *Archiver) newZip(opts ...ArchiveOption) *Zip {
 }
 
 // ReadFile reads the contents of a file from the archive into a byte slice.
-// Warning: this loads the entire file into memory. For large files, use Extract or StreamReader.
 func (a *Archiver) ReadFile(zip Source, filename string) ([]byte, error) {
 	return a.ReadFileWithContext(context.Background(), zip, filename)
 }
 
 // ReadFileWithContext reads file content with context support.
 // Cancelling the context stops the reading process.
-func (a *Archiver) ReadFileWithContext(ctx context.Context, zip Source, filename string) (data []byte, err error) {
-	archive := a.newZip()
-	if err = a.loadZip(ctx, zip, archive); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := zip.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
+func (a *Archiver) ReadFileWithContext(ctx context.Context, zip Source, filename string) ([]byte, error) {
+	var data []byte
 
-	rc, err := a.openFile(filename, archive)
-	if err != nil {
-		return
-	}
-	defer func() {
-		closeErr := rc.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
+	err := UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt != nil {
+			archive := a.newZip()
+			if _, err := archive.LoadWithContext(ctx, rAt, size); err != nil {
+				return err
+			}
 
-	data, err = io.ReadAll(rc)
-	return
+			rc, err := a.openFile(filename, archive)
+			if err != nil {
+				return err
+			}
+
+			data, err = io.ReadAll(rc)
+			return err
+		}
+
+		sr := NewStreamReader(r, WithStreamConfig(a.newZip().Config()))
+		_, err := sr.Scan(filename)
+		if err != nil {
+			return err
+		}
+
+		rc, err := sr.Open()
+		if err != nil {
+			return err
+		}
+
+		data, err = io.ReadAll(rc)
+		return err
+	})
+
+	return data, err
 }
 
 // ReplaceFile replaces a file in the archive with new content.
 // The other files are copied without changes.
-func (a *Archiver) ReplaceFile(src Source, dest Sink, filename string, content io.Reader) error {
-	return a.ReplaceFileWithContext(context.Background(), src, dest, filename, content)
+func (a *Archiver) ReplaceFile(zip Source, dest Sink, filename string, content io.Reader) error {
+	return a.ReplaceFileWithContext(context.Background(), zip, dest, filename, content)
 }
 
 // ReplaceFileWithContext replaces a file in the archive with new content with context support.
-func (a *Archiver) ReplaceFileWithContext(ctx context.Context, src Source, dest Sink, filename string, content io.Reader) error {
-	return a.TransformWithContext(ctx, src, dest, func(f *File) (io.Reader, error) {
+func (a *Archiver) ReplaceFileWithContext(ctx context.Context, zip Source, dest Sink, filename string, content io.Reader) error {
+	return a.TransformWithContext(ctx, zip, dest, func(f *File) (io.Reader, error) {
 		if f.Name() == filename {
 			// Replace content. Note: SizeUnknown implies buffering if Sink is not seekable.
 			// But since we are inside Transform, the file header is rewritten anyway.
@@ -126,47 +208,80 @@ func (a *Archiver) ReplaceFileWithContext(ctx context.Context, src Source, dest 
 }
 
 // GetEntries returns a list of files in the archive without loading their contents.
-// This is a fast operation: it only reads the Central Directory.
+// If source is [io.Reader], the returned files cannot be opened.
 func (a *Archiver) GetEntries(zip Source) ([]*File, error) {
 	return a.GetEntriesWithContext(context.Background(), zip)
 }
 
 // GetEntriesWithContext lists files with context support.
-func (a *Archiver) GetEntriesWithContext(ctx context.Context, zip Source) (files []*File, err error) {
-	archive := a.newZip()
-	if err = a.loadZip(ctx, zip, archive); err != nil {
-		return nil, err
-	}
-	defer func() {
-		closeErr := zip.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
+func (a *Archiver) GetEntriesWithContext(ctx context.Context, zip Source) ([]*File, error) {
+	var files []*File
 
-	return archive.Files(), err
+	err := UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt != nil {
+			var err error
+			files, err = a.newZip().LoadWithContext(ctx, rAt, size)
+			return err
+		}
+
+		sr := NewStreamReader(r, WithStreamConfig(a.newZip().Config()))
+
+		for {
+			f, err := sr.Next()
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			files = append(files, f)
+		}
+	})
+
+	return files, err
 }
 
 // Verify checks the integrity of the files in the archive (CRC, checksums).
+// If source is [io.Reader], zip options do not apply.
 func (a *Archiver) Verify(zip Source, opts ...ZipOption) error {
 	return a.VerifyWithContext(context.Background(), zip, opts...)
 }
 
 // Verify checks the integrity of the files in the archive with context support.
-func (a *Archiver) VerifyWithContext(ctx context.Context, zip Source, opts ...ZipOption) (err error) {
-	archive := a.newZip()
-	if err = a.loadZip(ctx, zip, archive); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := zip.Close()
-		if err == nil {
-			err = closeErr
+func (a *Archiver) VerifyWithContext(ctx context.Context, zip Source, opts ...ZipOption) error {
+	return UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt != nil {
+			archive := a.newZip()
+			archive.LoadWithContext(ctx, rAt, size)
+			return archive.VerifyWithContext(ctx, opts...)
 		}
-	}()
 
-	err = archive.VerifyWithContext(ctx, opts...)
-	return
+		sr := NewStreamReader(r, WithStreamConfig(a.newZip().Config()))
+		var errs []error
+
+		for {
+			_, err := sr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				errs = append(errs, err)
+				break
+			}
+
+			r, err = sr.Open()
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+
+			if _, err = io.Copy(io.Discard, r); err != nil {
+				errs = append(errs, err)
+			}
+		}
+
+		return errors.Join(errs...)
+	})
 }
 
 // Exists checks for the presence of a file in the archive.
@@ -175,50 +290,82 @@ func (a *Archiver) Exists(zip Source, filename string) (bool, error) {
 }
 
 // ExistsWithContext checks if a file exists with context support.
-func (a *Archiver) ExistsWithContext(ctx context.Context, zip Source, filename string) (exists bool, err error) {
-	archive := a.newZip()
-	if err = a.loadZip(ctx, zip, archive); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := zip.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
+func (a *Archiver) ExistsWithContext(ctx context.Context, zip Source, filename string) (bool, error) {
+	var exists bool
 
-	exists = archive.Exists(filename)
-	return
+	err := UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt != nil {
+			archive := a.newZip()
+			if _, err := archive.LoadWithContext(ctx, rAt, size); err != nil {
+				return err
+			}
+			exists = archive.Exists(filename)
+			return nil
+		}
+
+		sr := NewStreamReader(r, WithStreamConfig(a.newZip().Config()))
+
+		for {
+			f, err := sr.Next()
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if f.Name() == filename {
+				exists = true
+				return nil
+			}
+		}
+	})
+
+	return exists, err
 }
 
 // Walk traverses all files in the archive, calling walkFn for each one.
-// If walkFn returns an error, the traversal stops.
+// If walkFn returns an error, the traversal stops. Filters don't apply if source is [io.Reader].
 func (a *Archiver) Walk(zip Source, walkFn func(*File) error, filters ...Filter) error {
 	return a.WalkWithContext(context.Background(), zip, walkFn, filters...)
 }
 
 // WalkWithContext iterates over the archive with context cancellation support.
 func (a *Archiver) WalkWithContext(ctx context.Context, zip Source, walkFn func(*File) error, filters ...Filter) (err error) {
-	archive := a.newZip()
-	if err = a.loadZip(ctx, zip, archive); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := zip.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
+	return UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt != nil {
+			files, err := a.newZip().LoadWithContext(ctx, rAt, size)
+			if err != nil {
+				return err
+			}
 
-	for _, f := range a.applyFilters(archive.Files(), filters) {
-		if err = ctx.Err(); err != nil {
-			return
+			for _, f := range a.applyFilters(files, filters) {
+				if err = ctx.Err(); err != nil {
+					return err
+				}
+				if err = walkFn(f); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
-		if err = walkFn(f); err != nil {
-			return
+
+		sr := NewStreamReader(r)
+
+		for {
+			f, err := sr.Next()
+			if err != nil {
+				return err
+			}
+
+			// Allow file to be opened in walkFn
+			size := f.UncompressedSize()
+			f.WithOpenFunc(sr.Open).WithUncompressedSize(size)
+
+			if err = walkFn(f); err != nil {
+				return err
+			}
 		}
-	}
-	return
+	})
 }
 
 // Search searches for text within the contents of all files in the archive.
@@ -295,43 +442,36 @@ func (a *Archiver) SearchWithContext(ctx context.Context, zip Source, text strin
 
 // UpdateMetadata modifies the metadata of files in the archive.
 // Example: normalizing access permissions, adding comments.
-func (a *Archiver) UpdateMetadata(src Source, dest Sink, modifier func(*File), opts ...ZipOption) error {
-	return a.UpdateMetadataWithContext(context.Background(), src, dest, modifier, opts...)
+// Returns [ErrNotImplemented] if source is [io.Reader].
+func (a *Archiver) UpdateMetadata(zip Source, dest Sink, modifier func(*File), opts ...ZipOption) error {
+	return a.UpdateMetadataWithContext(context.Background(), zip, dest, modifier, opts...)
 }
 
 // UpdateMetadataWithContext allows bulk modification with context support.
-func (a *Archiver) UpdateMetadataWithContext(ctx context.Context, src Source, dest Sink, modifier func(*File), opts ...ZipOption) (err error) {
-	archive := a.newZip()
-	if err = a.loadZip(ctx, src, archive); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := src.Close()
-		if err == nil {
-			err = closeErr
+func (a *Archiver) UpdateMetadataWithContext(ctx context.Context, zip Source, dest Sink, modifier func(*File), opts ...ZipOption) error {
+	return UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt == nil {
+			return fmt.Errorf("%w: UpdateMetadata only accepts io.ReaderAt", ErrNotImplemented)
 		}
-	}()
 
-	for _, f := range archive.Files() {
-		if err = ctx.Err(); err != nil {
-			return
+		archive := a.newZip()
+		files, err := archive.LoadWithContext(ctx, rAt, size)
+		if err != nil {
+			return err
 		}
-		modifier(f)
-	}
 
-	w, err := dest.Create()
-	if err != nil {
-		return
-	}
-	defer func() {
-		closeErr := dest.Close()
-		if err == nil {
-			err = closeErr
+		for _, f := range files {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			modifier(f)
 		}
-	}()
 
-	_, err = archive.WriteToWithContext(ctx, w, opts...)
-	return
+		return UseSink(dest, func(w io.Writer) error {
+			_, err = archive.WriteToWithContext(ctx, w, opts...)
+			return err
+		})
+	})
 }
 
 // TransformFunc defines the logic for modifying a file:
@@ -349,55 +489,47 @@ type TransformFunc func(f *File) (io.Reader, error)
 //	    }
 //	    return nil, nil // Keep original content
 //	})
-func (a *Archiver) Transform(src Source, dest Sink, fn TransformFunc, opts ...ZipOption) error {
-	return a.TransformWithContext(context.Background(), src, dest, fn, opts...)
+//
+// Returns [ErrNotImplemented] if source is [io.Reader].
+func (a *Archiver) Transform(zip Source, dest Sink, fn TransformFunc, opts ...ZipOption) error {
+	return a.TransformWithContext(context.Background(), zip, dest, fn, opts...)
 }
 
 // TransformWithContext applies a function to each file in the archive, allowing modification of content with context support.
-func (a *Archiver) TransformWithContext(ctx context.Context, src Source, dest Sink, fn TransformFunc, opts ...ZipOption) (err error) {
-	input := a.newZip()
-	if err = a.loadZip(ctx, src, input); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := src.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
-
-	output := a.newZip().SetConfig(input.Config())
-
-	for _, file := range input.Files() {
-		if err := ctx.Err(); err != nil {
-			return err
+func (a *Archiver) TransformWithContext(ctx context.Context, zip Source, dest Sink, fn TransformFunc, opts ...ZipOption) error {
+	return UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt == nil {
+			return fmt.Errorf("%w: Transform only accepts io.ReaderAt", ErrNotImplemented)
 		}
 
-		newContent, err := fn(file)
+		files, err := a.newZip().LoadWithContext(ctx, rAt, size)
 		if err != nil {
 			return err
 		}
 
-		if newContent != nil {
-			output.AddReader(newContent, file.Name(), SizeUnknown)
-		} else {
-			output.Add(file)
-		}
-	}
+		output := a.newZip()
+		for _, file := range files {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 
-	w, err := dest.Create()
-	if err != nil {
-		return
-	}
-	defer func() {
-		closeErr := dest.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
+			newContent, err := fn(file)
+			if err != nil {
+				return err
+			}
 
-	_, err = output.WriteToWithContext(ctx, w, opts...)
-	return
+			if newContent != nil {
+				output.AddReader(newContent, file.Name(), SizeUnknown)
+			} else {
+				output.Add(file)
+			}
+		}
+
+		return UseSink(dest, func(w io.Writer) error {
+			_, err = output.WriteToWithContext(ctx, w, opts...)
+			return err
+		})
+	})
 }
 
 // ArchiveDiff describes the differences between two archives.
@@ -412,37 +544,17 @@ func (a *Archiver) Diff(srcA, srcB Source, filters ...Filter) (ArchiveDiff, erro
 	return a.DiffWithContext(context.Background(), srcA, srcB, filters...)
 }
 
-func (a *Archiver) DiffWithContext(ctx context.Context, srcA, srcB Source, filters ...Filter) (diff ArchiveDiff, err error) {
-	zipA := a.newZip()
-	zipB := a.newZip()
-
-	if err = a.loadZip(ctx, srcA, zipA); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := srcA.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
-
-	if err = a.loadZip(ctx, srcB, zipB); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := srcB.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
+func (a *Archiver) DiffWithContext(ctx context.Context, zipA, zipB Source, filters ...Filter) (diff ArchiveDiff, err error) {
+	filesA, err := a.GetEntriesWithContext(ctx, zipA)
+	filesB, err := a.GetEntriesWithContext(ctx, zipB)
 
 	mapA := make(map[string]*File)
-	for _, f := range a.applyFilters(zipA.Files(), filters) {
+	for _, f := range a.applyFilters(filesA, filters) {
 		mapA[f.Name()] = f
 	}
 
 	mapB := make(map[string]*File)
-	for _, f := range a.applyFilters(zipB.Files(), filters) {
+	for _, f := range a.applyFilters(filesB, filters) {
 		mapB[f.Name()] = f
 	}
 
@@ -473,13 +585,13 @@ func (a *Archiver) DiffWithContext(ctx context.Context, srcA, srcB Source, filte
 }
 
 // Tree returns a text representation of the archive structure (similar to the `tree` command).
-func (a *Archiver) Tree(src Source, filters ...Filter) (string, error) {
-	return a.TreeWithContext(context.Background(), src, filters...)
+func (a *Archiver) Tree(zip Source, filters ...Filter) (string, error) {
+	return a.TreeWithContext(context.Background(), zip, filters...)
 }
 
 // Tree returns a string representation of the archive structure with context support.
-func (a *Archiver) TreeWithContext(ctx context.Context, src Source, filters ...Filter) (string, error) {
-	files, err := a.GetEntriesWithContext(ctx, src)
+func (a *Archiver) TreeWithContext(ctx context.Context, zip Source, filters ...Filter) (string, error) {
+	files, err := a.GetEntriesWithContext(ctx, zip)
 	if err != nil {
 		return "", err
 	}
@@ -524,10 +636,10 @@ func (a *Archiver) ArchiveDir(srcDir string, destZip Sink, opts ...ZipOption) er
 
 // ArchiveDirWithContext recursively adds contents of the directory with context support.
 // Cancelling the context stops processing remaining files and closes the destination file.
-func (a *Archiver) ArchiveDirWithContext(ctx context.Context, srcDir string, destZip Sink, opts ...ZipOption) (err error) {
+func (a *Archiver) ArchiveDirWithContext(ctx context.Context, srcDir string, destZip Sink, opts ...ZipOption) error {
 	info, err := os.Stat(srcDir)
 	if err != nil {
-		return
+		return err
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("%w: %s is not a directory", ErrFileEntry, srcDir)
@@ -535,22 +647,13 @@ func (a *Archiver) ArchiveDirWithContext(ctx context.Context, srcDir string, des
 
 	archive := a.newZip()
 	if _, err = archive.AddDir(srcDir); err != nil {
-		return
+		return err
 	}
 
-	dest, err := destZip.Create()
-	if err != nil {
-		return
-	}
-	defer func() {
-		closeErr := destZip.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
-
-	_, err = archive.WriteToWithContext(ctx, dest, opts...)
-	return
+	return UseSink(destZip, func(w io.Writer) error {
+		_, err := archive.WriteToWithContext(ctx, w, opts...)
+		return err
+	})
 }
 
 // ArchiveFiles archives a list of files.
@@ -560,122 +663,100 @@ func (a *Archiver) ArchiveFiles(files []string, destZip Sink, opts ...ZipOption)
 }
 
 // ArchiveFilesWithContext creates an archive from a list of files with context support.
-func (a *Archiver) ArchiveFilesWithContext(ctx context.Context, files []string, destZip Sink, opts ...ZipOption) (err error) {
+func (a *Archiver) ArchiveFilesWithContext(ctx context.Context, files []string, destZip Sink, opts ...ZipOption) error {
 	archive := a.newZip()
+
 	for _, file := range files {
-		if _, err = archive.AddFile(file, WithName(filepath.Base(file))); err != nil {
-			return
+		if _, err := archive.AddFile(file, WithName(filepath.Base(file))); err != nil {
+			return err
 		}
 	}
 
-	dest, err := destZip.Create()
-	if err != nil {
-		return
-	}
-	defer func() {
-		closeErr := destZip.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
-
-	_, err = archive.WriteToWithContext(ctx, dest, opts...)
-	return
+	return UseSink(destZip, func(w io.Writer) error {
+		_, err := archive.WriteToWithContext(ctx, w, opts...)
+		return err
+	})
 }
 
 // Merge combines multiple archives into one.
 // Conflict resolution strategy: "the last written file wins".
+// Returns [ErrNotImplemented] if source is [io.Reader].
 func (a *Archiver) Merge(destZip Sink, sources ...Source) error {
 	return a.MergeWithContext(context.Background(), destZip, sources...)
 }
 
 // MergeWithContext combines archives with context support.
-func (a *Archiver) MergeWithContext(ctx context.Context, destZip Sink, sources ...Source) (err error) {
+func (a *Archiver) MergeWithContext(ctx context.Context, destZip Sink, sources ...Source) error {
 	archive := a.newZip()
+
 	for _, src := range sources {
-		if err = a.loadZip(ctx, src, archive); err != nil {
-			_ = src.Close() // Close current on error
+		err := UseSource(src, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+			if rAt == nil {
+				return fmt.Errorf("%w: Merge only accepts io.ReaderAt", ErrNotImplemented)
+			}
+			_, err := archive.LoadWithContext(ctx, rAt, size)
+			return err
+		})
+		if err != nil {
 			return err
 		}
-		defer func() {
-			closeErr := src.Close()
-			if err == nil {
-				err = closeErr
-			}
-		}()
 	}
 
-	dest, err := destZip.Create()
-	if err != nil {
-		return
-	}
-	defer func() {
-		closeErr := destZip.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
-
-	_, err = archive.WriteToWithContext(ctx, dest)
-	return
+	return UseSink(destZip, func(w io.Writer) error {
+		_, err := archive.WriteToWithContext(ctx, w)
+		return err
+	})
 }
 
 // Clone copies the archive with the possibility of applying filters or modifiers.
 // Example: deleting files, changing compression.
+// Returns [ErrNotImplemented] if source is [io.Reader].
 func (a *Archiver) Clone(zip Source, destZip Sink, opts ...ZipOption) error {
 	return a.CloneWithContext(context.Background(), zip, destZip, opts...)
 }
 
 // CloneWithContext copies archive with context support.
-func (a *Archiver) CloneWithContext(ctx context.Context, zip Source, destZip Sink, opts ...ZipOption) (err error) {
-	archive := a.newZip()
-	if err = a.loadZip(ctx, zip, archive); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := zip.Close()
-		if err == nil {
-			err = closeErr
+func (a *Archiver) CloneWithContext(ctx context.Context, zip Source, destZip Sink, opts ...ZipOption) error {
+	return UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt == nil {
+			return fmt.Errorf("%w: Clone only accepts io.ReaderAt", ErrNotImplemented)
 		}
-	}()
 
-	dest, err := destZip.Create()
-	if err != nil {
-		return
-	}
-	defer func() {
-		closeErr := destZip.Close()
-		if err == nil {
-			err = closeErr
+		archive := a.newZip()
+		if _, err := archive.LoadWithContext(ctx, rAt, size); err != nil {
+			return err
 		}
-	}()
 
-	_, err = archive.WriteToWithContext(ctx, dest, opts...)
-	return
+		return UseSink(destZip, func(w io.Writer) error {
+			_, err := archive.WriteToWithContext(ctx, w, opts...)
+			return err
+		})
+	})
 }
 
 // Unzip extracts the archive to the specified directory.
-// Note: It does not support encrypted archives (use UnzipEncrypted).
+// If source is [io.Reader], zip options do not apply.
 func (a *Archiver) Unzip(zip Source, destDir string, opts ...ZipOption) error {
 	return a.UnzipWithContext(context.Background(), zip, destDir, opts...)
 }
 
 // UnzipWithContext extracts archive contents with context support.
 // Cancelling the context stops the extraction immediately.
-func (a *Archiver) UnzipWithContext(ctx context.Context, zip Source, destDir string, opts ...ZipOption) (err error) {
-	archive := a.newZip()
-	if err = a.loadZip(ctx, zip, archive); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := zip.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
+func (a *Archiver) UnzipWithContext(ctx context.Context, zip Source, destDir string, opts ...ZipOption) error {
+	return UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt != nil {
+			archive := a.newZip()
 
-	err = archive.ExtractToWithContext(ctx, destDir, opts...)
-	return
+			if _, err := archive.LoadWithContext(ctx, rAt, size); err != nil {
+				return err
+			}
+
+			return archive.ExtractToWithContext(ctx, destDir, opts...)
+		}
+
+		sr := NewStreamReader(r, WithStreamConfig(a.newZip().Config()))
+		return sr.ExtractToWithContext(ctx, destDir)
+	})
 }
 
 // UnzipFile extracts the specified file from the archive.
@@ -684,83 +765,118 @@ func (a *Archiver) UnzipFile(zip Source, filename string, dest Sink) error {
 }
 
 // UnzipFileWithContext extracts the specified file from the archive with context support.
-func (a *Archiver) UnzipFileWithContext(ctx context.Context, zip Source, filename string, destPath Sink) (err error) {
-	archive := a.newZip()
-	if err = a.loadZip(ctx, zip, archive); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := zip.Close()
-		if err == nil {
-			err = closeErr
+func (a *Archiver) UnzipFileWithContext(ctx context.Context, zip Source, filename string, dest Sink) error {
+	return UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt != nil {
+			archive := a.newZip()
+			if _, err := archive.LoadWithContext(ctx, rAt, size); err != nil {
+				return err
+			}
+
+			file, err := a.openFile(filename, archive)
+			if err != nil {
+				return err
+			}
+
+			return UseSink(dest, func(w io.Writer) error {
+				_, err = io.Copy(w, file)
+				return err
+			})
 		}
-	}()
 
-	file, err := a.openFile(filename, archive)
-	if err != nil {
-		return
-	}
-
-	dest, err := destPath.Create()
-	if err != nil {
-		return
-	}
-	defer func() {
-		closeErr := destPath.Close()
-		if err == nil {
-			err = closeErr
+		sr := NewStreamReader(r, WithStreamConfig(a.newZip().Config()))
+		_, err := sr.Scan(filename)
+		if err != nil {
+			return err
 		}
-	}()
 
-	_, err = io.Copy(dest, file)
-	return
+		rc, err := sr.Open()
+		if err != nil {
+			return err
+		}
+
+		return UseSink(dest, func(w io.Writer) error {
+			_, err = io.Copy(w, rc)
+			return err
+		})
+	})
 }
 
 // UnzipToMap extracts all files from the archive into a map[filename]content. Directories are ignored.
-func (a *Archiver) UnzipToMap(src Source, filters ...Filter) (map[string][]byte, error) {
-	return a.UnzipToMapWithContext(context.Background(), src, filters...)
+func (a *Archiver) UnzipToMap(zip Source, filters ...Filter) (map[string][]byte, error) {
+	return a.UnzipToMapWithContext(context.Background(), zip, filters...)
 }
 
 // UnzipToMap extracts all files from the archive into a map[filename]content with context support.
-func (a *Archiver) UnzipToMapWithContext(ctx context.Context, src Source, filters ...Filter) (m map[string][]byte, err error) {
-	archive := a.newZip()
-	if err := a.loadZip(ctx, src, archive); err != nil {
-		return nil, err
+func (a *Archiver) UnzipToMapWithContext(ctx context.Context, zip Source, filters ...Filter) (map[string][]byte, error) {
+	var m map[string][]byte
+	var errs []error
+
+	err := UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt != nil {
+			files, err := a.newZip().LoadWithContext(ctx, rAt, size)
+			if err != nil {
+				return err
+			}
+
+			m = make(map[string][]byte, len(files))
+			for _, f := range files {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+
+				if f.IsDir() {
+					continue
+				}
+
+				rc, err := f.Open()
+				if err != nil {
+					errs = append(errs, fmt.Errorf("open %s: %w", f.Name(), err))
+					continue
+				}
+
+				data, err := io.ReadAll(rc)
+				_ = rc.Close()
+				if err != nil {
+					errs = append(errs, fmt.Errorf("read %s: %w", f.Name(), err))
+					continue
+				}
+
+				m[f.Name()] = data
+				return nil
+			}
+		}
+
+		sr := NewStreamReader(r, WithStreamConfig(a.newZip().Config()))
+		m = make(map[string][]byte)
+
+		for {
+			f, err := sr.Next()
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			rc, err := sr.Open()
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			data, err := io.ReadAll(rc)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			m[f.Name()] = data
+		}
+	})
+
+	if err != nil {
+		errs = append(errs, err)
 	}
-	defer func() {
-		closeErr := src.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
 
-	files := archive.applyFilters(archive.Files(), filters)
-	m = make(map[string][]byte, len(files))
-
-	for _, f := range files {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		if f.IsDir() {
-			continue
-		}
-
-		rc, err := f.Open()
-		if err != nil {
-			return nil, fmt.Errorf("open %s: %w", f.Name(), err)
-		}
-
-		data, err := io.ReadAll(rc)
-		_ = rc.Close()
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", f.Name(), err)
-		}
-
-		m[f.Name()] = data
-	}
-
-	return
+	return m, errors.Join(errs...)
 }
 
 // UnzipToTemp unpacks the archive into a temporary directory.
@@ -772,24 +888,13 @@ func (a *Archiver) UnzipToTemp(zip Source, prefix string, opts ...ZipOption) (pa
 
 // UnzipToTempWithContext extracts the archive to a temporary directory with cancellation support.
 func (a *Archiver) UnzipToTempWithContext(ctx context.Context, zip Source, prefix string, opts ...ZipOption) (path string, cleanup func(), err error) {
-	archive := a.newZip()
-	if err = a.loadZip(ctx, zip, archive); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := zip.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
-
 	path, err = os.MkdirTemp("", prefix)
 	if err != nil {
 		return
 	}
 	cleanup = func() { _ = os.RemoveAll(path) }
 
-	if err = archive.ExtractToWithContext(ctx, path, opts...); err != nil {
+	if err = a.Unzip(zip, path, opts...); err != nil {
 		cleanup()
 		return "", nil, err
 	}
@@ -804,24 +909,45 @@ func (a *Archiver) UnzipGlob(zip Source, pattern, destDir string) error {
 
 // UnzipGlobWithContext extracts all files file whose name matches the [path.Match] pattern with context support.
 func (a *Archiver) UnzipGlobWithContext(ctx context.Context, zip Source, pattern, destDir string) (err error) {
-	archive := a.newZip()
-	if err = a.loadZip(ctx, zip, archive); err != nil {
-		return
-	}
-	defer func() {
-		closeErr := zip.Close()
-		if err == nil {
-			err = closeErr
+	return UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
+		if rAt != nil {
+			archive := a.newZip()
+			archive.LoadWithContext(ctx, rAt, size)
+
+			files, err := archive.Glob(pattern)
+			if err != nil {
+				return err
+			}
+
+			return archive.ExtractTo(destDir, WithOnly(files))
 		}
-	}()
 
-	files, err := archive.Glob(pattern)
-	if err != nil {
-		return
-	}
+		sr := NewStreamReader(r, WithStreamConfig(a.newZip().Config()))
+		var errs []error
 
-	err = archive.ExtractTo(destDir, WithOnly(files))
-	return
+		for {
+			f, err := sr.Scan(pattern)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				errs = append(errs, err)
+				break
+			}
+
+			fpath, err := SafePath(destDir, f.name)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+
+			if err := sr.ExtractFile(fpath); err != nil {
+				errs = append(errs, err)
+			}
+		}
+
+		return errors.Join(errs...)
+	})
 }
 
 func (a *Archiver) openFile(filename string, archive *Zip) (io.ReadCloser, error) {
@@ -830,16 +956,6 @@ func (a *Archiver) openFile(filename string, archive *Zip) (io.ReadCloser, error
 		return nil, ErrFileNotFound
 	}
 	return f.Open()
-}
-
-func (a *Archiver) loadZip(ctx context.Context, zip Source, archive *Zip) error {
-	rc, size, err := zip.Open()
-	if err != nil {
-		return err
-	}
-
-	_, err = archive.LoadWithContext(ctx, rc, size)
-	return nil
 }
 
 func (a *Archiver) applyFilters(files []*File, filters []Filter) []*File {
@@ -863,8 +979,8 @@ func ReadFile(zip Source, filename string) ([]byte, error) {
 }
 
 // ReplaceFile replaces a file. See [Archiver.ReplaceFile]
-func ReplaceFile(src Source, dest Sink, filename string, content io.Reader) error {
-	return DefaultArchiver.ReplaceFile(src, dest, filename, content)
+func ReplaceFile(zip Source, dest Sink, filename string, content io.Reader) error {
+	return DefaultArchiver.ReplaceFile(zip, dest, filename, content)
 }
 
 // GetEntries lists files using the default archiver. [Archiver.GetEntries]
@@ -898,8 +1014,8 @@ func UpdateMetadata(zip Source, dest Sink, modifier func(*File), opts ...ZipOpti
 }
 
 // Transform modifies files on the fly. See [Archiver.Transform]
-func Transform(src Source, dest Sink, fn TransformFunc, opts ...ZipOption) error {
-	return DefaultArchiver.Transform(src, dest, fn, opts...)
+func Transform(zip Source, dest Sink, fn TransformFunc, opts ...ZipOption) error {
+	return DefaultArchiver.Transform(zip, dest, fn, opts...)
 }
 
 // Diff compares archives. See [Archiver.Diff]
@@ -908,18 +1024,18 @@ func Diff(srcA, srcB Source, filters ...Filter) (ArchiveDiff, error) {
 }
 
 // Tree returns a string representation of the archive structure.  See [Archiver.Tree].
-func Tree(src Source, filters ...Filter) (string, error) {
-	return DefaultArchiver.Tree(src, filters...)
+func Tree(zip Source, filters ...Filter) (string, error) {
+	return DefaultArchiver.Tree(zip, filters...)
 }
 
 // TotalSize calculates sizes using the default archiver. See [Archiver.TotalSize].
-func TotalSize(src Source, filters ...Filter) (uncompressed, compressed int64, err error) {
-	return DefaultArchiver.TotalSize(src, filters...)
+func TotalSize(zip Source, filters ...Filter) (uncompressed, compressed int64, err error) {
+	return DefaultArchiver.TotalSize(zip, filters...)
 }
 
 // IsEncrypted checks encryption using the default archiver. See [Archiver.IsEncrypted].
-func IsEncrypted(src Source, filters ...Filter) (bool, error) {
-	return DefaultArchiver.IsEncrypted(src, filters...)
+func IsEncrypted(zip Source, filters ...Filter) (bool, error) {
+	return DefaultArchiver.IsEncrypted(zip, filters...)
 }
 
 // ArchiveDir recursively adds contents of the directory to the archive and writes it to dest. See [Archiver.ArchiveDir].
@@ -953,8 +1069,8 @@ func UnzipFile(zip Source, filename string, dest Sink) error {
 }
 
 // UnzipToMap loads archive content into memory. See [Archiver.UnzipToMap].
-func UnzipToMap(src Source, filters ...Filter) (map[string][]byte, error) {
-	return DefaultArchiver.UnzipToMap(src, filters...)
+func UnzipToMap(zip Source, filters ...Filter) (map[string][]byte, error) {
+	return DefaultArchiver.UnzipToMap(zip, filters...)
 }
 
 // UnzipToTemp extracts to a temp dir. See [Archiver.UnzipToTemp].
@@ -963,8 +1079,8 @@ func UnzipToTemp(zip Source, prefix string, opts ...ZipOption) (path string, cle
 }
 
 // UnzipGlob extracts all files file whose name matches the [path.Match] pattern. See [Archiver.UnzipGlob].
-func UnzipGlob(src Source, pattern, destDir string) error {
-	return DefaultArchiver.UnzipGlob(src, pattern, destDir)
+func UnzipGlob(zip Source, pattern, destDir string) error {
+	return DefaultArchiver.UnzipGlob(zip, pattern, destDir)
 }
 
 type fileManager struct {
@@ -972,7 +1088,7 @@ type fileManager struct {
 	f    *os.File
 }
 
-func (s *fileManager) Open() (io.ReaderAt, int64, error) {
+func (s *fileManager) Open() (io.Reader, int64, error) {
 	if s.f == nil {
 		f, err := os.Open(s.path)
 		if err != nil {
@@ -1008,18 +1124,27 @@ func (s *fileManager) Close() error {
 	return err
 }
 
-type readerManager struct {
+type readerAtManager struct {
 	r    io.ReaderAt
 	size int64
 }
 
-func (s readerManager) Open() (io.ReaderAt, int64, error) {
+func (s readerAtManager) Open() (io.Reader, int64, error) {
+	return &readerAtWrapper{r: s.r}, s.size, nil
+}
+
+func (s readerAtManager) Close() error { return nil }
+
+type readerManager struct {
+	r    io.Reader
+	size int64
+}
+
+func (s readerManager) Open() (io.Reader, int64, error) {
 	return s.r, s.size, nil
 }
 
-func (s readerManager) Close() error {
-	return nil
-}
+func (s readerManager) Close() error { return nil }
 
 type writerManager struct {
 	w io.Writer
@@ -1036,12 +1161,27 @@ func (s writerManager) Close() error {
 	return nil
 }
 
+type readerAtWrapper struct {
+	r      io.ReaderAt
+	offset int64
+}
+
+func (s *readerAtWrapper) Read(p []byte) (n int, err error) {
+	n, err = s.r.ReadAt(p, s.offset)
+	s.offset += int64(n)
+	return
+}
+
+func (s *readerAtWrapper) ReadAt(p []byte, off int64) (n int, err error) {
+	return s.r.ReadAt(p, off)
+}
+
 type httpSource struct {
 	url    string
 	client *http.Client
 }
 
-func (h *httpSource) Open() (io.ReaderAt, int64, error) {
+func (h *httpSource) Open() (io.Reader, int64, error) {
 	req, err := http.NewRequest("HEAD", h.url, nil)
 	if err != nil {
 		return nil, 0, err
@@ -1060,18 +1200,19 @@ func (h *httpSource) Open() (io.ReaderAt, int64, error) {
 		return nil, 0, fmt.Errorf("server does not support Range requests or Content-Length is missing")
 	}
 
-	return &httpReaderAt{url: h.url, client: h.client}, resp.ContentLength, nil
+	return &httpReader{url: h.url, client: h.client}, resp.ContentLength, nil
 }
 
 func (h *httpSource) Close() error { return nil }
 
-// httpReaderAt implements io.ReaderAt via HTTP Range requests
-type httpReaderAt struct {
+// httpReader implements io.ReaderAt and io.Reader via HTTP Range requests
+type httpReader struct {
 	url    string
 	client *http.Client
+	offset int64
 }
 
-func (r *httpReaderAt) ReadAt(p []byte, off int64) (n int, err error) {
+func (r *httpReader) ReadAt(p []byte, off int64) (n int, err error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -1095,4 +1236,10 @@ func (r *httpReaderAt) ReadAt(p []byte, off int64) (n int, err error) {
 	}
 
 	return io.ReadFull(resp.Body, p)
+}
+
+func (w *httpReader) Read(p []byte) (n int, err error) {
+	n, err = w.ReadAt(p, w.offset)
+	w.offset += int64(n)
+	return
 }

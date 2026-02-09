@@ -99,7 +99,7 @@ type File struct {
 
 // NewFile creates a detached File entry with manual metadata.
 // Note: The file is not attached to any archive until you call [Zip.Add].
-// You must set a data source via [File.SetOpenFunc] before writing, unless it's a directory.
+// You must set a data source via [File.WithOpenFunc] before writing, unless it's a directory.
 func NewFile(name string, isDir bool) (*File, error) {
 	if name == "" {
 		return nil, fmt.Errorf("%w: filename cannot be empty", ErrFileEntry)
@@ -386,13 +386,14 @@ func (f *File) OpenRaw() (*io.SectionReader, error) {
 }
 
 // SetUncompressed size sets the file uncompressed size atomically.
-func (f *File) SetUncompressedSize(size int64) {
+func (f *File) WithUncompressedSize(size int64) *File {
 	atomic.StoreInt64(&f.uncompressedSize, size)
+	return f
 }
 
-// SetCompression replaces the compression method and level with the specified ones.
+// WithCompression replaces the compression method and level with the specified ones.
 // This does not affect configuration for decompressing file from an existing archive.
-func (f *File) SetCompression(method CompressionMethod, level int) *File {
+func (f *File) WithCompression(method CompressionMethod, level int) *File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -401,9 +402,9 @@ func (f *File) SetCompression(method CompressionMethod, level int) *File {
 	return f
 }
 
-// SetEncryption replaces the encryption method and password with the specified ones.
+// WithEncryption replaces the encryption method and password with the specified ones.
 // This does not affect configuration for decompressing file from an existing archive.
-func (f *File) SetEncryption(method EncryptionMethod, pwd string) *File {
+func (f *File) WithEncryption(method EncryptionMethod, pwd string) *File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -414,7 +415,7 @@ func (f *File) SetEncryption(method EncryptionMethod, pwd string) *File {
 
 // SetSourcePassword updates the password used to encrypt/decrypt this specific file.
 // If current encryption is [NotEncrypted] it defaults to [AES256].
-func (f *File) SetPassword(pwd string) *File {
+func (f *File) WithPassword(pwd string) *File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -425,10 +426,10 @@ func (f *File) SetPassword(pwd string) *File {
 	return f
 }
 
-// SetSourcePassword updates the password used to read (decrypt) this specific file
+// WithSourcePassword updates the password used to read (decrypt) this specific file
 // from the original archive in case if the archive-wide password was incorrect
 // or if different files have different passwords.
-func (f *File) SetSourcePassword(pwd string) *File {
+func (f *File) WithSourcePassword(pwd string) *File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -436,9 +437,9 @@ func (f *File) SetSourcePassword(pwd string) *File {
 	return f
 }
 
-// DisableEncryption sets encryption method to [NotEncrypted] and removes the password for this file.
+// WithDisableEncryption sets encryption method to [NotEncrypted] and removes the password for this file.
 // This does not affect configuration for decompressing file from an existing archive.
-func (f *File) DisableEncryption() *File {
+func (f *File) WithDisableEncryption() *File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -447,8 +448,8 @@ func (f *File) DisableEncryption() *File {
 	return f
 }
 
-// SetMode updates the Unix-style file permission bits.
-func (f *File) SetMode(mode fs.FileMode) *File {
+// WithMode updates the Unix-style file permission bits.
+func (f *File) WithMode(mode fs.FileMode) *File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -456,8 +457,8 @@ func (f *File) SetMode(mode fs.FileMode) *File {
 	return f
 }
 
-// SetModTime sets the file's last modification time.
-func (f *File) SetModTime(modTime time.Time) *File {
+// WithModTime sets the file's last modification time.
+func (f *File) WithModTime(modTime time.Time) *File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -465,7 +466,7 @@ func (f *File) SetModTime(modTime time.Time) *File {
 	return f
 }
 
-func (f *File) SetComment(c string) *File {
+func (f *File) WithComment(c string) *File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -473,8 +474,8 @@ func (f *File) SetComment(c string) *File {
 	return f
 }
 
-// SetConfig applies a FileConfig to this file, overriding individual properties.
-func (f *File) SetConfig(c FileConfig) *File {
+// WithConfig applies a FileConfig to this file, overriding individual properties.
+func (f *File) WithConfig(c FileConfig) *File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -488,9 +489,9 @@ func (f *File) SetConfig(c FileConfig) *File {
 	return f
 }
 
-// SetOpenFunc replaces the function used to open the
+// WithOpenFunc replaces the function used to open the
 // file's content and sets the size to [SizeUnknown].
-func (f *File) SetOpenFunc(openFunc func() (io.ReadCloser, error)) *File {
+func (f *File) WithOpenFunc(openFunc func() (io.ReadCloser, error)) *File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 

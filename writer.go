@@ -249,7 +249,7 @@ func (zw *zipWriter) encodeToAndUpdate(f *FileSnapshot, dest io.Writer) error {
 
 	if f.file != nil {
 		f.file.setCompressedSize(f.CompressedSize)
-		f.file.SetUncompressedSize(f.UncompressedSize)
+		f.file.WithUncompressedSize(f.UncompressedSize)
 		f.file.setCRC32(f.CRC32)
 	}
 
@@ -683,7 +683,7 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 
 			if res.snap.file != nil {
 				res.snap.file.setCompressedSize(res.snap.CompressedSize)
-				res.snap.file.SetUncompressedSize(res.snap.UncompressedSize)
+				res.snap.file.WithUncompressedSize(res.snap.UncompressedSize)
 				res.snap.file.setCRC32(res.snap.CRC32)
 			}
 		}

@@ -14,7 +14,9 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -50,7 +52,7 @@ func newReaderBase(dcm decompressorsMap, cfg ZipConfig) readerBase {
 	return readerBase{
 		decompressors: dcm,
 		password:      cfg.Password,
-		textDecoder:   cfg.TextEncoding,
+		textDecoder:   cfg.TextDecoder,
 	}
 }
 
@@ -246,7 +248,7 @@ func (zr *zipReader) FindAndReadEOCD(ctx context.Context) (internal.EOCD, error)
 
 		n, err := zr.src.ReadAt(buf[:readSize], readPos)
 		if err != nil && err != io.EOF {
-			return internal.EOCD{}, fmt.Errorf("read at %d: %w", readPos, err)
+			return internal.EOCD{}, fmt.Errorf("zip: read at %d: %w", readPos, err)
 		}
 
 		if eocd, found := zr.tryReadSignature(readSize, readPos, buf[:n]); found {
@@ -532,6 +534,8 @@ func (cr *checksumReader) Close() error {
 //     You cannot go back to a previous file.
 type StreamReader struct {
 	readerBase
+	onFileDone func(*File, error)
+
 	src     io.Reader
 	curFile *File
 	br      *bufio.Reader
@@ -542,28 +546,23 @@ type StreamReader struct {
 // StreamOption applies the option to StreamReader.
 type StreamOption func(s *StreamReader)
 
-// StreamWithPassword sets the stream password.
-func StreamWithPassword(pwd string) StreamOption {
-	return func(s *StreamReader) {
-		s.password = pwd
-	}
-}
-
-// StreamWithDecoder sets the stream [TextDecoder].
-func StreamWithDecoder(d TextDecoder) StreamOption {
-	return func(s *StreamReader) {
-		s.textDecoder = d
+// WithStreamConfig sets the stream config.
+func WithStreamConfig(cfg ZipConfig) StreamOption {
+	return func(sr *StreamReader) {
+		sr.password = cfg.Password
+		sr.onFileDone = cfg.OnFileDone
+		sr.textDecoder = cfg.TextDecoder
 	}
 }
 
 // NewStreamReader returns a new StreamReader reading from source.
-func NewStreamReader(src io.Reader, options ...StreamOption) *StreamReader {
+func NewStreamReader(src io.Reader, opts ...StreamOption) *StreamReader {
 	r := &StreamReader{
 		readerBase: newReaderBase(nil, ZipConfig{}),
 		src:        src,
 		br:         bufio.NewReaderSize(src, 32*1024),
 	}
-	for _, opt := range options {
+	for _, opt := range opts {
 		opt(r)
 	}
 	return r
@@ -610,17 +609,12 @@ func IsZipStream(r io.Reader) (bool, error) {
 }
 
 // Next advances to the next entry in the ZIP archive.
+// The CRC32 checksum is verified only after the stream is fully consumed.
 //
-// Usage:
-//   - Returns the next [File] entry or [io.EOF] if the end of the archive is reached.
-//   - If the previous file's data was not fully read, Next automatically discards
-//     the remaining bytes to reach the next header.
-//
-// Behavior with Data Descriptors:
-//   - If the previous file uses a Data Descriptor (bit 3 set) and the compression
-//     method is Store, Next scans the stream for the signature (PK\07\08) if the exact size is unknown.
-//   - For compressed data, it relies on the decompressor to find the end of the stream.
-//   - The CRC32 checksum is verified only after the stream is fully consumed.
+// Returns the next [File] entry or [io.EOF] if the end of the archive is reached.
+// If the previous file's data was not fully read, Next automatically discards the
+// remaining bytes to reach the next header. The returned file should not be opened
+// manually, but rather using [StreamReader.Open].
 //
 // Warning: The returned File object is populated from the Local File Header.
 // Fields like Unix permissions, file comments, or precise NTFS timestamps are unavailable.
@@ -654,21 +648,10 @@ func (sr *StreamReader) Next() (*File, error) {
 	return file, nil
 }
 
-// Open returns an [io.ReadCloser] that provides access to the decompressed content
-// of the current file.
-//
-// Prerequisites:
-//   - [StreamReader.Next] must be called successfully before calling Open.
-//   - Open can be called only once per file.
-//
-// Behavior:
-//   - Automatically handles decryption (if password is set in config) and decompression.
-//   - If the file has a Data Descriptor (unknown size), the reader will read until
-//     the decompression stream ends.
-//   - Closing the returned ReadCloser is optional for the library's internal state
-//     (Next will close it automatically), but recommended to free resources immediately.
-//
-// Returns error if no file is currently selected (Next wasn't called).
+// Open returns an [io.ReadCloser] that provides access to the decompressed content of the current file.
+// It must be called after a successful [StreamReader.Next] and it be called only once per file.
+// Closing the returned ReadCloser is optional for the library's internal state, but recommended
+// to free resources immediately. Returns error if no file is currently selected.
 func (sr *StreamReader) Open() (io.ReadCloser, error) {
 	raw, err := sr.OpenRaw()
 	if err != nil {
@@ -706,7 +689,7 @@ func (sr *StreamReader) Open() (io.ReadCloser, error) {
 // If the file is encrypted ([AES256]), the reader includes Salt, PVV, and MAC bytes.
 func (sr *StreamReader) OpenRaw() (io.Reader, error) {
 	if sr.curFile == nil {
-		return nil, errors.New("no current file")
+		return nil, errors.New("zip: no current file")
 	}
 
 	if sr.curFile.config.CompressionMethod == Store {
@@ -729,9 +712,9 @@ func (sr *StreamReader) OpenRaw() (io.Reader, error) {
 	return raw, nil
 }
 
-// Glob searches for the next file whose name matches the [path.Match] pattern.
-// It automatically skips all intermediate files. Returns io.EOF if there are no more matches.
-func (sr *StreamReader) Glob(pattern string) (*File, error) {
+// Scan searches for the next file whose name matches the [path.Match] pattern.
+// It automatically skips all intermediate files. Returns [ErrFileNotFound] if there are no more matches.
+func (sr *StreamReader) Scan(pattern string) (*File, error) {
 	pattern = strings.ReplaceAll(pattern, "\\", "/")
 
 	if _, err := path.Match(pattern, ""); err != nil {
@@ -740,6 +723,9 @@ func (sr *StreamReader) Glob(pattern string) (*File, error) {
 
 	for {
 		f, err := sr.Next()
+		if err == io.EOF {
+			return nil, ErrFileNotFound
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -748,6 +734,77 @@ func (sr *StreamReader) Glob(pattern string) (*File, error) {
 			return f, nil
 		}
 	}
+}
+
+// ExtractTo unpacks the archive to the specified destination directory.
+// Attempts to extract files outside the target directory will result in [ErrInsecurePath].
+func (sr *StreamReader) ExtractTo(destDir string) error {
+	return sr.ExtractToWithContext(context.Background(), destDir)
+}
+
+// ExtractToWithContext extracts files with context support.
+// Context cancellation stops the extraction process.
+func (sr *StreamReader) ExtractToWithContext(ctx context.Context, destDir string) error {
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return err
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		f, err := sr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		fpath, err := SafePath(destDir, f.Name())
+		if err != nil {
+			return fmt.Errorf("zip: %s: %w", f.Name(), err)
+		}
+
+		if f.IsDir() {
+			os.MkdirAll(fpath, 0755)
+			if sr.onFileDone != nil {
+				sr.onFileDone(f, nil)
+			}
+			continue
+		}
+
+		if err := sr.ExtractFile(fpath); err != nil {
+			return err
+		}
+
+		if sr.onFileDone != nil {
+			sr.onFileDone(f, nil)
+		}
+	}
+}
+
+func (sr *StreamReader) ExtractFile(fpath string) error {
+	if err := os.MkdirAll(filepath.Dir(fpath), 0755); err != nil {
+		return err
+	}
+
+	outFile, err := os.Create(fpath)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	rc, err := sr.Open()
+	if err != nil {
+		outFile.Close()
+		return err
+	}
+	defer rc.Close()
+
+	_, copyErr := io.Copy(outFile, rc)
+	return copyErr
 }
 
 // newFileFromCentralDir creates a File struct from a central directory entry.

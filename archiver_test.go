@@ -88,7 +88,7 @@ func TestArchiver_MemoryFlow(t *testing.T) {
 	// Important: To use FromReader with bytes.Buffer, we need a ReaderAt.
 	// bytes.NewReader provides ReadAt.
 	reader := bytes.NewReader(buf.Bytes())
-	src := gozip.FromReader(reader, int64(reader.Len()))
+	src := gozip.FromReaderAt(reader, int64(reader.Len()))
 
 	// High-level read
 	readBack, err := gozip.ReadFile(src, "test.txt")
@@ -171,8 +171,8 @@ func TestArchiver_Diff_And_Replace(t *testing.T) {
 	z2.WriteTo(w)
 
 	// Test Diff
-	srcA := gozip.FromReader(bytes.NewReader(buf1.Bytes()), int64(buf1.Len()))
-	srcB := gozip.FromReader(bytes.NewReader(buf2.Bytes()), int64(buf2.Len()))
+	srcA := gozip.FromReaderAt(bytes.NewReader(buf1.Bytes()), int64(buf1.Len()))
+	srcB := gozip.FromReaderAt(bytes.NewReader(buf2.Bytes()), int64(buf2.Len()))
 
 	diff, err := gozip.Diff(srcA, srcB)
 	if err != nil {
@@ -192,7 +192,7 @@ func TestArchiver_Diff_And_Replace(t *testing.T) {
 	newImg := strings.NewReader("new_image_data")
 
 	// Reset reader for srcA
-	srcA = gozip.FromReader(bytes.NewReader(buf1.Bytes()), int64(buf1.Len()))
+	srcA = gozip.FromReaderAt(bytes.NewReader(buf1.Bytes()), int64(buf1.Len()))
 
 	err = gozip.ReplaceFile(srcA, gozip.ToWriter(outBuf), "image.png", newImg)
 	if err != nil {
@@ -200,7 +200,7 @@ func TestArchiver_Diff_And_Replace(t *testing.T) {
 	}
 
 	// Verify replacement
-	resultSrc := gozip.FromReader(bytes.NewReader(outBuf.Bytes()), int64(outBuf.Len()))
+	resultSrc := gozip.FromReaderAt(bytes.NewReader(outBuf.Bytes()), int64(outBuf.Len()))
 	data, _ := gozip.ReadFile(resultSrc, "image.png")
 	if string(data) != "new_image_data" {
 		t.Errorf("ReplaceFile didn't update content")
@@ -266,7 +266,7 @@ func TestUnzipToTemp(t *testing.T) {
 	buf := new(bytes.Buffer)
 	z.WriteTo(buf)
 
-	src := gozip.FromReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	src := gozip.FromReaderAt(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 
 	// Test
 	path, cleanup, err := gozip.UnzipToTemp(src, "test-prefix-")
@@ -299,7 +299,7 @@ func TestTree(t *testing.T) {
 	buf := new(bytes.Buffer)
 	z.WriteTo(buf)
 
-	src := gozip.FromReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	src := gozip.FromReaderAt(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 
 	tree, err := gozip.Tree(src)
 	if err != nil {

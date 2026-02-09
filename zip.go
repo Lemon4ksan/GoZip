@@ -190,11 +190,11 @@ type ZipConfig struct {
 	// defaults to [ActionReplace] (Last Write Wins).
 	ConflictHandler ConflictHandler
 
-	// TextEncoding handles filename decoding for legacy archives (non-UTF8).
+	// TextDecoder handles filename decoding for legacy archives (non-UTF8).
 	// This function is only used in read operations. GoZip always sets
 	// the UTF-8 flag for maximum compatibility when writing.
 	// Default: [DecodeCP437] (IBM PC).
-	TextEncoding TextDecoder
+	TextDecoder TextDecoder
 
 	// OnFileDone is a callback triggered after a file is written, read, or extracted.
 	// Errors are not wrapped in [FileError], because file instance is passed separately.
@@ -344,37 +344,37 @@ func (z *Zip) FS() fs.FS {
 // [ErrDuplicateEntry] and do not overwrite the existing entry.
 //
 // Options can be used to override compression, encryption, or file attributes.
-func (z *Zip) Add(f *File, options ...AddOption) error {
+func (z *Zip) Add(f *File, opts ...AddOption) error {
 	if f == nil {
 		return wrapErr("add", nil, fmt.Errorf("file cannot be nil"))
 	}
-	return wrapErr("add", f, z.addEntry(f, options))
+	return wrapErr("add", f, z.addEntry(f, opts))
 }
 
 // AddFile adds a file from the local filesystem to the archive.
 // Symlinks are stored as link targets and are not followed.
-func (z *Zip) AddFile(path string, options ...AddOption) (*File, error) {
+func (z *Zip) AddFile(path string, opts ...AddOption) (*File, error) {
 	fileEntry, err := newFileFromPath(path)
 	if err != nil {
 		return nil, wrapErr("add", nil, err)
 	}
-	return fileEntry, z.Add(fileEntry, options...)
+	return fileEntry, z.Add(fileEntry, opts...)
 }
 
 // AddOSFile adds an open [os.File] to the archive.
 // The file content is wrapped using [io.SectionReader].
-func (z *Zip) AddOSFile(f *os.File, options ...AddOption) (*File, error) {
+func (z *Zip) AddOSFile(f *os.File, opts ...AddOption) (*File, error) {
 	fileEntry, err := newFileFromOS(f)
 	if err != nil {
 		return nil, wrapErr("add", nil, err)
 	}
-	return fileEntry, z.Add(fileEntry, options...)
+	return fileEntry, z.Add(fileEntry, opts...)
 }
 
 // AddDir recursively adds contents of the directory to the archive.
 // Files are added using "Best Effort" strategy: if a single file fails to read,
 // AddDir continues processing others but returns a joined error at the end.
-func (z *Zip) AddDir(path string, options ...AddOption) ([]*File, error) {
+func (z *Zip) AddDir(path string, opts ...AddOption) ([]*File, error) {
 	var errs []error
 	var files []*File
 
@@ -394,7 +394,7 @@ func (z *Zip) AddDir(path string, options ...AddOption) ([]*File, error) {
 		}
 
 		pathOpt := WithPath(filepath.ToSlash(filepath.Dir(relPath)))
-		fileOpts := append([]AddOption{pathOpt}, options...)
+		fileOpts := append([]AddOption{pathOpt}, opts...)
 
 		f, err := z.AddFile(walkPath, fileOpts...)
 		if err != nil {
@@ -415,7 +415,7 @@ func (z *Zip) AddDir(path string, options ...AddOption) ([]*File, error) {
 
 // AddFS adds files from an [fs.FS] (e.g., [embed.FS], [os.DirFS]) to the archive.
 // It recursively walks the file system and adds all entries using "Best Effort" strategy.
-func (z *Zip) AddFS(fileSystem fs.FS, options ...AddOption) ([]*File, error) {
+func (z *Zip) AddFS(fileSystem fs.FS, opts ...AddOption) ([]*File, error) {
 	var errs []error
 	var files []*File
 
@@ -434,7 +434,7 @@ func (z *Zip) AddFS(fileSystem fs.FS, options ...AddOption) ([]*File, error) {
 		}
 
 		pathOpt := WithPath(path.Dir(walkPath))
-		fileOpts := append([]AddOption{pathOpt}, options...)
+		fileOpts := append([]AddOption{pathOpt}, opts...)
 
 		f, err := newFileFromFS(fileSystem, walkPath, info)
 		if err != nil {
@@ -465,12 +465,12 @@ func (z *Zip) AddFS(fileSystem fs.FS, options ...AddOption) ([]*File, error) {
 // headers before writing. To avoid this, provide the exact size if possible.
 //
 // Returns [ErrFileEntry] if an invalid argument is passed.
-func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...AddOption) (*File, error) {
+func (z *Zip) AddReader(r io.Reader, filename string, size int64, opts ...AddOption) (*File, error) {
 	fileEntry, err := newFileFromReader(r, filename, size)
 	if err != nil {
 		return nil, wrapErr("add", nil, err)
 	}
-	return fileEntry, z.Add(fileEntry, options...)
+	return fileEntry, z.Add(fileEntry, opts...)
 }
 
 // AddLazy adds a file entry whose content is opened only when writing the archive.
@@ -481,35 +481,35 @@ func (z *Zip) AddReader(r io.Reader, filename string, size int64, options ...Add
 // (e.g. database connections) inside the closure or after [Zip.WriteTo] finishes.
 //
 // Returns [ErrFileEntry] if an invalid name is passed.
-func (z *Zip) AddLazy(name string, openFunc func() (io.ReadCloser, error), options ...AddOption) (*File, error) {
+func (z *Zip) AddLazy(name string, openFunc func() (io.ReadCloser, error), opts ...AddOption) (*File, error) {
 	fileEntry, err := newFileFromReader(io.LimitReader(nil, 0), name, SizeUnknown)
 	if err != nil {
 		return nil, wrapErr("add", nil, err)
 	}
 	fileEntry.openFunc = openFunc
-	return fileEntry, z.Add(fileEntry, options...)
+	return fileEntry, z.Add(fileEntry, opts...)
 }
 
 // AddBytes adds a file from a byte slice.
 // Returns [ErrFileEntry] if an invalid argument is passed.
-func (z *Zip) AddBytes(data []byte, filename string, options ...AddOption) (*File, error) {
-	return z.AddReader(bytes.NewReader(data), filename, int64(len(data)), options...)
+func (z *Zip) AddBytes(data []byte, filename string, opts ...AddOption) (*File, error) {
+	return z.AddReader(bytes.NewReader(data), filename, int64(len(data)), opts...)
 }
 
 // AddString adds a file from a string.
 // Returns [ErrFileEntry] if an invalid argument is passed.
-func (z *Zip) AddString(content string, filename string, options ...AddOption) (*File, error) {
-	return z.AddReader(strings.NewReader(content), filename, int64(len(content)), options...)
+func (z *Zip) AddString(content string, filename string, opts ...AddOption) (*File, error) {
+	return z.AddReader(strings.NewReader(content), filename, int64(len(content)), opts...)
 }
 
 // Mkdir creates an explicit directory entry in the archive.
 // Returns [ErrFileEntry] if invalid name is passed.
-func (z *Zip) Mkdir(name string, options ...AddOption) (*File, error) {
+func (z *Zip) Mkdir(name string, opts ...AddOption) (*File, error) {
 	dirEntry, err := newDirectoryFile(name)
 	if err != nil {
 		return nil, wrapErr("add", nil, err)
 	}
-	return dirEntry, z.Add(dirEntry, options...)
+	return dirEntry, z.Add(dirEntry, opts...)
 }
 
 // Remove deletes an entry from the archive. If the target is a directory,
@@ -661,29 +661,6 @@ func (z *Zip) Files() []*File {
 	return result
 }
 
-// SafePath returns a clean, absolute path for a zip entry within the destination directory.
-// It ensures that the resulting path is inside the destDir (prevents Zip Slip).
-func (z *Zip) SafePath(destDir, fileName string) (string, error) {
-	cleanedName := path.Clean("/" + fileName)
-	cleanedName = strings.TrimPrefix(cleanedName, "/")
-
-	for _, r := range fileName {
-		if r < 0x20 || r == 0x7F {
-			return "", fmt.Errorf("%w: filename contains control characters", ErrInsecurePath)
-		}
-	}
-
-	destDir = filepath.Clean(destDir)
-	fullPath := filepath.Join(destDir, filepath.FromSlash(cleanedName))
-
-	rel, err := filepath.Rel(destDir, fullPath)
-	if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
-		return "", fmt.Errorf("%w: path escapes destination directory", ErrInsecurePath)
-	}
-
-	return fullPath, nil
-}
-
 // Exists checks if a file or directory exists in the archive.
 // Returns true if an exact file match is found.
 func (z *Zip) Exists(name string) bool {
@@ -804,7 +781,7 @@ func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, opts ...Zi
 
 	if cfg.password != "" {
 		for _, f := range files {
-			f.SetPassword(cfg.password)
+			f.WithPassword(cfg.password)
 		}
 	}
 
@@ -979,7 +956,7 @@ func (z *Zip) VerifyWithContext(ctx context.Context, opts ...ZipOption) error {
 
 	if cfg.password != "" {
 		for _, f := range files {
-			f.SetPassword(cfg.password)
+			f.WithPassword(cfg.password)
 		}
 	}
 
@@ -1020,7 +997,7 @@ func (z *Zip) ExtractToWithContext(ctx context.Context, path string, opts ...Zip
 
 	if cfg.password != "" {
 		for _, f := range files {
-			f.SetSourcePassword(cfg.password)
+			f.WithSourcePassword(cfg.password)
 		}
 	}
 
@@ -1151,7 +1128,7 @@ func (z *Zip) execSequentialExtract(
 			continue
 		}
 
-		fpath, err := z.SafePath(destDir, f.name)
+		fpath, err := SafePath(destDir, f.name)
 		if err != nil {
 			errs = append(errs, wrapErr("extract", f, err))
 			collector.OnFileDone(f, err)
@@ -1205,7 +1182,7 @@ func (z *Zip) execParallelExtract(
 			continue
 		}
 
-		fpath, err := z.SafePath(destDir, f.name)
+		fpath, err := SafePath(destDir, f.name)
 		if err != nil {
 			errs = append(errs, wrapErr("extract", f, err))
 			collector.OnFileDone(f, err)
@@ -1577,7 +1554,7 @@ func (z *Zip) verifySingleFile(f *File, onRead signalFunc) error {
 // extractFile handles low-level extraction logic.
 // It uses the shared buffer pool and attempts to restore file metadata (times/perms).
 func (z *Zip) extractFile(
-	ctx context.Context, f *File, destDir, path string, onRead, onWrite signalFunc, globalWritten *int64, cfg processConfig,
+	ctx context.Context, f *File, destDir, fileName string, onRead, onWrite signalFunc, globalWritten *int64, cfg processConfig,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1587,7 +1564,7 @@ func (z *Zip) extractFile(
 		return fmt.Errorf("%w: symlinks are disabled", ErrInsecurePath)
 	}
 
-	fpath, _ := z.SafePath(destDir, path)
+	fpath, _ := SafePath(destDir, fileName)
 
 	if cfg.security.AllowSymlinks {
 		if err := checkSymlinkTraversal(fpath, destDir); err != nil {
@@ -1669,8 +1646,8 @@ func (z *Zip) extractFile(
 	}
 	// Best-effort attempts to restore metadata. Errors are ignored as they
 	// may occur on file systems that don't support these operations.
-	_ = os.Chmod(path, perm)
-	_ = os.Chtimes(path, time.Now(), f.modTime)
+	_ = os.Chmod(fileName, perm)
+	_ = os.Chtimes(fileName, time.Now(), f.modTime)
 
 	return nil
 }

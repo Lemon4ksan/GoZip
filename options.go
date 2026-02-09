@@ -69,7 +69,7 @@ type AddOption func(f *File)
 // WithConfig applies a complete [FileConfig], overwriting existing settings.
 func WithConfig(c FileConfig) AddOption {
 	return func(f *File) {
-		f.SetConfig(c)
+		f.WithConfig(c)
 	}
 }
 
@@ -331,7 +331,7 @@ func WithSmartStore(exts ...string) ZipOption {
 				}
 				ext := strings.ToLower(strings.TrimPrefix(path.Ext(f.name), "."))
 				if _, ok := extMap[ext]; ok {
-					f.SetCompression(Store, 0)
+					f.WithCompression(Store, 0)
 				}
 			}
 			return files

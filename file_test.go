@@ -143,7 +143,7 @@ func TestFileSetters(t *testing.T) {
 		CompressionLevel:  DeflateMaximum,
 	}
 
-	file.SetConfig(config)
+	file.WithConfig(config)
 
 	if file.config.CompressionMethod != Deflate {
 		t.Error("compression method not set correctly")

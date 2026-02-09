@@ -187,7 +187,7 @@ func TestParallelWriteRace(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		f.SetUncompressedSize(int64(len(content)))
+		f.WithUncompressedSize(int64(len(content)))
 	}
 
 	const (
@@ -204,8 +204,8 @@ func TestParallelWriteRace(t *testing.T) {
 			for j := range 5 {
 				name := fmt.Sprintf("file_%d.txt", j)
 				if f, ok := archive.File(name); ok {
-					f.SetPassword(fmt.Sprintf("pass_%d", i)).
-						SetComment(fmt.Sprintf("comment_%d", i))
+					f.WithPassword(fmt.Sprintf("pass_%d", i)).
+						WithComment(fmt.Sprintf("comment_%d", i))
 				}
 			}
 			time.Sleep(time.Millisecond)
@@ -242,7 +242,7 @@ func TestParallelExtractRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.SetPassword("secret").SetUncompressedSize(int64(len(content)))
+	f.WithPassword("secret").WithUncompressedSize(int64(len(content)))
 
 	const count = 10
 	var wg sync.WaitGroup
