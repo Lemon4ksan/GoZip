@@ -60,6 +60,23 @@ func ToFilePath(path string) Sink { return &fileManager{path: path} }
 // ToWriter creates a Sink for writing to an io.Writer.
 func ToWriter(w io.Writer) Sink { return writerManager{w} }
 
+// ToURL creates a Sink that streams the generated ZIP archive directly to a URL.
+// If method is empty, it defaults to [http.MethodPut].
+func ToURL(url, method string, client *http.Client) Sink {
+	if method == "" {
+		method = http.MethodPut
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &httpSink{
+		url:    url,
+		method: method,
+		client: client,
+		errCh:  make(chan error, 1),
+	}
+}
+
 // UseSource opens the source, handles the ReaderAt vs Reader distinction,
 // and ensures resources are closed properly after fn executes.
 //
@@ -1242,4 +1259,62 @@ func (w *httpReader) Read(p []byte) (n int, err error) {
 	n, err = w.ReadAt(p, w.offset)
 	w.offset += int64(n)
 	return
+}
+
+// httpSink implements the Sink interface for uploading data to a URL.
+type httpSink struct {
+	url    string
+	method string
+	client *http.Client
+
+	pw    *io.PipeWriter
+	errCh chan error
+}
+
+func (s *httpSink) Create() (io.Writer, error) {
+	pr, pw := io.Pipe()
+	s.pw = pw
+
+	go func() {
+		req, err := http.NewRequest(s.method, s.url, pr)
+		if err != nil {
+			s.errCh <- err
+			pr.CloseWithError(err)
+			return
+		}
+
+		req.Header.Set("Content-Type", "application/zip")
+
+		resp, err := s.client.Do(req)
+		if err != nil {
+			s.errCh <- err
+			pr.CloseWithError(err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			err = fmt.Errorf("upload failed with status: %s", resp.Status)
+			s.errCh <- err
+			pr.CloseWithError(err)
+			return
+		}
+
+		s.errCh <- nil
+	}()
+
+	return pw, nil
+}
+
+func (s *httpSink) Close() error {
+	if s.pw != nil {
+		err := s.pw.Close()
+
+		httpErr, _ := <-s.errCh
+		if err == nil {
+			err = httpErr
+		}
+		return err
+	}
+	return nil
 }
