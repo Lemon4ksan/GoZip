@@ -283,8 +283,7 @@ func NewZip(opts ...ArchiveOption) *Zip {
 		decompressors: make(decompressorsMap),
 		bufferPool: sync.Pool{
 			New: func() interface{} {
-				b := make([]byte, 64*1024) // 64KB
-				return &b
+				return make([]byte, 64*1024) // 64KB
 			},
 		},
 	}
@@ -378,6 +377,10 @@ func (z *Zip) AddDir(path string, opts ...AddOption) ([]*File, error) {
 	var errs []error
 	var files []*File
 
+	baseOpts := make([]AddOption, 0, len(opts)+1)
+	baseOpts = append(baseOpts, nil)
+	baseOpts = append(baseOpts, opts...)
+
 	walkErr := filepath.WalkDir(path, func(walkPath string, _ fs.DirEntry, err error) error {
 		if err != nil {
 			errs = append(errs, wrapErr("add", nil, fmt.Errorf("scan %s: %w", walkPath, err)))
@@ -393,10 +396,9 @@ func (z *Zip) AddDir(path string, opts ...AddOption) ([]*File, error) {
 			return nil
 		}
 
-		pathOpt := WithPath(filepath.ToSlash(filepath.Dir(relPath)))
-		fileOpts := append([]AddOption{pathOpt}, opts...)
+		baseOpts[0] = WithPath(filepath.ToSlash(filepath.Dir(relPath)))
 
-		f, err := z.AddFile(walkPath, fileOpts...)
+		f, err := z.AddFile(walkPath, baseOpts...)
 		if err != nil {
 			errs = append(errs, err)
 		} else {
@@ -694,16 +696,25 @@ func (z *Zip) OpenFile(name string) (io.ReadCloser, error) {
 }
 
 // Select returns a list of files that satisfy the given condition.
-func (z *Zip) Select(cond Predicate) []*File {
+func (z *Zip) Select(filters ...Filter) []*File {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
 
-	matches := make([]*File, 0)
+	matches := make([]*File, 0, len(z.files)/2)
+
 	for _, f := range z.files {
-		if cond(f) {
+		isMatch := true
+		for _, filter := range filters {
+			if !filter(f) {
+				isMatch = false
+				break
+			}
+		}
+		if isMatch {
 			matches = append(matches, f)
 		}
 	}
+
 	return matches
 }
 
@@ -725,7 +736,7 @@ func (z *Zip) Glob(pattern string) ([]*File, error) {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
 
-	var matches []*File
+	matches := make([]*File, 0, len(z.files)/2)
 
 	for _, f := range z.files {
 		if matched, _ := path.Match(pattern, f.name); matched {
@@ -780,7 +791,7 @@ func (z *Zip) WriteTo(dest io.Writer, opts ...ZipOption) (int64, error) {
 // Cancelling the context stops processing the remaining files and results in a valid archive.
 func (z *Zip) WriteToWithContext(ctx context.Context, dest io.Writer, opts ...ZipOption) (int64, error) {
 	cfg := z.applyOptions(opts)
-	files := z.applyFilters(z.Files(), cfg.filters)
+	files := z.Select(cfg.filters...)
 	files = SortFilesOptimized(files, z.config.FileSortStrategy)
 
 	if cfg.password != "" {
@@ -952,7 +963,7 @@ func (z *Zip) Verify(opts ...ZipOption) error {
 // VerifyWithContext checks integrity with context cancellation.
 func (z *Zip) VerifyWithContext(ctx context.Context, opts ...ZipOption) error {
 	cfg := z.applyOptions(opts)
-	files := z.applyFilters(z.Files(), cfg.filters)
+	files := z.Select(cfg.filters...)
 
 	if len(files) == 0 {
 		return nil
@@ -994,7 +1005,7 @@ func (z *Zip) ExtractTo(path string, opts ...ZipOption) error {
 func (z *Zip) ExtractToWithContext(ctx context.Context, path string, opts ...ZipOption) error {
 	path = filepath.Clean(path)
 	cfg := z.applyOptions(opts)
-	files := z.applyFilters(z.Files(), cfg.filters)
+	files := z.Select(cfg.filters...)
 	sortAlphabetical(files)
 
 	collector := newStatsCollector(cfg, files, nil)
@@ -1064,37 +1075,36 @@ func (z *Zip) execSequentialVerify(ctx context.Context, files []*File, collector
 }
 
 func (z *Zip) execParallelVerify(ctx context.Context, files []*File, workers int, collector *statsCollector) []error {
-	sem := make(chan struct{}, workers)
+	tasks := make(chan *File)
 	errChan := make(chan error, len(files))
 	var wg sync.WaitGroup
 
-	for _, f := range files {
-		if ctx.Err() != nil {
-			errChan <- ctx.Err()
-			break
-		}
-
-		sem <- struct{}{}
-		wg.Add(1)
-
-		go func(file *File) {
-			defer func() {
-				<-sem
-				wg.Done()
-			}()
-
-			if ctx.Err() != nil {
-				return
+	for range workers {
+		wg.Go(func() {
+			for f := range tasks {
+				if ctx.Err() != nil {
+					return
+				}
+				err := z.verifySingleFile(f, collector.OnRead)
+				if err != nil {
+					errChan <- wrapErr("verify", f, err)
+				}
+				collector.OnFileDone(f, err)
 			}
-
-			err := z.verifySingleFile(file, collector.OnRead)
-			if err != nil {
-				errChan <- wrapErr("verify", f, err)
-			}
-			collector.OnFileDone(file, err)
-		}(f)
+		})
 	}
 
+	func() {
+		for _, f := range files {
+			select {
+			case <-ctx.Done():
+				return
+			case tasks <- f:
+			}
+		}
+	}()
+
+	close(tasks)
 	wg.Wait()
 	close(errChan)
 
@@ -1102,7 +1112,6 @@ func (z *Zip) execParallelVerify(ctx context.Context, files []*File, workers int
 	for err := range errChan {
 		errs = append(errs, err)
 	}
-
 	return errs
 }
 
@@ -1217,32 +1226,39 @@ func (z *Zip) execParallelExtract(
 		return dirsToRestore, errs
 	}
 
-	sem := make(chan struct{}, workers)
+	tasks := make(chan *File, workers*2)
 	errChan := make(chan error, len(filesToExtract))
 	var wg sync.WaitGroup
 
-	for _, f := range filesToExtract {
-		select {
-		case <-ctx.Done():
-			goto Finish
-		case sem <- struct{}{}:
-		}
-
-		wg.Add(1)
-		go func(f *File) {
-			defer func() { <-sem; wg.Done() }()
-
-			err := z.extractFile(ctx, f, destDir, f.name, collector.OnRead, collector.OnWritten, &globalWritten, cfg)
-			if err != nil {
-				if ctx.Err() == nil {
-					errChan <- wrapErr("extract", f, err)
+	for range workers {
+		wg.Go(func() {
+			for f := range tasks {
+				if ctx.Err() != nil {
+					return
 				}
+				err := z.extractFile(ctx, f, destDir, f.name, collector.OnRead, collector.OnWritten, &globalWritten, cfg)
+				if err != nil {
+					if ctx.Err() == nil {
+						errChan <- wrapErr("extract", f, err)
+					}
+				}
+				collector.OnFileDone(f, err)
 			}
-			collector.OnFileDone(f, err)
-		}(f)
+
+		})
 	}
 
-Finish:
+	func() {
+		for _, f := range filesToExtract {
+			select {
+			case <-ctx.Done():
+				return
+			case tasks <- f:
+			}
+		}
+	}()
+
+	close(tasks)
 	wg.Wait()
 	close(errChan)
 
@@ -1543,7 +1559,11 @@ func (z *Zip) verifySingleFile(f *File, onRead signalFunc) error {
 		src = newProgressReader(rc, f, onRead)
 	}
 
-	if _, err := io.Copy(io.Discard, src); err != nil {
+	buf := z.bufferPool.Get().([]byte)
+	_, err = io.CopyBuffer(io.Discard, src, buf)
+	z.bufferPool.Put(buf)
+
+	if err != nil {
 		return err
 	}
 
@@ -1635,9 +1655,9 @@ func (z *Zip) extractFile(
 			return err
 		}
 
-		bufPtr := z.bufferPool.Get().(*[]byte)
-		_, err = io.CopyBuffer(wrappedW, &contextReader{ctx, wrappedR}, *bufPtr)
-		z.bufferPool.Put(bufPtr)
+		buf := z.bufferPool.Get().([]byte)
+		_, err = io.CopyBuffer(wrappedW, &contextReader{ctx, wrappedR}, buf)
+		z.bufferPool.Put(buf)
 
 		if err != nil {
 			return err
@@ -1690,13 +1710,6 @@ func (z *Zip) applyOptions(opts []ZipOption) processConfig {
 		opt(&cfg)
 	}
 	return cfg
-}
-
-func (z *Zip) applyFilters(files []*File, filters []Filter) []*File {
-	for _, filter := range filters {
-		files = filter(files)
-	}
-	return files
 }
 
 func (z *Zip) getWorkers(cfg processConfig, files []*File) int {

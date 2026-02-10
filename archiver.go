@@ -341,7 +341,7 @@ func (a *Archiver) ExistsWithContext(ctx context.Context, zip Source, filename s
 }
 
 // Walk traverses all files in the archive, calling walkFn for each one.
-// If walkFn returns an error, the traversal stops. Filters don't apply if source is [io.Reader].
+// If walkFn returns an error, the traversal stops.
 func (a *Archiver) Walk(zip Source, walkFn func(*File) error, filters ...Filter) error {
 	return a.WalkWithContext(context.Background(), zip, walkFn, filters...)
 }
@@ -350,12 +350,13 @@ func (a *Archiver) Walk(zip Source, walkFn func(*File) error, filters ...Filter)
 func (a *Archiver) WalkWithContext(ctx context.Context, zip Source, walkFn func(*File) error, filters ...Filter) (err error) {
 	return UseSource(zip, func(r io.Reader, rAt io.ReaderAt, size int64) error {
 		if rAt != nil {
-			files, err := a.newZip().LoadWithContext(ctx, rAt, size)
+			archive := a.newZip()
+			_, err := archive.LoadWithContext(ctx, rAt, size)
 			if err != nil {
 				return err
 			}
 
-			for _, f := range a.applyFilters(files, filters) {
+			for _, f := range archive.Select(filters...) {
 				if err = ctx.Err(); err != nil {
 					return err
 				}
@@ -372,6 +373,18 @@ func (a *Archiver) WalkWithContext(ctx context.Context, zip Source, walkFn func(
 			f, err := sr.Next()
 			if err != nil {
 				return err
+			}
+
+			isMatch := true
+			for _, filter := range filters {
+				if !filter(f) {
+					isMatch = false
+					break
+				}
+			}
+
+			if !isMatch {
+				continue
 			}
 
 			// Allow file to be opened in walkFn
@@ -561,6 +574,7 @@ func (a *Archiver) Diff(srcA, srcB Source, filters ...Filter) (ArchiveDiff, erro
 	return a.DiffWithContext(context.Background(), srcA, srcB, filters...)
 }
 
+// DiffWithContext compares two archives and returns the differences with context support.
 func (a *Archiver) DiffWithContext(ctx context.Context, zipA, zipB Source, filters ...Filter) (diff ArchiveDiff, err error) {
 	filesA, err := a.GetEntriesWithContext(ctx, zipA)
 	filesB, err := a.GetEntriesWithContext(ctx, zipB)
@@ -612,10 +626,7 @@ func (a *Archiver) TreeWithContext(ctx context.Context, zip Source, filters ...F
 	if err != nil {
 		return "", err
 	}
-	for _, filter := range filters {
-		files = filter(files)
-	}
-	return generateTree(files), nil
+	return generateTree(a.applyFilters(files, filters)), nil
 }
 
 // TotalSize returns the total size of compressed and uncompressed data in the archive.
@@ -976,10 +987,27 @@ func (a *Archiver) openFile(filename string, archive *Zip) (io.ReadCloser, error
 }
 
 func (a *Archiver) applyFilters(files []*File, filters []Filter) []*File {
-	for _, filter := range filters {
-		files = filter(files)
+	n := 0
+	for _, f := range files {
+		isMatch := true
+		for _, filter := range filters {
+			if !filter(f) {
+				isMatch = false
+				break
+			}
+		}
+
+		if isMatch {
+			files[n] = f
+			n++
+		}
 	}
-	return files
+
+	for i := n; i < len(files); i++ {
+		files[i] = nil
+	}
+
+	return files[:n]
 }
 
 var DefaultArchiver = NewArchiver(

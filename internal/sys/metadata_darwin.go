@@ -11,15 +11,15 @@ import (
 	"syscall"
 )
 
-func GetFileMetadata(stat os.FileInfo) map[string]interface{} {
+func GetFileMetadata(stat os.FileInfo) Metadata {
 	s, ok := stat.Sys().(*syscall.Stat_t)
 	if !ok {
-		return nil
+		return Metadata{}
 	}
 
-	return map[string]interface{}{
-		"LastAccessTime": unixNanoToWinFiletime(int64(s.Atimespec.Sec), int64(s.Atimespec.Nsec)),
-		"LastWriteTime":  unixNanoToWinFiletime(int64(s.Mtimespec.Sec), int64(s.Mtimespec.Nsec)),
-		"CreationTime":   unixNanoToWinFiletime(int64(s.Birthtimespec.Sec), int64(s.Birthtimespec.Nsec)),
+	return Metadata{
+		LastAccessTime: unixNanoToWinFiletime(int64(s.Atimespec.Sec), int64(s.Atimespec.Nsec)),
+		LastWriteTime:  unixNanoToWinFiletime(int64(s.Mtimespec.Sec), int64(s.Mtimespec.Nsec)),
+		CreationTime:   unixNanoToWinFiletime(int64(s.Birthtimespec.Sec), int64(s.Birthtimespec.Nsec)),
 	}
 }

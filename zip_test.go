@@ -264,7 +264,7 @@ func TestZip_Security_ResourceLimits(t *testing.T) {
 	f, _ := gozip.NewFile("bomb.txt", false)
 	f.WithOpenFunc(func() (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(make([]byte, 1024*1024))), nil
-	})
+	}).WithUncompressedSize(gozip.SizeUnknown)
 	z.Add(f)
 
 	buf := new(bytes.Buffer)
@@ -420,7 +420,7 @@ func TestZip_Add_Validation(t *testing.T) {
 
 func TestZip_ParallelOperations(t *testing.T) {
 	z := gozip.NewZip()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		z.AddString(fmt.Sprintf("data %d", i), fmt.Sprintf("file_%d.txt", i))
 	}
 

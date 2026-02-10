@@ -90,24 +90,32 @@ func ReadLocalFileHeader(src io.Reader) (LocalFileHeader, error) {
 	return entry, nil
 }
 
-func (h LocalFileHeader) Encode() []byte {
-	size := 30 + h.FilenameLength + h.ExtraFieldLength
-	buf := make([]byte, size)
+func (h LocalFileHeader) AppendBytes(buf []byte) []byte {
+	needed := 30 + h.FilenameLength + h.ExtraFieldLength
 
-	binary.LittleEndian.PutUint32(buf[0:4], LocalFileHeaderSignature)
-	binary.LittleEndian.PutUint16(buf[4:6], h.VersionNeededToExtract)
-	binary.LittleEndian.PutUint16(buf[6:8], h.GeneralPurposeBitFlag)
-	binary.LittleEndian.PutUint16(buf[8:10], h.CompressionMethod)
-	binary.LittleEndian.PutUint16(buf[10:12], h.LastModFileTime)
-	binary.LittleEndian.PutUint16(buf[12:14], h.LastModFileDate)
-	binary.LittleEndian.PutUint32(buf[14:18], h.CRC32)
-	binary.LittleEndian.PutUint32(buf[18:22], h.CompressedSize)
-	binary.LittleEndian.PutUint32(buf[22:26], h.UncompressedSize)
-	binary.LittleEndian.PutUint16(buf[26:28], h.FilenameLength)
-	binary.LittleEndian.PutUint16(buf[28:30], h.ExtraFieldLength)
+	if cap(buf)-len(buf) < int(needed) {
+		newBuf := make([]byte, len(buf), len(buf)+int(needed))
+		copy(newBuf, buf)
+		buf = newBuf
+	}
 
-	copy(buf[30:], h.Filename)
-	copy(buf[30+h.FilenameLength:], h.ExtraField)
+	offset := len(buf)
+	buf = buf[:offset+30]
+
+	binary.LittleEndian.PutUint32(buf[offset:offset+4], LocalFileHeaderSignature)
+	binary.LittleEndian.PutUint16(buf[offset+4:offset+6], h.VersionNeededToExtract)
+	binary.LittleEndian.PutUint16(buf[offset+6:offset+8], h.GeneralPurposeBitFlag)
+	binary.LittleEndian.PutUint16(buf[offset+8:offset+10], h.CompressionMethod)
+	binary.LittleEndian.PutUint16(buf[offset+10:offset+12], h.LastModFileTime)
+	binary.LittleEndian.PutUint16(buf[offset+12:offset+14], h.LastModFileDate)
+	binary.LittleEndian.PutUint32(buf[offset+14:offset+18], h.CRC32)
+	binary.LittleEndian.PutUint32(buf[offset+18:offset+22], h.CompressedSize)
+	binary.LittleEndian.PutUint32(buf[offset+22:offset+26], h.UncompressedSize)
+	binary.LittleEndian.PutUint16(buf[offset+26:offset+28], h.FilenameLength)
+	binary.LittleEndian.PutUint16(buf[offset+28:offset+30], h.ExtraFieldLength)
+
+	buf = append(buf, h.Filename...)
+	buf = append(buf, h.ExtraField...)
 
 	return buf
 }
@@ -185,33 +193,39 @@ func ReadCentralDirEntry(src io.Reader) (CentralDirectory, error) {
 	return entry, nil
 }
 
-func (d CentralDirectory) Encode() []byte {
-	totalSize := 46 + int(d.FilenameLength) + int(d.ExtraFieldLength) + int(d.FileCommentLength)
-	buf := make([]byte, totalSize)
+func (d CentralDirectory) AppendBytes(buf []byte) []byte {
+	needed := 46 + d.FilenameLength + d.ExtraFieldLength + d.FileCommentLength
 
-	binary.LittleEndian.PutUint32(buf[0:4], CentralDirectorySignature)
-	binary.LittleEndian.PutUint16(buf[4:6], d.VersionMadeBy)
-	binary.LittleEndian.PutUint16(buf[6:8], d.VersionNeededToExtract)
-	binary.LittleEndian.PutUint16(buf[8:10], d.GeneralPurposeBitFlag)
-	binary.LittleEndian.PutUint16(buf[10:12], d.CompressionMethod)
-	binary.LittleEndian.PutUint16(buf[12:14], d.LastModFileTime)
-	binary.LittleEndian.PutUint16(buf[14:16], d.LastModFileDate)
-	binary.LittleEndian.PutUint32(buf[16:20], d.CRC32)
-	binary.LittleEndian.PutUint32(buf[20:24], d.CompressedSize)
-	binary.LittleEndian.PutUint32(buf[24:28], d.UncompressedSize)
-	binary.LittleEndian.PutUint16(buf[28:30], d.FilenameLength)
-	binary.LittleEndian.PutUint16(buf[30:32], d.ExtraFieldLength)
-	binary.LittleEndian.PutUint16(buf[32:34], d.FileCommentLength)
-	binary.LittleEndian.PutUint16(buf[34:36], d.DiskNumberStart)
-	binary.LittleEndian.PutUint16(buf[36:38], d.InternalFileAttributes)
-	binary.LittleEndian.PutUint32(buf[38:42], d.ExternalFileAttributes)
-	binary.LittleEndian.PutUint32(buf[42:46], d.LocalHeaderOffset)
+	if cap(buf)-len(buf) < int(needed) {
+		newBuf := make([]byte, len(buf), len(buf)+int(needed))
+		copy(newBuf, buf)
+		buf = newBuf
+	}
 
-	offset := 46
+	offset := len(buf)
+	buf = buf[:offset+46]
 
-	offset += copy(buf[offset:], d.Filename)
-	offset += copy(buf[offset:], d.ExtraField)
-	copy(buf[offset:], d.Comment)
+	binary.LittleEndian.PutUint32(buf[offset+0:offset+4], CentralDirectorySignature)
+	binary.LittleEndian.PutUint16(buf[offset+4:offset+6], d.VersionMadeBy)
+	binary.LittleEndian.PutUint16(buf[offset+6:offset+8], d.VersionNeededToExtract)
+	binary.LittleEndian.PutUint16(buf[offset+8:offset+10], d.GeneralPurposeBitFlag)
+	binary.LittleEndian.PutUint16(buf[offset+10:offset+12], d.CompressionMethod)
+	binary.LittleEndian.PutUint16(buf[offset+12:offset+14], d.LastModFileTime)
+	binary.LittleEndian.PutUint16(buf[offset+14:offset+16], d.LastModFileDate)
+	binary.LittleEndian.PutUint32(buf[offset+16:offset+20], d.CRC32)
+	binary.LittleEndian.PutUint32(buf[offset+20:offset+24], d.CompressedSize)
+	binary.LittleEndian.PutUint32(buf[offset+24:offset+28], d.UncompressedSize)
+	binary.LittleEndian.PutUint16(buf[offset+28:offset+30], d.FilenameLength)
+	binary.LittleEndian.PutUint16(buf[offset+30:offset+32], d.ExtraFieldLength)
+	binary.LittleEndian.PutUint16(buf[offset+32:offset+34], d.FileCommentLength)
+	binary.LittleEndian.PutUint16(buf[offset+34:offset+36], d.DiskNumberStart)
+	binary.LittleEndian.PutUint16(buf[offset+36:offset+38], d.InternalFileAttributes)
+	binary.LittleEndian.PutUint32(buf[offset+38:offset+42], d.ExternalFileAttributes)
+	binary.LittleEndian.PutUint32(buf[offset+42:offset+46], d.LocalHeaderOffset)
+
+	buf = append(buf, d.Filename...)
+	buf = append(buf, d.ExtraField...)
+	buf = append(buf, d.Comment...)
 
 	return buf
 }
@@ -415,23 +429,35 @@ func ParseExtraField(extraField []byte) map[uint16][]byte {
 	return m
 }
 
-func EncodeZip64ExtraField(uncompSize, compSize, headerOffset int64) []byte {
-	data := make([]byte, 4, 28)
+func EncodeZip64ExtraField(buf []byte, uncompSize, compSize, headerOffset int64) []byte {
+	offset := 4
+	needed := offset + 24
 
-	binary.LittleEndian.PutUint16(data[0:2], Zip64ExtraFieldTag)
+	if cap(buf)-len(buf) < int(needed) {
+		newBuf := make([]byte, len(buf), len(buf)+int(needed))
+		copy(newBuf, buf)
+		buf = newBuf
+	}
+
+	buf = buf[:offset]
+
+	binary.LittleEndian.PutUint16(buf[0:2], Zip64ExtraFieldTag)
 
 	if uncompSize > MaxUint32 {
-		data = binary.LittleEndian.AppendUint64(data, uint64(uncompSize))
+		offset += 8
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(uncompSize))
 	}
 	if compSize > MaxUint32 {
-		data = binary.LittleEndian.AppendUint64(data, uint64(compSize))
+		offset += 8
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(compSize))
 	}
 	if headerOffset > MaxUint32 {
-		data = binary.LittleEndian.AppendUint64(data, uint64(headerOffset))
+		offset += 8
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(headerOffset))
 	}
 
-	binary.LittleEndian.PutUint16(data[2:4], uint16(len(data)-4))
-	return data
+	binary.LittleEndian.PutUint16(buf[2:4], uint16(offset))
+	return buf[:offset]
 }
 
 func EncodeZip64LocalExtraField(uncompSize, compSize int64) []byte {
@@ -443,32 +469,15 @@ func EncodeZip64LocalExtraField(uncompSize, compSize int64) []byte {
 	return data[:]
 }
 
-func ParseNTFSExtraField(data []byte) map[string]interface{} {
-	return map[string]interface{}{
-		"LastWriteTime":  binary.LittleEndian.Uint64(data[12:20]),
-		"LastAccessTime": binary.LittleEndian.Uint64(data[12:20]),
-		"CreationTime":   binary.LittleEndian.Uint64(data[28:36]),
+func ParseNTFSExtraField(data []byte) sys.Metadata {
+	return sys.Metadata{
+		LastWriteTime:  binary.LittleEndian.Uint64(data[12:20]),
+		LastAccessTime: binary.LittleEndian.Uint64(data[12:20]),
+		CreationTime:   binary.LittleEndian.Uint64(data[28:36]),
 	}
 }
 
-func EncodeNTFSExtraField(metadata map[string]interface{}) []byte {
-	var mtime, atime, ctime uint64
-	if val, ok := metadata["LastWriteTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			mtime = t
-		}
-	}
-	if val, ok := metadata["LastAccessTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			atime = t
-		}
-	}
-	if val, ok := metadata["CreationTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			ctime = t
-		}
-	}
-
+func EncodeNTFSExtraField(metadata sys.Metadata) []byte {
 	// Tag(2) + Size(2) + Reserved(4) + Attr1(2) + Size1(2) + Mtime(8) + Atime(8) + Ctime(8)
 	var data [36]byte
 	binary.LittleEndian.PutUint16(data[0:2], NTFSFieldTag)
@@ -476,9 +485,9 @@ func EncodeNTFSExtraField(metadata map[string]interface{}) []byte {
 	binary.LittleEndian.PutUint32(data[4:8], 0)
 	binary.LittleEndian.PutUint16(data[8:10], 1)
 	binary.LittleEndian.PutUint16(data[10:12], 24)
-	binary.LittleEndian.PutUint64(data[12:20], mtime)
-	binary.LittleEndian.PutUint64(data[20:28], atime)
-	binary.LittleEndian.PutUint64(data[28:36], ctime)
+	binary.LittleEndian.PutUint64(data[12:20], metadata.LastWriteTime)
+	binary.LittleEndian.PutUint64(data[20:28], metadata.LastAccessTime)
+	binary.LittleEndian.PutUint64(data[28:36], metadata.CreationTime)
 	return data[:]
 }
 
@@ -508,7 +517,7 @@ func ParseFileMode(entry CentralDirectory) fs.FileMode {
 	}
 
 	if hostSystem.IsWindows() {
-		isDir := strings.HasSuffix(entry.Filename, "/") || (entry.ExternalFileAttributes&0x10 != 0)
+		isDir := len(entry.Filename) > 0 && entry.Filename[len(entry.Filename)-1] == '/' || (entry.ExternalFileAttributes&0x10 != 0)
 
 		if isDir {
 			mode = 0755 | fs.ModeDir

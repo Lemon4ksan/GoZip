@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/lemon4ksan/gozip/internal/sys"
 )
 
 // byteCountWriter counts bytes written to a writer.
@@ -96,14 +98,8 @@ func msDosToTime(dosDate uint16, dosTime uint16) time.Time {
 	return time.Date(year, time.Month(month), int(day), int(hour), int(minute), int(second), 0, time.UTC)
 }
 
-func hasPreciseTimestamps(metadata map[string]interface{}) bool {
-	if metadata == nil {
-		return false
-	}
-	_, w := metadata["LastWriteTime"]
-	_, a := metadata["LastAccessTime"]
-	_, c := metadata["CreationTime"]
-	return w || a || c
+func hasPreciseTimestamps(metadata sys.Metadata) bool {
+	return metadata.LastWriteTime != 0 || metadata.LastAccessTime != 0 || metadata.CreationTime != 0
 }
 
 // winFiletimeToTime converts Windows FILETIME (100ns ticks since 1601) to Go time.Time.

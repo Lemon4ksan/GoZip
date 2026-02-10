@@ -4,7 +4,14 @@
 
 package sys
 
-// FileSystemType represents the type of file system on which the ZIP file was created
+// Metadata stores os specific file metadata.
+type Metadata struct {
+	LastAccessTime uint64
+	LastWriteTime  uint64
+	CreationTime   uint64
+}
+
+// FileSystemType represents the type of file system on which the ZIP file was created.
 type FileSystemType int
 
 const (
@@ -17,7 +24,7 @@ const (
 	FileSystemZFS
 )
 
-// HostSystem represents the host system on which the ZIP file was created
+// HostSystem represents the host system on which the ZIP file was created.
 type HostSystem uint8
 
 // Supported host systems according to ZIP specification
@@ -68,7 +75,7 @@ func (h HostSystem) IsUnix() bool {
 	}
 }
 
-// String representation of HostSystem for debugging
+// String representation of HostSystem for debugging.
 func (h HostSystem) String() string {
 	names := map[HostSystem]string{
 		HostSystemFAT:       "FAT",

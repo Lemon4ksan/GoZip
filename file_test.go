@@ -182,8 +182,7 @@ func TestFile_ExtraFields(t *testing.T) {
 	f.SetExtraField(tag2, data2)
 
 	// Force parse/build via private method access (since we are in same package)
-	headers := newZipHeaders(f.Snapshot())
-	rawBytes := headers.buildExtraFieldBytes()
+	rawBytes := f.Snapshot().buildExtraFieldBytes()
 
 	// Parse manually to verify order
 	// First field should be tag2 (0x0001)
@@ -309,9 +308,9 @@ func TestZipHeaders_AttributesAndFlags(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newZipHeaders(tt.file.Snapshot())
+			h := tt.file.Snapshot()
 			lh := h.LocalHeader()
-			cd := h.CentralDirEntry()
+			cd := h.CentralDirectory()
 
 			// Check Flags
 			if lh.GeneralPurposeBitFlag&tt.wantFlag != tt.wantFlag {
@@ -338,14 +337,14 @@ func TestZipHeaders(t *testing.T) {
 		},
 	}
 
-	headers := newZipHeaders(file.Snapshot())
-	localHeader := headers.LocalHeader()
+	snap := file.Snapshot()
+	localHeader := snap.LocalHeader()
 
 	if localHeader.CompressionMethod != uint16(Deflate) {
 		t.Error("compression method not set correctly")
 	}
 
-	centralDir := headers.CentralDirEntry()
+	centralDir := snap.CentralDirectory()
 	if centralDir.CompressedSize != 0 {
 		t.Error("central dir compressed size should be 0 before compression")
 	}
@@ -357,8 +356,7 @@ func TestZipHeaders_Directory(t *testing.T) {
 		isDir: true,
 	}
 
-	headers := newZipHeaders(file.Snapshot())
-	localHeader := headers.LocalHeader()
+	localHeader := file.Snapshot().LocalHeader()
 
 	// "archive/docs" + "/" = 13 bytes
 	expectedLength := uint16(len("archive/docs") + 1)
@@ -487,13 +485,8 @@ func TestIntegration_FileToHeaders(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// 1. Create headers using the logic in file.go
-			h := newZipHeaders(tt.file.Snapshot())
+			localEncoded := tt.file.Snapshot().LocalHeader().AppendBytes(nil)
 
-			// 2. Encode Local Header
-			localEncoded := h.LocalHeader().Encode()
-
-			// Verify Filename is present in bytes
 			if !bytes.Contains(localEncoded, []byte(tt.expected)) {
 				t.Errorf("Local Header bytes did not contain filename %q", tt.expected)
 			}

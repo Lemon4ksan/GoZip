@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path"
 	"slices"
@@ -89,9 +90,9 @@ type File struct {
 
 	// Per-file configuration overriding archive defaults
 	config        FileConfig
-	metadata      map[string]interface{} // Platform-specific metadata (NTFS timestamps, etc.)
-	extraField    map[uint16][]byte      // ZIP extra fields for extended functionality
-	extraFieldRaw []byte                 // Raw extra field data
+	metadata      sys.Metadata      // Platform-specific metadata (NTFS timestamps, etc.)
+	extraField    map[uint16][]byte // ZIP extra fields for extended functionality
+	extraFieldRaw []byte            // Raw extra field data
 
 	extraParseOnce sync.Once // Sync for map initialization
 	hasZip64Extra  bool      // True if 0x0001 tag is present in local header or cd
@@ -116,8 +117,6 @@ func NewFile(name string, isDir bool) (*File, error) {
 		modTime:    time.Now(),
 		mode:       0644,
 		hostSystem: sys.DefaultHostSystem,
-		metadata:   make(map[string]interface{}),
-		extraField: make(map[uint16][]byte),
 	}
 	if isDir {
 		f.mode = 0755 | fs.ModeDir
@@ -159,7 +158,6 @@ func newFileFromPath(path string) (*File, error) {
 		mode:             info.Mode(),
 		metadata:         sys.GetFileMetadata(info),
 		hostSystem:       sys.DefaultHostSystem,
-		extraField:       make(map[uint16][]byte),
 	}
 
 	if isSymlink {
@@ -199,7 +197,6 @@ func newFileFromOS(f *os.File) (*File, error) {
 		mode:             stat.Mode(),
 		metadata:         sys.GetFileMetadata(stat),
 		hostSystem:       sys.DefaultHostSystem,
-		extraField:       make(map[uint16][]byte),
 		openFunc: func() (io.ReadCloser, error) {
 			// NopCloser to prevent the caller from closing the original file handle
 			return io.NopCloser(io.NewSectionReader(f, 0, stat.Size())), nil
@@ -225,7 +222,6 @@ func newFileFromReader(src io.Reader, name string, size int64) (*File, error) {
 		uncompressedSize: size,
 		modTime:          time.Now(),
 		hostSystem:       sys.DefaultHostSystem,
-		extraField:       make(map[uint16][]byte),
 		openFunc: func() (io.ReadCloser, error) {
 			return io.NopCloser(src), nil
 		},
@@ -244,7 +240,6 @@ func newDirectoryFile(name string) (*File, error) {
 		mode:       0755 | fs.ModeDir,
 		hostSystem: sys.DefaultHostSystem,
 		modTime:    time.Now(),
-		extraField: make(map[uint16][]byte),
 	}, nil
 }
 
@@ -265,7 +260,6 @@ func newFileFromFS(fs fs.FS, filePath string, info fs.FileInfo) (*File, error) {
 		modTime:          info.ModTime(),
 		mode:             info.Mode(),
 		hostSystem:       sys.DefaultHostSystem,
-		extraField:       make(map[uint16][]byte),
 		openFunc: func() (io.ReadCloser, error) {
 			return fs.Open(filePath)
 		},
@@ -334,21 +328,9 @@ func (f *File) FsTime() (mtime, atime, ctime time.Time) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	if val, ok := f.metadata["LastWriteTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			mtime = winFiletimeToTime(t)
-		}
-	}
-	if val, ok := f.metadata["LastAccessTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			atime = winFiletimeToTime(t)
-		}
-	}
-	if val, ok := f.metadata["CreationTime"]; ok {
-		if t, ok := val.(uint64); ok {
-			ctime = winFiletimeToTime(t)
-		}
-	}
+	mtime = winFiletimeToTime(f.metadata.LastWriteTime)
+	atime = winFiletimeToTime(f.metadata.LastAccessTime)
+	ctime = winFiletimeToTime(f.metadata.CreationTime)
 	return
 }
 
@@ -489,15 +471,13 @@ func (f *File) WithConfig(c FileConfig) *File {
 	return f
 }
 
-// WithOpenFunc replaces the function used to open the
-// file's content and sets the size to [SizeUnknown].
+// WithOpenFunc replaces the function used to open the file's content.
 func (f *File) WithOpenFunc(openFunc func() (io.ReadCloser, error)) *File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.srcFunc = nil
 	f.openFunc = openFunc
-	f.uncompressedSize = SizeUnknown
 	return f
 }
 
@@ -640,7 +620,7 @@ type FileSnapshot struct {
 	Flags             uint16
 
 	// Extra Fields (Deep copy or flattened representation)
-	Metadata      map[string]interface{}
+	Metadata      sys.Metadata
 	ExtraField    map[uint16][]byte
 	ExtraFieldRaw []byte
 }
@@ -665,13 +645,6 @@ func (f *File) Snapshot() *FileSnapshot {
 			extraCopy[k] = vCopy
 		}
 	}
-	var metadataCopy map[string]interface{}
-	if f.metadata != nil {
-		metadataCopy = make(map[string]interface{}, len(f.metadata))
-		for k, v := range f.metadata {
-			metadataCopy[k] = v
-		}
-	}
 
 	snap := &FileSnapshot{
 		file:       f,
@@ -690,12 +663,42 @@ func (f *File) Snapshot() *FileSnapshot {
 		CRC32:             atomic.LoadUint32(&f.crc32),
 		Flags:             f.flags,
 
-		Metadata:      metadataCopy,
+		Metadata:      f.metadata,
 		ExtraField:    extraCopy,
 		ExtraFieldRaw: f.extraFieldRaw, // Copy slice header is enough if content is immutable
 	}
 
 	return snap
+}
+
+// FillSnapshot executes the passed data snapshot to avoid allocations.
+func (f *File) FillSnapshot(snap *FileSnapshot) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	snap.file = f
+	snap.Name = f.name
+	snap.IsDir = f.isDir
+	snap.IsImplicit = f.isImplicit
+	snap.Mode = f.mode
+	snap.ModTime = f.modTime
+	snap.HostSystem = f.hostSystem
+	snap.Config = f.config
+	snap.UncompressedSize = atomic.LoadInt64(&f.uncompressedSize)
+	snap.CompressedSize = atomic.LoadInt64(&f.compressedSize)
+	snap.LocalHeaderOffset = atomic.LoadInt64(&f.localHeaderOffset)
+	snap.CRC32 = atomic.LoadUint32(&f.crc32)
+	snap.Flags = f.flags
+	snap.Metadata = f.metadata
+
+	if f.extraField == nil && len(f.extraFieldRaw) > 0 {
+		snap.ExtraFieldRaw = f.extraFieldRaw
+		snap.ExtraField = nil
+	} else {
+		f.ensureExtraParsed()
+		snap.ExtraField = maps.Clone(f.extraField)
+		snap.ExtraFieldRaw = nil
+	}
 }
 
 // RequiresZip64 checks if Zip64 format is needed based on the snapshot values.
@@ -721,31 +724,21 @@ func (s *FileSnapshot) entryName() string {
 	return s.Name
 }
 
-// zipHeaders is responsible for generating ZIP format headers from a FileHeaderSnapshot.
-type zipHeaders struct {
-	snap *FileSnapshot
-}
-
-// newZipHeaders accepts a snapshot instead of a raw File.
-func newZipHeaders(snap *FileSnapshot) *zipHeaders {
-	return &zipHeaders{snap: snap}
-}
-
 // LocalHeader generates the local file header that precedes the file data.
-func (zh *zipHeaders) LocalHeader() internal.LocalFileHeader {
-	dosDate, dosTime := timeToMsDos(zh.snap.ModTime)
-	filename := zh.snap.entryName()
-	localExtra := zh.buildLocalExtraData()
+func (s *FileSnapshot) LocalHeader() internal.LocalFileHeader {
+	dosDate, dosTime := timeToMsDos(s.ModTime)
+	filename := s.entryName()
+	localExtra := s.buildLocalExtraData()
 
 	return internal.LocalFileHeader{
-		VersionNeededToExtract: zh.getVersionNeededToExtract(),
-		GeneralPurposeBitFlag:  zh.getFileBitFlag(),
-		CompressionMethod:      zh.getCompressionMethod(),
+		VersionNeededToExtract: s.VersionNeededToExtract(),
+		GeneralPurposeBitFlag:  s.FileBitFlag(),
+		CompressionMethod:      s.CompressionMethod(),
 		LastModFileTime:        dosTime,
 		LastModFileDate:        dosDate,
-		CRC32:                  zh.snap.CRC32,
-		CompressedSize:         uint32(min(StandardSizeLimit, zh.snap.CompressedSize)),
-		UncompressedSize:       uint32(min(StandardSizeLimit, zh.snap.UncompressedSize)),
+		CRC32:                  s.CRC32,
+		CompressedSize:         uint32(min(StandardSizeLimit, s.CompressedSize)),
+		UncompressedSize:       uint32(min(StandardSizeLimit, s.UncompressedSize)),
 		FilenameLength:         uint16(len(filename)),
 		ExtraFieldLength:       uint16(len(localExtra)),
 		Filename:               filename,
@@ -753,112 +746,112 @@ func (zh *zipHeaders) LocalHeader() internal.LocalFileHeader {
 	}
 }
 
-// CentralDirEntry generates the central directory entry for this file.
-func (zh *zipHeaders) CentralDirEntry() internal.CentralDirectory {
-	dosDate, dosTime := timeToMsDos(zh.snap.ModTime)
-	filename := zh.snap.entryName()
+// CentralDirectory generates the central directory entry for this file.
+func (s *FileSnapshot) CentralDirectory() internal.CentralDirectory {
+	dosDate, dosTime := timeToMsDos(s.ModTime)
+	filename := s.entryName()
 
 	var extraField []byte
-	if zh.snap.ExtraField == nil {
-		extraField = zh.snap.ExtraFieldRaw
+	if s.ExtraField == nil {
+		extraField = s.ExtraFieldRaw
 	} else {
-		extraField = zh.buildExtraFieldBytes()
+		extraField = s.buildExtraFieldBytes()
 	}
 
 	return internal.CentralDirectory{
-		VersionMadeBy:          zh.getVersionMadeBy(),
-		VersionNeededToExtract: zh.getVersionNeededToExtract(),
-		GeneralPurposeBitFlag:  zh.getFileBitFlag(),
-		CompressionMethod:      zh.getCompressionMethod(),
+		VersionMadeBy:          s.VersionMadeBy(),
+		VersionNeededToExtract: s.VersionNeededToExtract(),
+		GeneralPurposeBitFlag:  s.FileBitFlag(),
+		CompressionMethod:      s.CompressionMethod(),
 		LastModFileTime:        dosTime,
 		LastModFileDate:        dosDate,
-		CRC32:                  zh.snap.CRC32,
-		CompressedSize:         uint32(min(StandardSizeLimit, zh.snap.CompressedSize)),
-		UncompressedSize:       uint32(min(StandardSizeLimit, zh.snap.UncompressedSize)),
+		CRC32:                  s.CRC32,
+		CompressedSize:         uint32(min(StandardSizeLimit, s.CompressedSize)),
+		UncompressedSize:       uint32(min(StandardSizeLimit, s.UncompressedSize)),
 		FilenameLength:         uint16(len(filename)),
 		ExtraFieldLength:       uint16(len(extraField)),
-		FileCommentLength:      uint16(len(zh.snap.Config.Comment)),
+		FileCommentLength:      uint16(len(s.Config.Comment)),
 		DiskNumberStart:        0,
 		InternalFileAttributes: 0,
-		ExternalFileAttributes: zh.getExternalFileAttributes(),
-		LocalHeaderOffset:      uint32(min(StandardSizeLimit, zh.snap.LocalHeaderOffset)),
+		ExternalFileAttributes: s.ExternalFileAttributes(),
+		LocalHeaderOffset:      uint32(min(StandardSizeLimit, s.LocalHeaderOffset)),
 		Filename:               filename,
 		ExtraField:             extraField,
-		Comment:                zh.snap.Config.Comment,
+		Comment:                s.Config.Comment,
 	}
 }
 
-func (zh *zipHeaders) getVersionNeededToExtract() uint16 {
-	if zh.snap.Config.CompressionMethod == LZMA {
+func (s *FileSnapshot) VersionNeededToExtract() uint16 {
+	if s.Config.CompressionMethod == LZMA {
 		return 63
 	}
-	if zh.snap.Config.EncryptionMethod == AES256 {
+	if s.Config.EncryptionMethod == AES256 {
 		return 51
 	}
-	if zh.snap.Config.CompressionMethod == BZIP2 {
+	if s.Config.CompressionMethod == BZIP2 {
 		return 46
 	}
-	if zh.snap.RequiresZip64() {
+	if s.RequiresZip64() {
 		return 45
 	}
-	if zh.snap.Config.CompressionMethod == Deflate64 {
+	if s.Config.CompressionMethod == Deflate64 {
 		return 21
 	}
-	if zh.snap.Config.CompressionMethod == Deflate {
+	if s.Config.CompressionMethod == Deflate {
 		return 20
 	}
-	if zh.snap.IsDir || strings.Contains(zh.snap.Name, "/") {
+	if s.IsDir || strings.Contains(s.Name, "/") {
 		return 20
 	}
-	if zh.snap.Config.EncryptionMethod == ZipCrypto {
+	if s.Config.EncryptionMethod == ZipCrypto {
 		return 20
 	}
 	return 10
 }
 
-func (zh *zipHeaders) getVersionMadeBy() uint16 {
-	fs := zh.snap.HostSystem
+func (s *FileSnapshot) VersionMadeBy() uint16 {
+	fs := s.HostSystem
 	if fs == sys.HostSystemNTFS {
 		fs = sys.HostSystemFAT
 	}
 	return uint16(fs)<<8 | LatestZipVersion
 }
 
-func (zh *zipHeaders) getFileBitFlag() uint16 {
-	flag := zh.snap.Flags
+func (s *FileSnapshot) FileBitFlag() uint16 {
+	flag := s.Flags
 
-	if zh.snap.Config.EncryptionMethod != NotEncrypted {
+	if s.Config.EncryptionMethod != NotEncrypted {
 		flag |= 0x1
 	}
 
-	if zh.snap.Config.CompressionMethod == Deflate && zh.snap.UncompressedSize != 0 {
-		flag |= zh.getCompressionLevelBits()
+	if s.Config.CompressionMethod == Deflate && s.UncompressedSize != 0 {
+		flag |= s.CompressionLevelBits()
 	}
 
 	flag |= 0x800 // UTF-8 flag
 	return flag
 }
 
-func (zh *zipHeaders) getCompressionMethod() uint16 {
-	if zh.snap.UncompressedSize == 0 {
+func (s *FileSnapshot) CompressionMethod() uint16 {
+	if s.UncompressedSize == 0 {
 		return uint16(Store)
 	}
-	if zh.snap.Config.EncryptionMethod == AES256 {
+	if s.Config.EncryptionMethod == AES256 {
 		return winZipAESMarker
 	}
-	return uint16(zh.snap.Config.CompressionMethod)
+	return uint16(s.Config.CompressionMethod)
 }
 
-func (zh *zipHeaders) getExternalFileAttributes() uint32 {
+func (s *FileSnapshot) ExternalFileAttributes() uint32 {
 	var externalAttrs uint32
 
-	switch zh.snap.HostSystem {
+	switch s.HostSystem {
 	case sys.HostSystemUNIX, sys.HostSystemDarwin:
-		mode := uint32(zh.snap.Mode & fs.ModePerm)
+		mode := uint32(s.Mode & fs.ModePerm)
 		switch {
-		case zh.snap.IsDir:
+		case s.IsDir:
 			mode |= sys.S_IFDIR
-		case zh.snap.Mode&fs.ModeSymlink != 0:
+		case s.Mode&fs.ModeSymlink != 0:
 			mode |= sys.S_IFLNK
 		default:
 			mode |= sys.S_IFREG
@@ -866,20 +859,20 @@ func (zh *zipHeaders) getExternalFileAttributes() uint32 {
 		externalAttrs = mode << 16
 
 	case sys.HostSystemFAT, sys.HostSystemNTFS:
-		if zh.snap.IsDir {
+		if s.IsDir {
 			externalAttrs |= 0x10
 		} else {
 			externalAttrs |= 0x20
 		}
-		if zh.snap.Mode&0200 == 0 {
+		if s.Mode&0200 == 0 {
 			externalAttrs |= 0x01 // ReadOnly
 		}
 	}
 	return externalAttrs
 }
 
-func (zh *zipHeaders) getCompressionLevelBits() uint16 {
-	level := zh.snap.Config.CompressionLevel
+func (s *FileSnapshot) CompressionLevelBits() uint16 {
+	level := s.Config.CompressionLevel
 	if level == 0 {
 		level = DeflateNormal
 	}
@@ -895,36 +888,36 @@ func (zh *zipHeaders) getCompressionLevelBits() uint16 {
 	}
 }
 
-func (zh *zipHeaders) buildLocalExtraData() []byte {
+func (s *FileSnapshot) buildLocalExtraData() []byte {
 	var buf []byte
 
-	if zh.snap.UncompressedSize > StandardSizeLimit || zh.snap.CompressedSize > StandardSizeLimit {
-		buf = append(buf, internal.EncodeZip64LocalExtraField(zh.snap.UncompressedSize, zh.snap.CompressedSize)...)
+	if s.UncompressedSize > StandardSizeLimit || s.CompressedSize > StandardSizeLimit {
+		buf = append(buf, internal.EncodeZip64LocalExtraField(s.UncompressedSize, s.CompressedSize)...)
 	}
 
-	if zh.snap.Config.EncryptionMethod == AES256 {
-		buf = append(buf, internal.EncodeAESExtraField(uint16(zh.snap.Config.CompressionMethod))...)
+	if s.Config.EncryptionMethod == AES256 {
+		buf = append(buf, internal.EncodeAESExtraField(uint16(s.Config.CompressionMethod))...)
 	}
 
 	return buf
 }
 
-func (zh *zipHeaders) buildExtraFieldBytes() []byte {
+func (s *FileSnapshot) buildExtraFieldBytes() []byte {
 	// Works with snapshot's pre-copied map
-	if len(zh.snap.ExtraField) == 0 {
+	if len(s.ExtraField) == 0 {
 		return nil
 	}
 
 	// Deterministic sorting is still needed for binary stability
-	keys := make([]uint16, 0, len(zh.snap.ExtraField))
-	for key := range zh.snap.ExtraField {
+	keys := make([]uint16, 0, len(s.ExtraField))
+	for key := range s.ExtraField {
 		keys = append(keys, key)
 	}
 	slices.Sort(keys)
 
 	var buf []byte
 	for _, key := range keys {
-		buf = append(buf, zh.snap.ExtraField[key]...)
+		buf = append(buf, s.ExtraField[key]...)
 	}
 	return buf
 }

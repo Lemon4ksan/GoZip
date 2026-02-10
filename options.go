@@ -202,97 +202,52 @@ func WithExcludeDir(dirPath string) ZipOption {
 	}
 }
 
-// Predicate defines the condition for selecting a file.
-type Predicate func(*File) bool
-
-// WithWhere restricts operation to
-func WithWhere(cond Predicate) ZipOption {
-	return WithFilter(FilterWhere(cond))
-}
-
 // Filter filters out the files.
-type Filter func(files []*File) []*File
+type Filter func(file *File) bool
 
 // WithFiles returns files provided.
 func FilterOnly(files []*File) Filter {
-	return func(_ []*File) []*File { return files }
+	lookup := make(map[string]struct{})
+	for _, file := range files {
+		lookup[file.entryName()] = struct{}{}
+	}
+	return func(file *File) bool {
+		_, ok := lookup[file.entryName()]
+		return ok
+	}
 }
 
 // FilterFromDir returns only files nested under the specified path.
 func FilterFromDir(dirPath string) Filter {
-	return func(files []*File) []*File {
+	prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	dirEntryName := strings.TrimSuffix(prefix, "/")
+
+	return func(file *File) bool {
 		if dirPath == "" || dirPath == "." {
-			return files
+			return true
 		}
-
-		prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
-		if !strings.HasSuffix(prefix, "/") {
-			prefix += "/"
-		}
-		dirEntryName := strings.TrimSuffix(prefix, "/")
-
-		n := 0
-		for _, f := range files {
-			fName := f.entryName()
-			if strings.HasPrefix(fName, prefix) || fName == dirEntryName {
-				files[n] = f
-				n++
-			}
-		}
-
-		for i := n; i < len(files); i++ {
-			files[i] = nil
-		}
-
-		return files[:n]
+		fName := file.entryName()
+		return strings.HasPrefix(fName, prefix) || fName == dirEntryName
 	}
 }
 
 // FilterExcludeDir returns files without a provided directory and its contents.
 func FilterExcludeDir(dirPath string) Filter {
-	return func(files []*File) []*File {
-		if dirPath == "" || dirPath == "." {
-			return nil
-		}
-
-		prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
-		if !strings.HasSuffix(prefix, "/") {
-			prefix += "/"
-		}
-		dirEntryName := strings.TrimSuffix(prefix, "/")
-
-		n := 0
-		for _, f := range files {
-			fName := f.entryName()
-			if strings.HasPrefix(fName, prefix) || fName == dirEntryName {
-				continue
-			}
-			files[n] = f
-			n++
-		}
-
-		for i := n; i < len(files); i++ {
-			files[i] = nil
-		}
-
-		return files[:n]
+	prefix := strings.TrimPrefix(path.Clean(strings.ReplaceAll(dirPath, "\\", "/")), "/")
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
 	}
-}
+	dirEntryName := strings.TrimSuffix(prefix, "/")
 
-// FilterWhere returns files that match the specified condition.
-func FilterWhere(cond Predicate) Filter {
-	return func(files []*File) []*File {
-		n := 0
-		for _, f := range files {
-			if cond(f) {
-				files[n] = f
-				n++
-			}
+	return func(file *File) bool {
+		if dirPath == "" || dirPath == "." {
+			return false
 		}
-		for i := range len(files) {
-			files[i] = nil
-		}
-		return files[:n]
+		fName := file.entryName()
+		return !(strings.HasPrefix(fName, prefix) || fName == dirEntryName)
 	}
 }
 
@@ -324,17 +279,14 @@ func WithSmartStore(exts ...string) ZipOption {
 		extMap[strings.ToLower(strings.TrimPrefix(ext, "."))] = struct{}{}
 	}
 	return func(pc *processConfig) {
-		pc.filters = append(pc.filters, func(files []*File) []*File {
-			for _, f := range files {
-				if f.isDir {
-					continue
-				}
-				ext := strings.ToLower(strings.TrimPrefix(path.Ext(f.name), "."))
+		pc.filters = append(pc.filters, func(file *File) bool {
+			if !file.isDir {
+				ext := strings.ToLower(strings.TrimPrefix(path.Ext(file.name), "."))
 				if _, ok := extMap[ext]; ok {
-					f.WithCompression(Store, 0)
+					file.WithCompression(Store, 0)
 				}
 			}
-			return files
+			return true
 		})
 	}
 }

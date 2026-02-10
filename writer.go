@@ -29,8 +29,11 @@ type zipWriter struct {
 	centralDirSize int64          // Cumulative size of central directory entries
 	headerOffset   int64          // Current write position for local file headers
 	centralDir     *spillBuffer   // Buffer for accumulating central directory before final write
+	encodeBuf      []byte         // Reusable headers entry buffer
+	copyBuf        []byte         // Reusable copy buf
 	onRead         signalFunc
 	onCompressed   signalFunc
+	scratchSnap    FileSnapshot
 }
 
 // newZipWriter creates and initializes a new zipWriter instance.
@@ -41,13 +44,16 @@ func newZipWriter(config ZipConfig, factories factoriesMap, dest io.Writer) *zip
 		factories:   factories,
 		compressors: make(compressorsMap),
 		centralDir:  newSpillBuffer(),
+		encodeBuf:   make([]byte, 0, 256),
+		copyBuf:     make([]byte, 64*1024),
 	}
 }
 
 // WriteFile processes and writes a single file to the archive.
 // It automatically chooses between streaming and buffered write strategies.
 func (zw *zipWriter) WriteFile(f *File) error {
-	snap := f.Snapshot()
+	f.FillSnapshot(&zw.scratchSnap)
+	snap := &zw.scratchSnap
 
 	if snap.UncompressedSize == 0 {
 		snap.ResetEncodeOptions()
@@ -222,7 +228,7 @@ func (zw *zipWriter) encodeToAndUpdate(f *FileSnapshot, dest io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if _, err := io.Copy(dest, src); err != nil {
+		if _, err := io.CopyBuffer(dest, src, zw.copyBuf); err != nil {
 			return fmt.Errorf("copy raw: %w", err)
 		}
 		return nil
@@ -296,17 +302,18 @@ func (zw *zipWriter) encodeTo(src io.Reader, dest io.Writer, cfg FileConfig) (en
 
 // Pipeline: Src -> Tee(Hasher) -> Compressor -> Counter -> Dest
 func (zw *zipWriter) encodeUnencrypted(src io.Reader, dest io.Writer, cfg FileConfig) (encodingStats, error) {
-	hasher := crc32.NewIEEE()
-	counter := &byteCountWriter{dest: dest}
+	cr := crcReaderPool.Get().(*crcReader)
+	cr.Reset(src)
+	defer crcReaderPool.Put(cr)
 
-	input := io.TeeReader(src, hasher)
+	counter := &byteCountWriter{dest: dest}
 
 	comp, err := zw.resolveCompressor(cfg.CompressionMethod, cfg.CompressionLevel)
 	if err != nil {
 		return encodingStats{}, err
 	}
 
-	uncompressedSize, err := comp.Compress(input, counter)
+	uncompressedSize, err := comp.Compress(cr, counter)
 	if err != nil {
 		return encodingStats{}, fmt.Errorf("compress: %w", err)
 	}
@@ -314,7 +321,7 @@ func (zw *zipWriter) encodeUnencrypted(src io.Reader, dest io.Writer, cfg FileCo
 	return encodingStats{
 		uncompressedSize: uncompressedSize,
 		compressedSize:   counter.bytesWritten,
-		crc32:            hasher.Sum32(),
+		crc32:            cr.crc,
 	}, nil
 }
 
@@ -349,14 +356,16 @@ func (zw *zipWriter) encodeEncryptedStream(src io.Reader, dest io.Writer, cfg Fi
 	}
 	defer cleanupTmp(tmpFile)
 
-	hasher := crc32.NewIEEE()
+	cr := crcReaderPool.Get().(*crcReader)
+	cr.Reset(src)
+	defer crcReaderPool.Put(cr)
 
 	comp, err := zw.resolveCompressor(cfg.CompressionMethod, cfg.CompressionLevel)
 	if err != nil {
 		return encodingStats{}, err
 	}
 
-	uncompressedSize, err := comp.Compress(io.TeeReader(src, hasher), tmpFile)
+	uncompressedSize, err := comp.Compress(cr, tmpFile)
 	if err != nil {
 		return encodingStats{}, fmt.Errorf("compress to temp: %w", err)
 	}
@@ -366,7 +375,7 @@ func (zw *zipWriter) encodeEncryptedStream(src io.Reader, dest io.Writer, cfg Fi
 	}
 
 	// compress=false because data is already compressed in tmpFile
-	compressedSize, err := zw.writeEncrypted(tmpFile, dest, cfg, hasher.Sum32(), false)
+	compressedSize, err := zw.writeEncrypted(tmpFile, dest, cfg, cr.crc, false)
 	if err != nil {
 		return encodingStats{}, err
 	}
@@ -374,7 +383,7 @@ func (zw *zipWriter) encodeEncryptedStream(src io.Reader, dest io.Writer, cfg Fi
 	return zw.finalizeStats(encodingStats{
 		uncompressedSize: uncompressedSize,
 		compressedSize:   compressedSize,
-		crc32:            hasher.Sum32(),
+		crc32:            cr.crc,
 	}, cfg), nil
 }
 
@@ -402,7 +411,7 @@ func (zw *zipWriter) writeEncrypted(src io.Reader, dest io.Writer, cfg FileConfi
 		}
 	} else {
 		// Pipeline: Src -> Encryptor -> Counter -> Dest
-		if _, err := io.Copy(encryptor, src); err != nil {
+		if _, err := io.CopyBuffer(encryptor, src, zw.copyBuf); err != nil {
 			_ = encryptor.Close()
 			return 0, fmt.Errorf("encrypt copy: %w", err)
 		}
@@ -417,12 +426,16 @@ func (zw *zipWriter) writeEncrypted(src io.Reader, dest io.Writer, cfg FileConfi
 
 // calculateCRC reads the entire stream to calculate size and CRC32.
 func (zw *zipWriter) calculateCRC(r io.Reader) (int64, uint32, error) {
-	hasher := crc32.NewIEEE()
-	size, err := io.Copy(io.Discard, io.TeeReader(r, hasher))
+	cr := crcReaderPool.Get().(*crcReader)
+	cr.Reset(r)
+	defer crcReaderPool.Put(cr)
+
+	_, err := io.CopyBuffer(io.Discard, cr, zw.copyBuf)
 	if err != nil {
 		return 0, 0, fmt.Errorf("calc crc: %w", err)
 	}
-	return size, hasher.Sum32(), nil
+
+	return cr.size, cr.crc, nil
 }
 
 func (zw *zipWriter) finalizeStats(s encodingStats, cfg FileConfig) encodingStats {
@@ -453,9 +466,11 @@ func (zw *zipWriter) writeFileHeader(f *FileSnapshot) error {
 	}
 
 	f.LocalHeaderOffset = zw.headerOffset
-	header := newZipHeaders(f).LocalHeader()
 
-	if n, err := zw.dest.Write(header.Encode()); err != nil {
+	zw.encodeBuf = zw.encodeBuf[:0]
+	zw.encodeBuf = f.LocalHeader().AppendBytes(zw.encodeBuf)
+
+	if n, err := zw.dest.Write(zw.encodeBuf); err != nil {
 		return fmt.Errorf("write header: %w", err)
 	} else {
 		zw.headerOffset += int64(n)
@@ -474,13 +489,14 @@ func (zw *zipWriter) addCentralDirEntry(f *FileSnapshot) error {
 		f.ExtraField[AESEncryptionTag] = internal.EncodeAESExtraField(uint16(f.Config.CompressionMethod))
 	}
 	if f.RequiresZip64() {
-		f.ExtraField[Zip64ExtraFieldTag] = internal.EncodeZip64ExtraField(f.UncompressedSize, f.CompressedSize, f.LocalHeaderOffset)
+		f.ExtraField[Zip64ExtraFieldTag] = internal.EncodeZip64ExtraField(zw.encodeBuf, f.UncompressedSize, f.CompressedSize, f.LocalHeaderOffset)
 	}
 	addFSExtraField(f)
 
-	cdData := newZipHeaders(f).CentralDirEntry()
+	zw.encodeBuf = zw.encodeBuf[:0]
+	zw.encodeBuf = f.CentralDirectory().AppendBytes(zw.encodeBuf)
 
-	if n, err := zw.centralDir.Write(cdData.Encode()); err != nil {
+	if n, err := zw.centralDir.Write(zw.encodeBuf); err != nil {
 		return err
 	} else {
 		zw.centralDirSize += int64(n)
@@ -573,6 +589,7 @@ type parallelZipWriter struct {
 	sem             chan struct{}
 	memoryThreshold int64
 	bufferPool      sync.Pool
+	snapPool        sync.Pool
 	onFileDone      func(*File, error)
 }
 
@@ -589,6 +606,9 @@ func newParallelZipWriter(zw *zipWriter, workers int) *parallelZipWriter {
 			New: func() interface{} {
 				return newMemoryBuffer(64 * 1024)
 			},
+		},
+		snapPool: sync.Pool{
+			New: func() interface{} { return &FileSnapshot{} },
 		},
 	}
 }
@@ -634,7 +654,9 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 			go func(file *File, ch chan<- zipResult) {
 				defer func() { <-pzw.sem; wg.Done() }()
 
-				snap := file.Snapshot()
+				snap := pzw.snapPool.Get().(*FileSnapshot)
+				file.FillSnapshot(snap)
+
 				if snap.UncompressedSize == 0 {
 					snap.ResetEncodeOptions()
 				}
@@ -680,12 +702,12 @@ func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []e
 				errs = append(errs, wrapErr("write", res.snap.file, err))
 				stopWriting = true
 			}
+		}
 
-			if res.snap.file != nil {
-				res.snap.file.setCompressedSize(res.snap.CompressedSize)
-				res.snap.file.WithUncompressedSize(res.snap.UncompressedSize)
-				res.snap.file.setCRC32(res.snap.CRC32)
-			}
+		if res.snap.file != nil {
+			res.snap.file.setCompressedSize(res.snap.CompressedSize)
+			res.snap.file.WithUncompressedSize(res.snap.UncompressedSize)
+			res.snap.file.setCRC32(res.snap.CRC32)
 		}
 
 		if pzw.onFileDone != nil {
@@ -786,7 +808,7 @@ func (pzw *parallelZipWriter) writeCompressedFile(file *FileSnapshot, src io.Rea
 		return nil
 	}
 
-	if n, err := io.Copy(pzw.zw.dest, src); err != nil {
+	if n, err := io.CopyBuffer(pzw.zw.dest, src, pzw.zw.copyBuf); err != nil {
 		return fmt.Errorf("copy buffer data: %w", err)
 	} else {
 		pzw.zw.headerOffset += n
@@ -897,9 +919,6 @@ func (mb *memoryBuffer) Reset() {
 }
 
 func addFSExtraField(f *FileSnapshot) {
-	if f.Metadata == nil {
-		return
-	}
 	if hasPreciseTimestamps(f.Metadata) {
 		f.ExtraField[NTFSFieldTag] = internal.EncodeNTFSExtraField(f.Metadata)
 	}
@@ -998,4 +1017,35 @@ func (sb *spillBuffer) Close() error {
 	}
 	sb.mem = nil
 	return nil
+}
+
+type crcReader struct {
+	r     io.Reader
+	crc   uint32
+	size  int64
+	table *crc32.Table
+}
+
+func (c *crcReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		c.crc = crc32.Update(c.crc, c.table, p[:n])
+		c.size += int64(n)
+	}
+	return n, err
+}
+
+func (c *crcReader) Reset(r io.Reader) {
+	c.r = r
+	c.crc = 0
+	c.size = 0
+	if c.table == nil {
+		c.table = crc32.IEEETable
+	}
+}
+
+var crcReaderPool = sync.Pool{
+	New: func() interface{} {
+		return &crcReader{table: crc32.IEEETable}
+	},
 }

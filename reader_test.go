@@ -127,7 +127,7 @@ func TestFindEOCD_BufferBoundary(t *testing.T) {
 
 func TestParseZip64_Internal(t *testing.T) {
 	// Tag(2) + Size(2) + Uncomp(8) + Comp(8) + Offset(8)
-	data := internal.EncodeZip64ExtraField(5000000000, 5000000000, 5000000000)
+	data := internal.EncodeZip64ExtraField(nil, 5000000000, 5000000000, 5000000000)
 
 	f := &File{}
 	entry := internal.SharedEntry{
@@ -375,14 +375,14 @@ func TestStreamReader_DataDescriptor(t *testing.T) {
 		Filename:              "stream.txt",
 		FilenameLength:        10,
 	}
-	buf.Write(lh.Encode())
+	buf.Write(lh.AppendBytes(nil))
 
 	buf.Write(content)
 
 	buf.Write(internal.EncodeDataDescriptor(crc, int64(len(content)), int64(len(content))))
 
 	nextLh := internal.LocalFileHeader{Filename: "next.txt", FilenameLength: 8}
-	buf.Write(nextLh.Encode())
+	buf.Write(nextLh.AppendBytes(nil))
 
 	sr := NewStreamReader(buf)
 	_, err := sr.Next()
