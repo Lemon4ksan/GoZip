@@ -5,7 +5,7 @@
 
 **GoZip** is a high-performance, feature-rich library for creating, reading, modifying, and extracting ZIP archives in Go. It is written in pure Go without CGO or external dependencies.
 
-Designed for high-load applications, GoZip focuses on **concurrency**, **memory safety**, and **strict standard compliance**, fixing common pain points found in the standard library (like legacy encodings, Zip64 limits, and WinZip AES compatibility).
+Designed for high-load applications, GoZip focuses on **concurrency**, **memory safety**, **strict standard compliance**, and **developer experience**, fixing common pain points found in the standard library (like legacy encodings, Zip64 limits, and WinZip AES compatibility).
 
 ## ⚡ Performance Benchmarks
 
@@ -19,33 +19,16 @@ GoZip achieves performance parity with the standard library (`archive/zip`) in s
 
 *Benchmarks run on **Intel Core i5-12400F** (6 cores, 12 threads).*
 
-GoZip's `Load` is slower than stdLib because it eagerly builds an O(1) lookup map and ensures structural safety. Use **StreamReader** for maximum efficiency during sequential processing.
-
-## Custom algorithms
-
-You can speed up the time even further by registering a faster flate implementation. ([`github.com/klauspost/compress/flate`](https://github.com/klauspost/compress) for example)
-
-```go
-// Example registration:
-archive.RegisterCompressor(gozip.Deflate, func(level int) gozip.Compressor {
-    return klauspost_wrapper.New(level)
-})
-```
-
 ## 🚀 Key Features
 
-* **High Performance:** Built-in support for **parallel compression and extraction** using worker pools.
-* **Zero Overhead**: In sequential mode, GoZip matches the standard library's speed, proving that its rich API features do not compromise performance.
-* **Concurrency Safe:** Optimized for concurrent access using `io.ReaderAt`, allowing wait-free parallel reading.
+* **High-Level Helpers:** `Archiver` abstraction over `Zip` reduces boilerplate code significantly.
+* **Archiver Pattern:** Encapsulated configuration (passwords, codecs) without global state side-effects.
+* **Parallel Processing:** Built-in worker pools for compression and extraction.
 * **Smart I/O:** Automatically switches between stream processing and temporary file buffering based on file size and capabilities.
-* **Archive Modification:** Supports renaming, moving, and removing files/directories within an existing archive.
-* **Developer Experience:** Helpers for common tasks: `AddString`, `AddBytes`, `AddLazy`, `Find`, `Glob`, `LoadFromFile`.
-* **Context Support:** Full support for `context.Context` (cancellation/timeouts) for all long-running operations.
-* **Security:**
-  * **Zip Slip** protection during extraction.
-  * **AES-256** (WinZip compatible) and legacy **ZipCrypto** encryption support.
-* **Cross-Platform Metadata:** Preserves **NTFS** timestamps and **Unix/macOS** file permissions.
-* **Legacy Compatibility:** Includes support for **CP866 (Cyrillic DOS)** and **CP437** encodings.
+* **Security:** Native **Zip Slip** protection and **AES-256** (WinZip compatible) encryption.
+* **Context Support:** Full cancellation and timeout support for all long-running operations.
+* **Edit Capability:** Modify existing archives (Rename, Move, Remove) with structural safety.
+* **Legacy Support:** Handles **Zip64**, **NTFS timestamps**, and **CP866 (DOS)** encoding automatically.
 
 ## 📦 Installation
 
@@ -53,353 +36,208 @@ archive.RegisterCompressor(gozip.Deflate, func(level int) gozip.Compressor {
 go get github.com/lemon4ksan/gozip@latest
 ```
 
-## 📖 Usage Examples
+## 📖 Quick Start
 
-### 1. Creating an Archive
-
-The simplest way to create an archive. `AddFile` is lazy and efficient.
+For 90% of use cases, use the high-level static functions. They use safe defaults (Deflate compression, auto-detection).
 
 ```go
 package main
 
-import (
-    "os"
-    "github.com/lemon4ksan/gozip"
-)
+import "github.com/lemon4ksan/gozip"
 
 func main() {
-    archive := gozip.NewZip()
+    // Automatically walks the folder and compresses files using all CPU cores
+    gozip.ArchiveDir(
+        "data/images",
+        gozip.ToFilePath("images_backup.zip"),
+        gozip.WithWorkers(runtime.NumCPU()),
+    )
 
-    // Add a single file from disk
-    archive.AddFile("document.txt")
+    // Extract specific files from an archive
+    gozip.Unzip(
+        gozip.FromFilePath("images_backup.zip"),
+        "restored_images/",
+        gozip.WithExcludeDir("2020"),
+    )
 
-    // Add data directly from memory
-    archive.AddString("debug mode=on", "config.ini")
-    archive.AddBytes([]byte{0xDE, 0xAD, 0xBE, 0xEF}, "bin/header.bin")
-
-    // Add a directory recursively
-    // You can override compression per file
-    archive.AddDir("images", gozip.WithCompression(gozip.Deflate, gozip.DeflateMaximum))
-
-    out, _ := os.Create("backup.zip")
-    defer out.Close()
-
-    // Write sequentially to the output file
-    if _, err := archive.WriteTo(out); err != nil {
-        panic(err)
-    }
+    // Read a single config file content directly into memory
+    configBytes, _ := gozip.ReadFile(
+        gozip.FromFilePath("app_data.zip"),
+        "config.json",
+    )
 }
 ```
 
-### 2. Parallel Archiving (High Speed) ⚡
+## 🛠 Advanced Usage
 
-Use `WriteToParallel` to utilize multiple CPU cores.
+### 1. The Archiver (Custom Configuration)
+
+Use `NewArchiver` to create a configured environment. This is ideal for dependency injection or when you need specific settings (like encryption or custom codecs) isolated from other parts of your app.
 
 ```go
 func main() {
-    archive := gozip.NewZip()
-    archive.AddDir("huge_dataset")
+    // Create an archiver with specific settings
+    archiver := gozip.NewArchiver(
+        gozip.WithArchivePassword("secure-password-123"),
+        gozip.WithCompression(gozip.ZStandard, zstd.SpeedBestCompression),
+        zstd.Enable(),
+    )
 
-    out, _ := os.Create("data.zip")
-    defer out.Close()
-
-    // Use all available CPU cores
-    _, err := archive.WriteToParallel(out, runtime.NumCPU())
+    // Use this instance to perform operations
+    err := archiver.Unzip(
+        gozip.FromFilePath("encrypted_data.zip"), 
+        "output_dir/",
+    )
     if err != nil {
         panic(err)
     }
 }
 ```
 
-### 3. Modifying an Archive (Edit Mode)
+### 2. Low-Level Control & Modification
 
-GoZip allows you to load an existing archive, modify its structure, and save it.
+For granular control (e.g., adding files lazily, modifying existing archives), use the `NewZip` directly.
 
 ```go
 func main() {
     archive := gozip.NewZip()
 
-    // Open existing archive
+    // Open existing archive for editing
     f, _ := os.Open("backup.zip")
     defer f.Close()
+    archive.LoadFromFile(f)
 
-    // Parse structure
-    if err := archive.LoadFromFile(f); err != nil {
-        panic(err)
-    }
-
-    // 1. Remove files
-    archive.Remove("secret_config.yaml")
-    archive.Remove("temp_cache") // Recursive removal
-
-    // 2. Rename/Move files
-    if file, ok := archive.File("images/old_logo.png"); ok {
-        archive.Move(file.Name(), "assets/graphics")
-        archive.Rename(file.Name(), "new_logo.png")
-    }
-
-    // 3. Modify a file
-    file, _ := archive.File("data/config.json")
-    archive.Remove(file.Name())
-    archive.AddLazy(file.Name(), func() (io.ReadCloser, error) {
-        pr, pw := io.Pipe()
-
-        go func() {
-            defer pw.Close() 
-
-            rc, err := file.Open()
-            if err != nil {
-                pw.CloseWithError(err)
-                return
-            }
-            defer rc.Close()
-
-            processor.Transform(rc, pw)
-        }()
-
-        return pr, nil
+    // Modify structure
+    archive.Remove("old_logs/")
+    archive.Rename("config.yaml", "config.old.yaml")
+    
+    // Add dynamic content (Lazy)
+    // The function is called only when WriteTo is executed
+    archive.AddLazy("db_dump.sql", func() (io.ReadCloser, error) {
+        return exec.Command("pg_dump", "db").StdoutPipe()
     })
 
-    // 4. Add new content
-    archive.AddString("Updated at 2025", "meta.txt")
-
-    // Save changes to a new file
+    // Save changes
     out, _ := os.Create("backup_v2.zip")
-    defer out.Close()
-
-    // Zero-copy optimization: unaltered files are copied directly without re-compression
     archive.WriteTo(out)
 }
 ```
 
-### 4. Extracting Files with Context (Timeout)
+### 3. Context Support (Timeouts)
 
-Safe extraction with timeout protection.
+Safe extraction with timeout protection using `...WithContext` methods.
 
 ```go
 func main() {
-    archive := gozip.NewZip()
-
-    f, _ := os.Open("huge_backup.zip")
-    defer f.Close()
-
-    archive.LoadFromFile(f)
-
-    // Create a context with a 30-second timeout
     ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
     defer cancel()
 
-    // Extract files concurrently
-    // If it takes longer than 30s, it cancels automatically and cleans up
-    err := archive.ExtractParallelWithContext(ctx, "output_dir", 8)
-    if err != nil {
-        if errors.Is(err, context.DeadlineExceeded) {
-            fmt.Println("Extraction timed out!")
-        }
-    }
+    // If extraction takes longer than 30s, it cancels automatically
+    // and cleans up partially extracted files.
+    err := gozip.UnzipWithContext(ctx, gozip.FromFilePath("huge.zip"), "output/")
 }
 ```
 
-### 5. Virtual File Systems 📂
-
-Work with files abstractly, without relying on physical disk.
-
-```go
-package main
-
-import (
-    "embed"
-    "github.com/lemon4ksan/gozip"
-)
-
-//go:embed templates/* static/*
-var assets embed.FS
-
-func main() {
-    archive := gozip.NewZip()
-
-    // Recursively add embed.FS
-    if err := archive.AddFS(assets); err != nil {
-        panic(err)
-    }
-
-    // Turn archive into file system
-    fileSystem := archive.FS()
-
-    // Read files with fs interface
-    data, _ := fs.ReadFile(fileSystem, "style.css")
-
-    // Use in HTTP
-    http.Handle("/", http.FileServer(http.FS(fileSystem)))
-
-    http.ListenAndServe(":8080", nil)
-}
-```
-
-### 6. Encryption (AES-256) 🔒
+### 4. Encryption (AES-256) 🔒
 
 GoZip supports strong encryption compatible with WinZip and 7-Zip.
 
 ```go
 func main() {
-    archive := gozip.NewZip()
+    // Create an encrypted archive
+    cfg := gozip.ZipConfig{
+        EncryptionMethod: gozip.AES256,
+        Password:         "MySecret",
+    }
+    archive := gozip.NewZip().SetConfig(cfg)
 
-    // Set global configuration
-    archive.SetConfig(gozip.ZipConfig{
-        CompressionMethod: gozip.Deflate,
-        CompressionLevel:  gozip.DeflateNormal,
-        EncryptionMethod:  gozip.AES256, // Recommended
-        Password:          "MySecretPassword123",
-    })
-
-    archive.AddFile("secret.pdf")
-
+    archive.AddFile("secrets.txt")
+    
     out, _ := os.Create("secure.zip")
     archive.WriteTo(out)
+
+    // Decrypt using helper
+    gozip.Unzip(
+        gozip.FromFilePath("secure.zip"), 
+        "out_dir/", 
+        gozip.WithOpPassword("MySecret"),
+    )
 }
 ```
 
-If you want to remove encryption, you can do it as follows:
+## 🛠 Utilities & I/O Abstraction
+
+GoZip exposes its internal resource management logic via `UseSource` and `UseSink`.
+You can use the library's `Source` abstractions (File, URL, Stream, Buffer) for your own tasks, like hashing, signing, or uploading data, without writing boilerplate for opening/closing resources or handling `io.Reader` vs `io.ReaderAt`.
+
+### Example: Calculate SHA-256 hash of any source (File, URL, or Memory)
 
 ```go
-func main() {
-    archive := gozip.NewZip()
-    // Register compressors & decompressors if needed
+import (
+    "crypto/sha256"
+    "encoding/hex"
+    "github.com/lemon4ksan/gozip"
+)
 
-    archive.SetConfig(gozip.ZipConfig{
-        Password: "pass",
-    })
-
-    f, _ := os.Open("encrypted.zip")
-    defer f.Close()
-
-    // Only the password will apply
-    if err := archive.LoadFromFile(f); err != nil {
-        panic(err)
-    }
-
-    // Remove encryption and set new compression level for each file
-    for _, file := range archive.Files() {
-        // To replace initial password use file.SetSourcePassword()
-        // in case if it's incorrect
-        file.DisableEncryption()
-        file.SetCompression(gozip.Deflate, gozip.DeflateMaximum)
-    }
-
-    out, _ := os.Create("output.zip")
-    defer out.Close()
-
-    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-    defer stop()
-
-    _, err := archive.WriteToParallelWithContext(ctx, out, runtime.NumCPU())
-    if err != nil {
-        if errors.Is(err, context.Canceled) {
-            out.Close()
-            os.Remove("output.zip")
-            return
-        }
-        panic(err)
-    }
+func CalculateHash(src gozip.Source) (string, error) {
+    var hash string
+    
+    // Automatically handles Open/Close, and provides both
+    // Reader (stream) and ReaderAt (random access) interfaces.
+    err := gozip.DefaultArchiver.UseSource(src, 
+        func(r io.Reader, rAt io.ReaderAt, size int64) error {
+            h := sha256.New()
+            
+            // Just read from the stream. 
+            // If it's a URL, it streams. If it's a file, it reads from disk.
+            if _, err := io.Copy(h, r); err != nil {
+                return err
+            }
+            
+            hash = hex.EncodeToString(h.Sum(nil))
+            return nil
+        },
+    )
+    
+    return hash, err
 }
-```
 
-### 7. Fixing Broken Encodings (CP866 / Russian DOS)
-
-Read archives created on old Windows systems that appear as gibberish (e.g., `ΓÑßΓ.txt`).
-
-```go
 func main() {
-    archive := gozip.NewZip()
-
-    // Configure fallback encoding
-    archive.SetConfig(gozip.ZipConfig{
-        TextEncoding: gozip.DecodeIBM866, // Fixes Cyrillic CP866
-    })
-
-    f, _ := os.Open("old_dos_archive.zip")
-    archive.LoadFromFile(f)
-
-    // Filenames are now correctly converted to UTF-8
-    archive.Extract("output")
+    // Works uniformly!
+    h1, _ := CalculateHash(gozip.FromFilePath("local.iso"))
+    h2, _ := CalculateHash(gozip.FromURL("https://example.com/image.iso", nil))
 }
 ```
 
 ## 🌊 Streaming Reader (Sequential Access)
 
-While the standard `Zip` object requires random access (`io.ReaderAt`), GoZip provides a `StreamReader` for processing archives sequentially. This is ideal for reading ZIP files directly from **HTTP response bodies**, **TCP connections**, or **Unix pipes** without saving them to disk.
-
-### Key Advantages
-
-* **Memory Efficient:** Processes files one by one with a tiny memory footprint.
-* **No Seek Required:** Works with any `io.Reader`.
-* **Data Descriptor Support:** Correctly handles archives created in streaming mode (where file sizes are unknown until the end of the file data).
-
-### Example: Processing a remote ZIP via HTTP
+While the `Archiver` and `Zip` act as random-access managers, `StreamReader` allows processing archives sequentially. This is ideal for reading ZIP files directly from **HTTP response bodies** or **pipes** where seeking is impossible.
 
 ```go
-package main
-
-import (
-    "io"
-    "net/http"
-    "github.com/lemon4ksan/gozip"
-)
-
 func main() {
-    resp, err := http.Get("https://example.com/huge_backup.zip")
-    if err != nil {
-        panic(err)
-    }
+    resp, _ := http.Get("https://example.com/data.zip")
     defer resp.Body.Close()
 
-    // Initialize StreamReader from the network stream
+    // Read sequentially without downloading the whole file
     sr := gozip.NewStreamReader(resp.Body)
 
     for {
-        // Move to the next file in the stream
         f, err := sr.Next()
-        if err == io.EOF {
-            break // End of archive
-        }
-        if err != nil {
-            panic(err)
-        }
+        if err == io.EOF { break }
 
-        // Process only specific files without downloading the rest
-        if isRequired(f.Name()) {
+        if f.Name() == "target.txt" {
             rc, _ := sr.Open()
-
-            // Integrity check happens inside io.ReadAll at the very end.
-            data, err := io.ReadAll(rc)
-            if err != nil {
-                if errors.Is(err, gozip.ErrChecksum) {
-                    fmt.Println("Error: File is corrupted")
-                }
-            }
-
+            data, _ := io.ReadAll(rc)
+            fmt.Printf("Content: %s\n", string(data))
             rc.Close()
         }
-        // sr.Next() will automatically skip remaining data of the current file
     }
 }
 ```
 
-### Limitations of Streaming Mode
-
-Due to the nature of the ZIP format, reading sequentially has some trade-offs:
-
-1. **Limited Metadata:** Since `StreamReader` reads Local File Headers instead of the Central Directory at the end, some attributes (like Unix permissions, file comments, or precise NTFS timestamps) are unavailable.
-2. **No Backtracking:** Once a file is skipped or read, you cannot go back to it without restarting the entire stream.
-3. **Data Descriptor Scanning:** For `Stored` (uncompressed) files with unknown sizes, the reader must scan the stream for signatures, which has a very small chance of false positives in purely random binary data.
-
 ## ⚠️ Error Handling
 
-GoZip provides a structured error system. Instead of simple strings, most operations return errors that can be inspected to find exactly which file caused the issue and why.
-
-### 1. The `FileError` Structure
-
-Whenever an error is tied to a specific archive entry, GoZip wraps it in a `*FileError`.
+GoZip uses structured error handling. Bulk operations return `errors.Join`, and specific file errors are wrapped in `*FileError`.
 
 ```go
 if err := archive.AddFile("data/report.pdf"); err != nil {
@@ -412,62 +250,40 @@ if err := archive.AddFile("data/report.pdf"); err != nil {
 }
 ```
 
-### 2. Handling Bulk Operations (`errors.Join`)
-
-Methods that process multiple files (like `AddDir`, `Extract`, or `WriteTo`) use a "Best Effort" strategy.
-They continue processing after non-fatal errors and return a combined error using `errors.Join`.
-
-To inspect all errors in a combined result:
-
-```go
-if err := archive.Extract("./out"); err != nil {
-    // Standard way to unwrap joined errors (Go 1.20+)
-    if e, ok := err.(interface{ Unwrap() []error }); ok {
-        for _, subErr := range e.Unwrap() {
-            var fErr *gozip.FileError
-            if errors.As(subErr, &fErr) {
-                log.Printf("Failed to extract %s: %v", fErr.File.Name(), fErr.Err)
-            }
-        }
-    }
-}
-```
-
-### 3. Sentinel Errors Reference
-
-### Error Reference
+### Errors Reference
 
 | Error | Description
 | :--- | :---
 | `ErrFormat` | Not a valid ZIP archive (invalid signatures).
-| `ErrPasswordMismatch` | Incorrect password or missing password for encrypted file.
-| `ErrChecksum` | CRC-32 integrity check failed after reading.
-| `ErrSizeMismatch` | Extracted data size doesn't match the header.
+| `ErrPasswordMismatch` | Incorrect password or missing password.
+| `ErrChecksum` | CRC-32 integrity check failed.
 | `ErrInsecurePath` | **Zip Slip** detected: file path attempts to escape destination.
 | `ErrDuplicateEntry` | A file with this name already exists in the archive.
 | `ErrAlgorithm` | Compression method not supported (e.g., LZMA without plugin).
 | `ErrFileNotFound` | Requested entry is missing. Wraps `fs.ErrNotExist`.
 | `ErrFilenameTooLong` | Filename exceeds the ZIP limit of 65,535 bytes.
+| `ErrResourceLimit` | Extraction exceeded defined limits.
+| `ErrNotImplemented` | Code path is not implemented.
 
 ## ⚙️ Configuration & Options
 
 ### Functional Options
 
-Configure individual files using the Option pattern:
+Configure operations per-file or per-archive:
 
-* `WithName("new_name.txt")`: Rename file inside the archive.
-* `WithPath("folder/subfolder")`: Place file inside a specific virtual path.
-* `WithCompression(method, level)`: Override compression for this file.
-* `WithEncryption(method, password)`: Override encryption for this file.
-* `WithMode(0755)`: Set custom file permissions (Unix style).
+* `WithName("new.txt")`: Rename file inside the archive.
+* `WithCompression(method, level)`: Override compression for specific files.
+* `WithEncryption(method, password)`: Override encryption.
+* `WithWorkers(n)`: Set number of parallel workers.
+* `WithProgress(callback)`: track progress of operations.
 
-Configure which files should be saved or extracted using Filters:
+### Filters
 
-* `WithFiles(files)`: Restrict operation to provided files.
-* `FromDir("folder1")`: Restrict operation to files located within the specified directory.
-* `WithoutDir("folder2")`: Exclude files from a directory from the operation.
+Select which files to process:
 
-Or you can write your own filter, for example to exclude files larger than 10 MB.
+* `WithOnly([]string)`: Process only specific files.
+* `WithFromDir("folder")`: Restrict to a directory.
+* `WithExcludeDir("folder")`: Exclude a directory.
 
 ### Sort Strategies
 
