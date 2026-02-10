@@ -13,13 +13,14 @@ import (
 
 const DefaultHostSystem = HostSystemFAT
 
-func GetFileMetadata(stat os.FileInfo) map[string]interface{} {
-	metadata := make(map[string]interface{})
-	if s, ok := stat.Sys().(*syscall.Win32FileAttributeData); ok {
-		metadata["LastWriteTime"] = uint64(s.LastWriteTime.HighDateTime)<<32 | uint64(s.LastWriteTime.LowDateTime)
-		metadata["LastAccessTime"] = uint64(s.LastAccessTime.HighDateTime)<<32 | uint64(s.LastAccessTime.LowDateTime)
-		metadata["CreationTime"] = uint64(s.CreationTime.HighDateTime)<<32 | uint64(s.CreationTime.LowDateTime)
-		metadata["FileAttributes"] = s.FileAttributes
+func GetFileMetadata(stat os.FileInfo) Metadata {
+	s, ok := stat.Sys().(*syscall.Win32FileAttributeData)
+	if !ok {
+		return Metadata{}
 	}
-	return metadata
+	return Metadata{
+		LastWriteTime:  uint64(s.LastWriteTime.HighDateTime)<<32 | uint64(s.LastWriteTime.LowDateTime),
+		LastAccessTime: uint64(s.LastAccessTime.HighDateTime)<<32 | uint64(s.LastAccessTime.LowDateTime),
+		CreationTime:   uint64(s.CreationTime.HighDateTime)<<32 | uint64(s.CreationTime.LowDateTime),
+	}
 }

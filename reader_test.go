@@ -12,16 +12,25 @@ import (
 	"hash/crc32"
 	"io"
 	"io/fs"
-	"math"
 	"testing"
 
 	"github.com/lemon4ksan/gozip/internal"
 	"github.com/lemon4ksan/gozip/internal/sys"
 )
 
+// writeOnlyBuffer wraps bytes.Buffer to hide Bytes(), ReadFrom and other methods,
+// exposing only Write. This forces the ZipWriter to use Data Descriptors (Bit 3).
+type writeOnlyBuffer struct {
+	buf *bytes.Buffer
+}
+
+func (w *writeOnlyBuffer) Write(p []byte) (int, error) {
+	return w.buf.Write(p)
+}
+
 func makeEOCD(entries uint16, cdSize, cdOffset uint32, comment string) []byte {
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, internal.EndOfCentralDirSignature)
+	binary.Write(buf, binary.LittleEndian, internal.EOCDSignature)
 	binary.Write(buf, binary.LittleEndian, uint16(0))            // Disk number
 	binary.Write(buf, binary.LittleEndian, uint16(0))            // Disk number with start
 	binary.Write(buf, binary.LittleEndian, entries)              // Entries on disk
@@ -79,14 +88,14 @@ func TestFindAndReadEndOfCentralDir(t *testing.T) {
 			r := bytes.NewReader(tt.data)
 			zr := newZipReader(r, r.Size(), nil, ZipConfig{})
 
-			got, err := zr.FindAndReadEndOfCentralDir(context.Background())
+			got, err := zr.FindAndReadEOCD(context.Background())
 
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("findAndReadEndOfCentralDir() error = %v, wantErr %v", err, tt.wantErr)
 			}
 
 			if !tt.wantErr && tt.wantFound {
-				if got.TotalNumberOfEntries == 0 && len(tt.data) > 30 {
+				if got.EntriesNum == 0 && len(tt.data) > 30 {
 					// Basic check to see if we parsed something meaningful from our helper
 					// (assuming helper sets entries > 0 usually, except specific cases)
 				}
@@ -107,7 +116,7 @@ func TestFindEOCD_BufferBoundary(t *testing.T) {
 	r := bytes.NewReader(data)
 	zr := newZipReader(r, r.Size(), nil, ZipConfig{})
 
-	res, err := zr.FindAndReadEndOfCentralDir(context.Background())
+	res, err := zr.FindAndReadEOCD(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to find EOCD across buffer boundaries: %v", err)
 	}
@@ -116,11 +125,35 @@ func TestFindEOCD_BufferBoundary(t *testing.T) {
 	}
 }
 
+func TestParseZip64_Internal(t *testing.T) {
+	// Tag(2) + Size(2) + Uncomp(8) + Comp(8) + Offset(8)
+	data := internal.EncodeZip64ExtraField(nil, 5000000000, 5000000000, 5000000000)
+
+	f := &File{}
+	entry := internal.SharedEntry{
+		UncompressedSize:  StandardSizeLimit,
+		CompressedSize:    StandardSizeLimit,
+		LocalHeaderOffset: StandardSizeLimit,
+	}
+
+	parseZip64(f, data[4:], entry)
+
+	if f.uncompressedSize != 5000000000 {
+		t.Errorf("Uncompressed mismatch: %d", f.uncompressedSize)
+	}
+	if f.compressedSize != 5000000000 {
+		t.Errorf("Compressed mismatch: %d", f.compressedSize)
+	}
+	if f.localHeaderOffset != 5000000000 {
+		t.Errorf("LocalHeaderOffset mismatch: %d", f.localHeaderOffset)
+	}
+}
+
 func TestNewFileFromCentralDir_Zip64(t *testing.T) {
 	cd := internal.CentralDirectory{
-		UncompressedSize:  math.MaxUint32,
-		CompressedSize:    math.MaxUint32,
-		LocalHeaderOffset: math.MaxUint32,
+		UncompressedSize:  StandardSizeLimit,
+		CompressedSize:    StandardSizeLimit,
+		LocalHeaderOffset: StandardSizeLimit,
 		Filename:          "large_file.dat",
 		ExtraField:        make([]byte, 0),
 	}
@@ -194,7 +227,7 @@ func TestParseFileExternalAttributes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := parseFileExternalAttributes(tt.entry)
+			got := internal.ParseFileMode(tt.entry)
 			if got != tt.wantMode {
 				t.Errorf("parseFileExternalAttributes() = %v, want %v", got, tt.wantMode)
 			}
@@ -209,10 +242,10 @@ func TestChecksumReader(t *testing.T) {
 	t.Run("Valid Checksum", func(t *testing.T) {
 		rc := io.NopCloser(bytes.NewReader(data))
 		cr := &checksumReader{
-			rc:   rc,
-			hash: crc32.NewIEEE(),
-			want: crc,
-			size: uint64(len(data)),
+			rc:       rc,
+			hash:     crc32.NewIEEE(),
+			wantCRC:  crc,
+			wantSize: uint64(len(data)),
 		}
 
 		if _, err := io.Copy(io.Discard, cr); err != nil {
@@ -226,10 +259,10 @@ func TestChecksumReader(t *testing.T) {
 	t.Run("Partial Read (No Error)", func(t *testing.T) {
 		rc := io.NopCloser(bytes.NewReader(data))
 		cr := &checksumReader{
-			rc:   rc,
-			hash: crc32.NewIEEE(),
-			want: crc,
-			size: uint64(len(data)),
+			rc:       rc,
+			hash:     crc32.NewIEEE(),
+			wantCRC:  crc,
+			wantSize: uint64(len(data)),
 		}
 
 		// Read only 1 byte
@@ -246,10 +279,10 @@ func TestChecksumReader(t *testing.T) {
 	t.Run("Invalid Checksum", func(t *testing.T) {
 		rc := io.NopCloser(bytes.NewReader([]byte("wrong data")))
 		cr := &checksumReader{
-			rc:   rc,
-			hash: crc32.NewIEEE(),
-			want: crc,
-			size: uint64(len("wrong data")),
+			rc:       rc,
+			hash:     crc32.NewIEEE(),
+			wantCRC:  crc,
+			wantSize: uint64(len("wrong data")),
 		}
 
 		io.Copy(io.Discard, cr)
@@ -263,10 +296,10 @@ func TestChecksumReader(t *testing.T) {
 		longData := append(data, '!')
 		rc := io.NopCloser(bytes.NewReader(longData))
 		cr := &checksumReader{
-			rc:   rc,
-			hash: crc32.NewIEEE(),
-			want: crc,
-			size: uint64(len(data)),
+			rc:       rc,
+			hash:     crc32.NewIEEE(),
+			wantCRC:  crc,
+			wantSize: uint64(len(data)),
 		}
 
 		_, err := io.Copy(io.Discard, cr)
@@ -327,5 +360,207 @@ func TestZipReader_OpenFile_Integration(t *testing.T) {
 
 	if err := rc.Close(); err != nil {
 		t.Errorf("Close (checksum verification) failed: %v", err)
+	}
+}
+
+func TestStreamReader_DataDescriptor(t *testing.T) {
+	content := []byte("stream content")
+	crc := crc32.ChecksumIEEE(content)
+
+	buf := new(bytes.Buffer)
+
+	lh := internal.LocalFileHeader{
+		GeneralPurposeBitFlag: 0x08, // Bit 3
+		CompressionMethod:     uint16(Store),
+		Filename:              "stream.txt",
+		FilenameLength:        10,
+	}
+	buf.Write(lh.AppendBytes(nil))
+
+	buf.Write(content)
+
+	buf.Write(internal.EncodeDataDescriptor(crc, int64(len(content)), int64(len(content))))
+
+	nextLh := internal.LocalFileHeader{Filename: "next.txt", FilenameLength: 8}
+	buf.Write(nextLh.AppendBytes(nil))
+
+	sr := NewStreamReader(buf)
+	_, err := sr.Next()
+	if err != nil {
+		t.Fatalf("Next failed: %v", err)
+	}
+
+	rc, err := sr.Open()
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	got, _ := io.ReadAll(rc)
+	if !bytes.Equal(got, content) {
+		t.Errorf("Content mismatch: got %s", got)
+	}
+	rc.Close()
+
+	nextF, err := sr.Next()
+	if err != nil || nextF.Name() != "next.txt" {
+		t.Errorf("Failed to advance to next file after Data Descriptor: %v", err)
+	}
+}
+
+func TestStreamReader_RoundTrip(t *testing.T) {
+	buf := new(bytes.Buffer)
+	archive := NewZip()
+
+	testFiles := map[string]string{
+		"hello.txt":       "Hello World",
+		"dir/nested.dat":  "Nested Data",
+		"images/logo.png": string(make([]byte, 5000)),
+	}
+
+	for name, content := range testFiles {
+		if _, err := archive.AddString(content, name); err != nil {
+			t.Fatalf("AddString failed: %v", err)
+		}
+	}
+
+	if _, err := archive.WriteTo(buf); err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+
+	sr := NewStreamReader(bytes.NewReader(buf.Bytes()))
+
+	filesFound := 0
+	for {
+		f, err := sr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next() failed: %v", err)
+		}
+
+		expectedContent, ok := testFiles[f.Name()]
+		if !ok {
+			t.Errorf("Unexpected file found: %s", f.Name())
+			continue
+		}
+
+		rc, err := sr.Open()
+		if err != nil {
+			t.Fatalf("Open() failed for %s: %v", f.Name(), err)
+		}
+
+		content, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatalf("ReadAll failed: %v", err)
+		}
+		rc.Close()
+
+		if string(content) != expectedContent {
+			t.Errorf("Content mismatch for %s", f.Name())
+		}
+		filesFound++
+	}
+
+	if filesFound != len(testFiles) {
+		t.Errorf("Expected %d files, found %d", len(testFiles), filesFound)
+	}
+}
+
+func TestStreamReader_DataDescriptors(t *testing.T) {
+	buf := new(bytes.Buffer)
+	dest := &writeOnlyBuffer{buf: buf}
+
+	archive := NewZip()
+
+	archive.AddString("compressed data string repeated repeated", "deflate.txt",
+		WithCompression(Deflate, DeflateNormal))
+
+	archive.AddString("stored data string", "store.txt",
+		WithCompression(Store, 0))
+
+	if _, err := archive.WriteTo(dest); err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+
+	sr := NewStreamReader(buf)
+
+	f1, err := sr.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f1.Name() != "deflate.txt" {
+		t.Fatalf("Expected deflate.txt, got %s", f1.Name())
+	}
+	if f1.flags&0x8 == 0 {
+		t.Fatal("Bit 3 (Data Descriptor) should be set for streaming write")
+	}
+	rc1, _ := sr.Open()
+	data1, _ := io.ReadAll(rc1)
+	if string(data1) != "compressed data string repeated repeated" {
+		t.Error("Deflate content mismatch")
+	}
+
+	f2, err := sr.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f2.Name() != "store.txt" {
+		t.Fatalf("Expected store.txt, got %s", f2.Name())
+	}
+	rc2, _ := sr.Open()
+	data2, _ := io.ReadAll(rc2)
+	if string(data2) != "stored data string" {
+		t.Error("Store content mismatch")
+	}
+
+	if _, err := sr.Next(); err != io.EOF {
+		t.Error("Expected EOF")
+	}
+}
+
+func TestStreamReader_SkipAndPartial(t *testing.T) {
+	buf := new(bytes.Buffer)
+	archive := NewZip()
+
+	archive.AddString("file1 content", "1.txt")
+	archive.AddString("file2 content is longer", "2.txt")
+	archive.AddString("file3 content", "3.txt")
+
+	archive.WriteTo(buf)
+
+	sr := NewStreamReader(buf)
+
+	f1, _ := sr.Next()
+	if f1.Name() != "1.txt" {
+		t.Fatal("Order mismatch")
+	}
+	rc, _ := sr.Open()
+	io.ReadAll(rc)
+	rc.Close()
+
+	f2, err := sr.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f2.Name() != "2.txt" {
+		t.Fatal("Order mismatch 2")
+	}
+
+	f3, err := sr.Next()
+	if err != nil {
+		t.Fatalf("Failed to skip file 2: %v", err)
+	}
+	if f3.Name() != "3.txt" {
+		t.Fatal("Order mismatch 3")
+	}
+
+	rc3, _ := sr.Open()
+	p := make([]byte, 5)
+	rc3.Read(p)
+
+	_, err = sr.Next()
+	if err != io.EOF {
+		t.Errorf("Expected EOF, got %v", err)
 	}
 }

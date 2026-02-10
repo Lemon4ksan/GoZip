@@ -8,6 +8,8 @@ import (
 	"bytes"
 	"testing"
 	"time"
+
+	"github.com/lemon4ksan/gozip/internal/sys"
 )
 
 func TestByteCounterWriter(t *testing.T) {
@@ -233,10 +235,10 @@ func TestFile_FsTime(t *testing.T) {
 	winTicks := uint64(targetTime.UnixNano()/100) + 116444736000000000
 
 	f := &File{
-		metadata: map[string]interface{}{
-			"LastWriteTime":  winTicks,
-			"LastAccessTime": winTicks,
-			"CreationTime":   winTicks,
+		metadata: sys.Metadata{
+			LastWriteTime:  winTicks,
+			LastAccessTime: winTicks,
+			CreationTime:   winTicks,
 		},
 	}
 
@@ -254,9 +256,7 @@ func TestFile_FsTime(t *testing.T) {
 }
 
 func TestFile_FsTime_Empty(t *testing.T) {
-	f := &File{
-		metadata: nil,
-	}
+	f := &File{}
 
 	mtime, atime, ctime := f.FsTime()
 

@@ -20,6 +20,13 @@ import (
 )
 
 // EncryptionMethod represents the encryption algorithm used for file protection.
+//
+// Compatibility Warning:
+//   - AES256 is the recommended standard for security. It is supported by modern
+//     archivers like 7-Zip, WinRAR.
+//   - Some legacy tools (e.g., older built-in macOS Archive Utility or Windows Explorer)
+//     may only support ZipCrypto (weak encryption). Use ZipCrypto only if legacy
+//     compatibility is strictly required.
 type EncryptionMethod uint16
 
 // Supported encryption methods
@@ -38,10 +45,9 @@ type zipCryptoWriter struct {
 func newZipCryptoWriter(dest io.Writer, password string, checkByte byte) (io.WriteCloser, error) {
 	cipher := newZipCipher(password)
 
-	// Write the encryption header (12 bytes)
 	var header [12]byte
 	if _, err := rand.Read(header[:]); err != nil {
-		return nil, fmt.Errorf("crypto rand failed: %w", err)
+		return nil, fmt.Errorf("crypto rand: %w", err)
 	}
 
 	// The last byte of the header is used as a check byte (CRC or ModTime)
@@ -191,15 +197,15 @@ type aesWriter struct {
 }
 
 func newAes256Writer(dest io.Writer, password string) (io.WriteCloser, error) {
-	salt := make([]byte, aes256SaltSize)
-	if _, err := rand.Read(salt); err != nil {
+	var salt [aes256SaltSize]byte
+	if _, err := rand.Read(salt[:]); err != nil {
 		return nil, fmt.Errorf("aes rand: %w", err)
 	}
 
-	keys := deriveAesKeys(password, salt)
+	keys := deriveAesKeys(password, salt[:])
 
 	// Write Salt
-	if _, err := dest.Write(salt); err != nil {
+	if _, err := dest.Write(salt[:]); err != nil {
 		return nil, fmt.Errorf("write salt: %w", err)
 	}
 
@@ -262,12 +268,12 @@ type aesReader struct {
 // src MUST be positioned at the start of the AES data (Salt).
 // compressedSize is the size of the data segment in the ZIP file (including Salt/PVV/MAC).
 func newAes256Reader(src io.Reader, password string, compressedSize int64) (io.Reader, error) {
-	salt := make([]byte, aes256SaltSize)
-	if _, err := io.ReadFull(src, salt); err != nil {
+	var salt [aes256SaltSize]byte
+	if _, err := io.ReadFull(src, salt[:]); err != nil {
 		return nil, fmt.Errorf("read salt: %w", err)
 	}
 
-	keys := deriveAesKeys(password, salt)
+	keys := deriveAesKeys(password, salt[:])
 	pvv := make([]byte, aesPvvSize)
 	if _, err := io.ReadFull(src, pvv); err != nil {
 		return nil, fmt.Errorf("read pvv: %w", err)
@@ -282,7 +288,7 @@ func newAes256Reader(src io.Reader, password string, compressedSize int64) (io.R
 	}
 
 	if compressedSize < overhead {
-		return nil, errors.New("zip: invalid aes file size (too small)")
+		return nil, errors.New("invalid aes file size (too small)")
 	}
 	// The actual encrypted data size
 	dataSize := compressedSize - overhead
@@ -309,15 +315,15 @@ func (r *aesReader) Read(p []byte) (int, error) {
 
 	// If we hit EOF of the payload, verify the MAC immediately
 	if err == io.EOF && r.checkOnEOF {
-		expected := make([]byte, aesMacSize)
+		var expected [aesMacSize]byte
 		// Read the MAC from the remaining bytes in source
-		if _, macErr := io.ReadFull(r.macSrc, expected); macErr != nil {
+		if _, macErr := io.ReadFull(r.macSrc, expected[:]); macErr != nil {
 			return n, fmt.Errorf("read auth mac: %w", macErr)
 		}
 
 		calculated := r.mac.Sum(nil)[:aesMacSize]
-		if subtle.ConstantTimeCompare(calculated, expected) != 1 {
-			return n, errors.New("zip: aes authentication failed")
+		if subtle.ConstantTimeCompare(calculated, expected[:]) != 1 {
+			return n, errors.New("aes authentication failed")
 		}
 		// Verification successful
 		return n, io.EOF
@@ -352,15 +358,14 @@ func deriveAesKeys(password string, salt []byte) aesKeys {
 // whereas standard Go cipher.NewCTR uses Big Endian.
 type winZipCounter struct {
 	block   cipher.Block
-	counter [16]byte
-	buffer  []byte
+	counter [aes.BlockSize]byte
+	buffer  [aes.BlockSize]byte
 	pos     int
 }
 
 func newWinZipCounter(block cipher.Block) *winZipCounter {
 	c := &winZipCounter{
-		block:  block,
-		buffer: make([]byte, aes.BlockSize),
+		block: block,
 	}
 	c.counter[0] = 1 // Initial counter value
 	return c
@@ -369,7 +374,7 @@ func newWinZipCounter(block cipher.Block) *winZipCounter {
 func (c *winZipCounter) XORKeyStream(dst, src []byte) {
 	for len(src) > 0 {
 		if c.pos == len(c.buffer) || c.pos == 0 {
-			c.block.Encrypt(c.buffer, c.counter[:])
+			c.block.Encrypt(c.buffer[:], c.counter[:])
 			c.incrementCounter()
 			c.pos = 0
 		}

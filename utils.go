@@ -7,7 +7,12 @@ package gozip
 import (
 	"context"
 	"io"
+	"sort"
+	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/lemon4ksan/gozip/internal/sys"
 )
 
 // byteCountWriter counts bytes written to a writer.
@@ -22,14 +27,30 @@ func (w *byteCountWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// byteCountWriteSeeker is an extension of byteCountWriter that supports seeking.
-type byteCountWriteSeeker struct {
-	*byteCountWriter
-	seeker io.WriteSeeker
+type atomicCounterWriter struct {
+	w     io.Writer
+	count int64
 }
 
-func (w *byteCountWriteSeeker) Seek(offset int64, whence int) (int64, error) {
-	return w.seeker.Seek(offset, whence)
+func (acw *atomicCounterWriter) Write(p []byte) (int, error) {
+	n, err := acw.w.Write(p)
+	if n > 0 {
+		atomic.AddInt64(&acw.count, int64(n))
+	}
+	return n, err
+}
+
+func (acw *atomicCounterWriter) Count() int64 {
+	return atomic.LoadInt64(&acw.count)
+}
+
+type atomicCounterWriteSeeker struct {
+	*atomicCounterWriter
+	seeker io.Seeker
+}
+
+func (acw *atomicCounterWriteSeeker) Seek(offset int64, whence int) (int64, error) {
+	return acw.seeker.Seek(offset, whence)
 }
 
 // contextReader wraps an io.Reader to make it respect context cancellation.
@@ -77,14 +98,8 @@ func msDosToTime(dosDate uint16, dosTime uint16) time.Time {
 	return time.Date(year, time.Month(month), int(day), int(hour), int(minute), int(second), 0, time.UTC)
 }
 
-func hasPreciseTimestamps(metadata map[string]interface{}) bool {
-	if metadata == nil {
-		return false
-	}
-	_, w := metadata["LastWriteTime"]
-	_, a := metadata["LastAccessTime"]
-	_, c := metadata["CreationTime"]
-	return w || a || c
+func hasPreciseTimestamps(metadata sys.Metadata) bool {
+	return metadata.LastWriteTime != 0 || metadata.LastAccessTime != 0 || metadata.CreationTime != 0
 }
 
 // winFiletimeToTime converts Windows FILETIME (100ns ticks since 1601) to Go time.Time.
@@ -125,11 +140,101 @@ func winFiletimeToTime(ft uint64) time.Time {
 
 // hasMeta checks if the string contains pattern matching characters.
 func hasMeta(path string) bool {
-	for i := 0; i < len(path); i++ {
-		switch path[i] {
+	for _, c := range path {
+		switch c {
 		case '*', '?', '[', '\\':
 			return true
 		}
 	}
 	return false
+}
+
+// treeNode represents a node in the directory tree.
+type treeNode struct {
+	name     string
+	isDir    bool
+	children map[string]*treeNode
+}
+
+func newTreeNode(name string, isDir bool) *treeNode {
+	return &treeNode{
+		name:     name,
+		isDir:    isDir,
+		children: make(map[string]*treeNode),
+	}
+}
+
+// generateTree converts a list of zip Files into a visual tree string.
+func generateTree(files []*File) string {
+	if len(files) == 0 {
+		return ".\n└── (empty archive)"
+	}
+
+	// Build the tree structure from flat paths
+	root := newTreeNode(".", true)
+
+	for _, f := range files {
+		// Clean path and split into components
+		path := strings.Trim(f.Name(), "/")
+		parts := strings.Split(path, "/")
+
+		current := root
+		for i, part := range parts {
+			if part == "" {
+				continue
+			}
+
+			// Determine if this part is a directory
+			// It is a directory if it has children (i < len-1) OR if the file itself is a dir
+			isDir := i < len(parts)-1 || f.IsDir()
+
+			if _, exists := current.children[part]; !exists {
+				current.children[part] = newTreeNode(part, isDir)
+			}
+			current = current.children[part]
+		}
+	}
+
+	// Render the tree
+	var sb strings.Builder
+	sb.WriteString(".\n")
+	renderTreeNode(root, "", &sb)
+
+	return sb.String()
+}
+
+func renderTreeNode(node *treeNode, prefix string, sb *strings.Builder) {
+	// Sort children keys to ensure deterministic output
+	keys := make([]string, 0, len(node.children))
+	for k := range node.children {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for i, name := range keys {
+		child := node.children[name]
+		isLast := i == len(keys)-1
+
+		connector := "├── "
+		if isLast {
+			connector = "└── "
+		}
+
+		sb.WriteString(prefix)
+		sb.WriteString(connector)
+		sb.WriteString(name)
+		if child.isDir {
+			sb.WriteString("/")
+		}
+		sb.WriteString("\n")
+
+		childPrefix := prefix
+		if isLast {
+			childPrefix += "    "
+		} else {
+			childPrefix += "│   "
+		}
+
+		renderTreeNode(child, childPrefix, sb)
+	}
 }
