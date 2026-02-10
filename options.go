@@ -56,6 +56,13 @@ func WithZipPassword(pwd string) ArchiveOption {
 	}
 }
 
+// WithStrategy sets the parallel write strategy for the archive.
+func WithStrategy(s ZipStrategy) ArchiveOption {
+	return func(z *Zip) {
+		z.config.ZipStrategy = s
+	}
+}
+
 // WithImplicitDirs enables writing implicit dirs to the resulting archive.
 func WithImplicitDirs() ArchiveOption {
 	return func(z *Zip) {

@@ -159,6 +159,14 @@ import (
 // be determined before writing (e.g., streaming from [io.Reader]).
 const SizeUnknown int64 = -1
 
+// ZipStrategy determines the write strategy.
+type ZipStrategy int
+
+const (
+	StrategyPerformance ZipStrategy = iota // Maximum speed, order doesn't matter
+	StrategyOrdered                        // Preserve the original file order
+)
+
 // ZipConfig defines global configuration parameters for the
 // archive. These settings apply to the entire archive but
 // can be overridden per-file using [FileConfig] options.
@@ -184,6 +192,10 @@ type ZipConfig struct {
 	// FileSortStrategy determines the order of file
 	// processing and their order in the written archive.
 	FileSortStrategy FileSortStrategy
+
+	// ZipStrategy determines what parallel write strategy to use. By default
+	// the order of files in the written archive is not deterministic.
+	ZipStrategy ZipStrategy
 
 	// ConflictHandler defines the strategy for handling
 	// duplicate file names during [Zip.Load]. If nil,
@@ -1054,9 +1066,9 @@ func (z *Zip) execSequentialWrite(ctx context.Context, files []*File, writer *zi
 }
 
 func (z *Zip) execParallelWrite(ctx context.Context, files []*File, writer *zipWriter, workers int, onFileDone func(*File, error)) []error {
-	pzw := newParallelZipWriter(writer, workers)
+	pzw := newParallelZipWriter(writer)
 	pzw.onFileDone = onFileDone
-	return pzw.WriteFiles(ctx, files)
+	return pzw.WriteFiles(ctx, files, workers, z.config.ZipStrategy)
 }
 
 func (z *Zip) execSequentialVerify(ctx context.Context, files []*File, collector *statsCollector) []error {

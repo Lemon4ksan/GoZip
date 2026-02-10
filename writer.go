@@ -586,21 +586,19 @@ func cleanupTmp(f *os.File) {
 // parallelZipWriter handles parallel compression and sequential writing.
 type parallelZipWriter struct {
 	zw              *zipWriter
-	sem             chan struct{}
 	memoryThreshold int64
 	bufferPool      sync.Pool
 	snapPool        sync.Pool
 	onFileDone      func(*File, error)
 }
 
-func newParallelZipWriter(zw *zipWriter, workers int) *parallelZipWriter {
+func newParallelZipWriter(zw *zipWriter) *parallelZipWriter {
 	var threshold int64 = 10 * 1024 * 1024 // 10MB
 	if zw.config.MemoryThreshold > 0 {
 		threshold = zw.config.MemoryThreshold
 	}
 	return &parallelZipWriter{
 		zw:              zw,
-		sem:             make(chan struct{}, workers),
 		memoryThreshold: threshold,
 		bufferPool: sync.Pool{
 			New: func() interface{} {
@@ -622,103 +620,138 @@ type zipResult struct {
 }
 
 // WriteFiles processes multiple files in parallel and writes them to the ZIP archive.
-// It uses a back pressure mechanism to ensure memory usage remains bounded,
-// even if files are processed out of order or vary significantly in size.
-func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File) []error {
-	pipeline := make(chan chan zipResult, cap(pzw.sem)*2)
+func (pzw *parallelZipWriter) WriteFiles(ctx context.Context, files []*File, workers int, strategy ZipStrategy) []error {
+	type task struct {
+		index int
+		file  *File
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan zipResult, workers*2)
+	pending := make(map[int]zipResult)
+
+	tasks := make(chan task, len(files))
+	nextIndex := 0
 
 	var wg sync.WaitGroup
 	var errs []error
 
-	wg.Go(func() {
-		defer close(pipeline)
-
-		for _, f := range files {
-			resultChan := make(chan zipResult, 1)
-
-			select {
-			case <-ctx.Done():
-				return
-			case pipeline <- resultChan:
-			}
-
-			select {
-			case <-ctx.Done():
-				resultChan <- zipResult{snap: f.Snapshot(), err: ctx.Err()}
-				close(resultChan)
-				return
-			case pzw.sem <- struct{}{}:
-			}
-
-			wg.Add(1)
-			go func(file *File, ch chan<- zipResult) {
-				defer func() { <-pzw.sem; wg.Done() }()
+	for range workers {
+		wg.Go(func() {
+			for t := range tasks {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
 
 				snap := pzw.snapPool.Get().(*FileSnapshot)
-				file.FillSnapshot(snap)
+				t.file.FillSnapshot(snap)
 
 				if snap.UncompressedSize == 0 {
 					snap.ResetEncodeOptions()
 				}
 				src, err := pzw.compressFile(ctx, snap)
 
-				ch <- zipResult{snap: snap, src: src, err: err}
-				close(ch)
-			}(f, resultChan)
+				select {
+				case <-ctx.Done():
+					pzw.discardResult(zipResult{snap: snap, src: src})
+				case results <- zipResult{index: t.index, snap: snap, src: src, err: err}:
+				}
+			}
+		})
+	}
 
-			if ctx.Err() != nil {
+	go func() {
+		defer close(tasks)
+		for i, f := range files {
+			select {
+			case <-ctx.Done():
 				return
+			case tasks <- task{i, f}:
 			}
 		}
-	})
+	}()
 
-	stopWriting := false
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
 
-	for resultChan := range pipeline {
-		res, ok := <-resultChan
-		if !ok {
-			// unreachable
-			continue
-		}
-
-		if ctx.Err() != nil || stopWriting {
-			pzw.cleanupBuf(res.src)
+	for res := range results {
+		if ctx.Err() != nil {
+			pzw.discardResult(res)
 			continue
 		}
 
 		if res.err != nil {
 			errs = append(errs, res.err)
-			pzw.cleanupBuf(res.src)
-			stopWriting = true
+			cancel()
 			continue
 		}
 
-		err := pzw.writeCompressedFile(res.snap, res.src)
-		if err != nil {
-			errs = append(errs, wrapErr("write", res.snap.file, err))
-			stopWriting = true
-		} else {
-			if err = pzw.zw.addCentralDirEntry(res.snap); err != nil {
+		if strategy == StrategyPerformance {
+			if err := pzw.handleResult(res); err != nil {
 				errs = append(errs, wrapErr("write", res.snap.file, err))
-				stopWriting = true
+				cancel()
 			}
+			continue
 		}
 
-		if res.snap.file != nil {
-			res.snap.file.setCompressedSize(res.snap.CompressedSize)
-			res.snap.file.WithUncompressedSize(res.snap.UncompressedSize)
-			res.snap.file.setCRC32(res.snap.CRC32)
+		if res.index != nextIndex {
+			pending[res.index] = res
+			continue
 		}
 
-		if pzw.onFileDone != nil {
-			pzw.onFileDone(res.snap.file, err)
-		}
+		for {
+			err := pzw.handleResult(res)
+			if err != nil {
+				errs = append(errs, wrapErr("write", res.snap.file, err))
+				cancel()
+				break
+			}
 
-		pzw.cleanupBuf(res.src)
+			nextIndex++
+			nextRes, ok := pending[nextIndex]
+			if !ok {
+				break
+			}
+
+			res = nextRes
+			delete(pending, nextIndex)
+		}
 	}
 
-	wg.Wait()
 	return errs
+}
+
+// discardResult frees resources if the result will not be processed
+func (pzw *parallelZipWriter) discardResult(res zipResult) {
+	pzw.cleanupBuf(res.src)
+	pzw.snapPool.Put(res.snap)
+}
+
+// handleResult writes a successful result to the archive and updates central directory buffer.
+func (pzw *parallelZipWriter) handleResult(res zipResult) error {
+	err := pzw.writeCompressedFile(res.snap, res.src)
+	if err == nil {
+		err = pzw.zw.addCentralDirEntry(res.snap)
+	}
+
+	if res.snap.file != nil {
+		res.snap.file.setCompressedSize(res.snap.CompressedSize)
+		res.snap.file.WithUncompressedSize(res.snap.UncompressedSize)
+		res.snap.file.setCRC32(res.snap.CRC32)
+	}
+
+	if pzw.onFileDone != nil {
+		pzw.onFileDone(res.snap.file, err)
+	}
+
+	pzw.discardResult(res)
+	return err
 }
 
 // compressFile compresses a single file to memory or temp file.

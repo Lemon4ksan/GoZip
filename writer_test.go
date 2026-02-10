@@ -251,9 +251,9 @@ func TestParallelZipWriter_Integration(t *testing.T) {
 	}
 
 	zw := newZipWriter(config, nil, mw)
-	pzw := newParallelZipWriter(zw, 2)
+	pzw := newParallelZipWriter(zw)
 
-	errs := pzw.WriteFiles(context.Background(), files)
+	errs := pzw.WriteFiles(context.Background(), files, 2, StrategyPerformance)
 	if len(errs) > 0 {
 		t.Fatalf("WriteFiles returned errors: %v", errs)
 	}
@@ -313,10 +313,10 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 	}
 
 	zw := newZipWriter(config, nil, mw)
-	pzw := newParallelZipWriter(zw, 1)
+	pzw := newParallelZipWriter(zw)
 	pzw.memoryThreshold = 10 // Force second file to disk
 
-	errs := pzw.WriteFiles(context.Background(), files)
+	errs := pzw.WriteFiles(context.Background(), files, 1, StrategyPerformance)
 	if len(errs) > 0 {
 		t.Fatalf("WriteFiles errors: %v", errs)
 	}
@@ -337,7 +337,7 @@ func TestParallelZipWriter_MemoryVsDisk(t *testing.T) {
 func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 	mw := NewMemoryWriteSeeker()
 	zw := newZipWriter(ZipConfig{}, nil, mw)
-	pzw := newParallelZipWriter(zw, 2)
+	pzw := newParallelZipWriter(zw)
 
 	expectedErr := errors.New("simulated open error")
 	files := []*File{
@@ -350,7 +350,7 @@ func TestParallelZipWriter_ErrorHandling(t *testing.T) {
 		},
 	}
 
-	errs := pzw.WriteFiles(context.Background(), files)
+	errs := pzw.WriteFiles(context.Background(), files, 2, StrategyOrdered)
 	if len(errs) == 0 {
 		t.Fatal("Expected error, got none")
 	}
